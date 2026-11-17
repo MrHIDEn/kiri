@@ -10,6 +10,13 @@
 //! Preview 1 core modules and preview 2 command components both run. A
 //! component that exports `wasi:http/incoming-handler` is served by
 //! [`super::wasm_http`] instead of running once. There is no cgroup.
+//!
+//! `wasi:http/outgoing-handler` dials from this process. On a Mac that is
+//! the Mac's own network: `127.0.0.1` is the Mac's loopback, and a name is
+//! resolved here, not inside the VM. Container addresses that exist only
+//! in the VM are not reachable. HTTPS trusts the CA set compiled into the
+//! daemon, and the module's `HTTP_PROXY` is not applied. A preview 1 core
+//! module has no `wasi:http`.
 
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -502,6 +509,7 @@ fn run_core(job: &mut Job<'_>, stderr_note: &mut File) -> i32 {
 
 struct ComponentState {
     ctx: wasmtime_wasi::WasiCtx,
+    http: wasmtime_wasi_http::WasiHttpCtx,
     table: wasmtime::component::ResourceTable,
 }
 
@@ -510,6 +518,16 @@ impl wasmtime_wasi::WasiView for ComponentState {
         wasmtime_wasi::WasiCtxView {
             ctx: &mut self.ctx,
             table: &mut self.table,
+        }
+    }
+}
+
+impl wasmtime_wasi_http::WasiHttpView for ComponentState {
+    fn http(&mut self) -> wasmtime_wasi_http::WasiHttpCtxView<'_> {
+        wasmtime_wasi_http::WasiHttpCtxView {
+            ctx: &mut self.http,
+            table: &mut self.table,
+            hooks: wasmtime_wasi_http::default_hooks(),
         }
     }
 }
@@ -532,8 +550,15 @@ fn run_component(job: &mut Job<'_>, stderr_note: &mut File) -> i32 {
         let _ = writeln!(stderr_note, "wasm: {e}");
         return 1;
     }
+    // Command components may import wasi:http/outgoing-handler. The sync
+    // bindings run the request on wasmtime's tokio runtime, from this process.
+    if let Err(e) = wasmtime_wasi_http::p2::add_only_http_to_linker_sync(&mut linker) {
+        let _ = writeln!(stderr_note, "wasm: {e}");
+        return 1;
+    }
     let state = ComponentState {
         ctx: builder.build(),
+        http: wasmtime_wasi_http::WasiHttpCtx::new(),
         table: wasmtime::component::ResourceTable::new(),
     };
     let mut store = wasmtime::Store::new(job.engine, state);
@@ -904,6 +929,13 @@ mod tests {
             header.set_mode(0o644);
             header.set_cksum();
             builder.append(&header, http.as_slice()).unwrap();
+            let fetch = include_bytes!("../../../../tests/wasm/fetch.wasm");
+            let mut header = tar::Header::new_gnu();
+            header.set_path("fetch.wasm").unwrap();
+            header.set_size(fetch.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, fetch.as_slice()).unwrap();
             builder.finish().unwrap();
         }
         let mut gz = Vec::new();
@@ -1026,12 +1058,18 @@ mod tests {
 
     #[test]
     fn current_component_versions_are_recognised() {
-        let http = include_bytes!("../../../../tests/wasm/http.wasm");
-        assert!(
-            is_component(http),
-            "http.wasm version {:02x?}",
-            &http[4..8]
-        );
+        for (name, bytes) in [
+            (
+                "http.wasm",
+                include_bytes!("../../../../tests/wasm/http.wasm").as_slice(),
+            ),
+            (
+                "fetch.wasm",
+                include_bytes!("../../../../tests/wasm/fetch.wasm").as_slice(),
+            ),
+        ] {
+            assert!(is_component(bytes), "{name} version {:02x?}", &bytes[4..8]);
+        }
     }
 
     #[test]
@@ -1112,6 +1150,101 @@ mod tests {
         assert!(!engine.is_awake());
         drop(engine);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_command_component_fetches_on_the_host() {
+        let (port, server) = serve_text(b"kiri-fetched-ok\n");
+        let url = format!("http://127.0.0.1:{port}/hello");
+        let (code, out, err) = run_bytes(
+            include_bytes!("../../../../tests/wasm/fetch.wasm"),
+            &["/fetch.wasm", &url],
+        );
+        let _ = server.join();
+        assert_eq!(code, 0, "{err} / {out}");
+        assert!(out.contains("kiri-fetched-ok"), "{out} / {err}");
+    }
+
+    #[test]
+    fn a_wasi_http_handler_fetches_on_the_host() {
+        let (upstream, server) = serve_text(b"kiri-fetched-ok\n");
+        let dir = scratch("fetch-http");
+        let store = kiri_image::Store::open(&dir).unwrap();
+        let engine = super::super::engine::Engine::boot(store).unwrap();
+        engine.test_clear_stopped();
+        let image = install_wasi_image(&engine.store);
+        let spec: super::super::engine::Spec = serde_json::from_value(serde_json::json!({
+            "image": image.name, "image_id": image.digest, "entrypoint": ["/http.wasm"], "cmd": [],
+            "env": [], "cwd": "/", "user": "", "auto_remove": false, "network_mode": "none", "labels": {},
+            "ports": [{"container_port": 80, "proto": "tcp", "host_ip": "127.0.0.1", "host_port": 0}]
+        }))
+        .unwrap();
+        let id = engine
+            .create(Some("wasi-fetch".into()), spec, &image)
+            .unwrap();
+        engine.start(&id).unwrap();
+        assert!(!engine.is_awake(), "fetching over http booted the VM");
+        let published = engine
+            .with(&id, |c| c.forwards.as_ref().unwrap().bound[0].2)
+            .unwrap();
+        let req = format!(
+            "GET /out HTTP/1.1\r\nHost: wasi-fetch.kiri.local\r\nx-fetch: http://127.0.0.1:{upstream}/hello\r\nConnection: close\r\n\r\n"
+        );
+        let got = http_exchange(published, &req);
+        assert!(got.contains("HTTP/1.1 200"), "{got}");
+        assert!(got.contains("kiri-fetched-ok"), "{got}");
+        engine.stop(&id, Duration::from_secs(5)).unwrap();
+        let _ = engine.wait(&id, "not-running");
+        let _ = server.join();
+        assert!(!engine.is_awake());
+        drop(engine);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// One HTTP response, from this process. The wasm module dials it itself.
+    fn serve_text(body: &'static [u8]) -> (u16, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let Ok((mut sock, _)) = listener.accept() else {
+                return;
+            };
+            let _ = sock.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut buf = [0u8; 2048];
+            let _ = sock.read(&mut buf);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = sock.write_all(head.as_bytes());
+            let _ = sock.write_all(body);
+        });
+        (port, server)
+    }
+
+    fn run_bytes(bytes: &[u8], args: &[&str]) -> (i32, String, String) {
+        let (mut out_r, out_w) = os_pipe().unwrap();
+        let (mut err_r, err_w) = os_pipe().unwrap();
+        let args: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
+        let killed = AtomicU32::new(0);
+        let code = execute(Job {
+            engine: shared_engine(),
+            bytes,
+            args: &args,
+            env: &[],
+            cwd: "",
+            preopens: &[],
+            stdin: None,
+            stdout: out_w,
+            stderr: err_w,
+            killed: &killed,
+            interruptible: false,
+        });
+        let mut out = String::new();
+        let mut err = String::new();
+        out_r.read_to_string(&mut out).unwrap();
+        err_r.read_to_string(&mut err).unwrap();
+        (code, out, err)
     }
 
     fn http_exchange(port: u16, req: &str) -> String {
