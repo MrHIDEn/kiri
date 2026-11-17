@@ -1443,6 +1443,7 @@ dependencies = [
  "dispatch2",
  "flate2",
  "gtk",
+ "http-body",
  "http-body-util",
  "hyper",
  "javascriptcore-rs",

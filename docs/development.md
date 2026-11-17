@@ -97,9 +97,15 @@ kiri UI ────┘
   this machine's loopback and DNS is resolved here, not in the VM.
   Addresses that exist only inside the VM are not reachable. HTTPS trusts
   the CA set compiled into the daemon; a module's `HTTP_PROXY` is not
-  applied. A preview 1 core module has no `wasi:http`. `tests/wasm.sh`
-  covers the command, the incoming handler and an outgoing GET through
-  the docker CLI.
+  applied. Request and response bodies stream: the guest pulls the
+  upload and hyper writes the download as the guest produces it. Each
+  direction stops after `KIRI_WASM_HTTP_BODY_LIMIT` bytes (default 32
+  MiB) or after `KIRI_WASM_HTTP_IDLE_SECS` with no next frame (default
+  60); a `Content-Length` already over the limit is 413. Outgoing
+  requests use the same streaming client and are not under that cap. A
+  preview 1 core module has no `wasi:http`. `tests/wasm.sh` covers the
+  command, the incoming handler, an outgoing GET and a multi-megabyte
+  upload and download through the docker CLI.
 
 ## Layout
 
@@ -114,7 +120,7 @@ kiri UI ────┘
 | `tests/e2e.sh` | ~350 checks through the real `docker` CLI, plus a leak soak (`K8S=1` adds Kubernetes) |
 | `tests/linux-host.sh` | the Linux host build, driven in a privileged container |
 | `tests/finder-mount.sh` | the Mac's Finder mount at `~/Kiri`: covers only an empty folder or its own old mount, never your files or another mount |
-| `tests/wasm.sh` | WASI workloads through the real `docker` CLI (hello, args and env, exit code, a read-only volume, `ps`/`stop`/`rm`, `--rm`, a wasi:http container on a published port and on `<name>.kiri.local` when that router is this engine's, and an outgoing GET); needs a running daemon, no VM |
+| `tests/wasm.sh` | WASI workloads through the real `docker` CLI (hello, args and env, exit code, a read-only volume, `ps`/`stop`/`rm`, `--rm`, a wasi:http container on a published port and on `<name>.kiri.local` when that router is this engine's, an outgoing GET, and a multi-megabyte upload and download); needs a running daemon, no VM |
 | `contrib/` | systemd unit, WSL2 and Windows install scripts |
 | `installer/windows` | the Windows MSI (WiX 5): `kiri.wxs`, licence, dialog bitmaps |
 | `packaging/` | Linux `.deb` and `.rpm` (`kiri` with the docker CLI, `kiri-lite` engine only), the Homebrew plan |

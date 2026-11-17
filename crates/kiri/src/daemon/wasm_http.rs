@@ -8,15 +8,34 @@
 //!
 //! `wasi:http/outgoing-handler` is the same host network as a command
 //! component: this process dials, so loopback and DNS are the machine's,
-//! not the VM's. HTTPS uses the daemon's compiled-in CA set.
+//! not the VM's. HTTPS uses the daemon's compiled-in CA set. That client
+//! already streams: the guest's body is one chunk of backpressure, then
+//! the next write waits, and the response is read as it arrives. It is
+//! not capped by the limits below.
+//!
+//! Request and response bodies are streamed. The guest pulls the request
+//! as it reads, and hyper writes the response as the guest writes it, so
+//! neither side is collected into one buffer first. Each direction stops
+//! after [`Limits::body`] bytes (default 32 MiB,
+//! `KIRI_WASM_HTTP_BODY_LIMIT`) or after [`Limits::idle`] with no next
+//! frame (default 60s, `KIRI_WASM_HTTP_IDLE_SECS`). The same idle applies
+//! to reading the request headers. A `Content-Length` already over the
+//! limit is refused with 413 before the guest runs. A chunked body that
+//! grows past the limit fails the read the guest is in. The
+//! published-port relay still closes a socket idle for 300s, and the
+//! domain router still uses a 30s read timeout on its own connection.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fs::File;
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use http_body_util::BodyExt;
 use hyper::server::conn::http1;
@@ -37,10 +56,13 @@ use super::wasm::{self, Preopen};
 /// Instantiations in flight. Past this, a connection is refused with 503
 /// instead of queuing wasmtime compiles without bound.
 const IN_FLIGHT: usize = 64;
-/// A request body is read to the end before the guest runs, so the
-/// connection task is not stuck waiting on a guest that is itself waiting
-/// to read. Larger bodies are rejected.
-const MAX_BODY: usize = 1024 * 1024;
+/// Bytes of one request body, or one response body, when
+/// `KIRI_WASM_HTTP_BODY_LIMIT` is unset. Several megabytes is the case
+/// this exists for; the cap is what stops a guest that reads forever.
+const DEFAULT_BODY_LIMIT: u64 = 32 * 1024 * 1024;
+/// Seconds with no next body frame, and the budget for request headers,
+/// when `KIRI_WASM_HTTP_IDLE_SECS` is unset.
+const DEFAULT_IDLE_SECS: u64 = 60;
 
 struct State {
     ctx: WasiCtx,
@@ -268,6 +290,7 @@ fn run(
         preopens,
         stdout: Mutex::new(out_w),
         stderr: Mutex::new(err_w),
+        limits: limits(),
     });
     let code = rt.block_on(serve(listener, prep.stop, srv.clone(), &killed));
     // Drop the files only after in-flight requests are gone, or the pumps
@@ -310,6 +333,31 @@ struct Srv {
     preopens: Vec<Preopen>,
     stdout: Mutex<File>,
     stderr: Mutex<File>,
+    limits: Limits,
+}
+
+/// Read once, when the handler starts. A later change of the environment
+/// applies to the next container, not to one already listening.
+struct Limits {
+    body: u64,
+    idle: Duration,
+}
+
+fn limits() -> Limits {
+    Limits {
+        body: env_u64("KIRI_WASM_HTTP_BODY_LIMIT", DEFAULT_BODY_LIMIT),
+        idle: Duration::from_secs(
+            env_u64("KIRI_WASM_HTTP_IDLE_SECS", DEFAULT_IDLE_SECS).clamp(1, 24 * 60 * 60),
+        ),
+    }
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default)
 }
 
 async fn serve(
@@ -354,6 +402,8 @@ async fn serve(
                     });
                     if let Err(e) = http1::Builder::new()
                         .keep_alive(true)
+                        .timer(TokioTimer)
+                        .header_read_timeout(srv.limits.idle)
                         .serve_connection(TokioIo::new(sock), svc)
                         .await
                     {
@@ -394,15 +444,21 @@ impl Srv {
             return text(503, "stopped\n");
         }
         let (parts, incoming) = req.into_parts();
-        let collected = match incoming.collect().await {
-            Ok(c) => c,
-            Err(e) => return text(400, &format!("{e}\n")),
-        };
-        let body = collected.to_bytes();
-        if body.len() > MAX_BODY {
+        if content_length(&parts.headers).is_some_and(|n| n > self.limits.body) {
             return text(413, "request body is too large\n");
         }
-        let req = hyper::Request::from_parts(parts, full_body(body));
+        // The connection keeps reading this body while the guest runs, and
+        // stops when the guest is not reading (the channel holds one
+        // frame). The guest is not handed a buffer of the whole request.
+        let req = hyper::Request::from_parts(
+            parts,
+            cap(
+                incoming,
+                self.limits.body,
+                self.limits.idle,
+                CapKind::Request,
+            ),
+        );
         let (stdout, stderr) = match (dup(&self.stdout), dup(&self.stderr)) {
             (Ok(stdout), Ok(stderr)) => (stdout, stderr),
             (Err(e), _) | (_, Err(e)) => return text(500, &format!("{e}\n")),
@@ -464,7 +520,16 @@ impl Srv {
             Ok::<(), wasmtime::Error>(())
         });
         match receiver.await {
-            Ok(Ok(resp)) => resp,
+            Ok(Ok(resp)) => {
+                if content_length(resp.headers()).is_some_and(|n| n > self.limits.body) {
+                    return text(500, "response body is too large\n");
+                }
+                let (parts, body) = resp.into_parts();
+                hyper::Response::from_parts(
+                    parts,
+                    cap(body, self.limits.body, self.limits.idle, CapKind::Response).boxed_unsync(),
+                )
+            }
             Ok(Err(code)) => text(500, &format!("{code}\n")),
             Err(_) => {
                 let msg = match task.await {
@@ -486,6 +551,162 @@ fn one_line(s: &str) -> String {
     s.replace(['\r', '\n'], " ")
 }
 
+fn content_length(headers: &hyper::HeaderMap) -> Option<u64> {
+    headers
+        .get(hyper::header::CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()
+}
+
+/// Which limit a frame crossed, so the guest sees a request or a response error.
+#[derive(Clone, Copy)]
+enum CapKind {
+    Request,
+    Response,
+}
+
+impl CapKind {
+    fn too_big(self, limit: u64) -> wasmtime_wasi_http::Error {
+        match self {
+            Self::Request => wasmtime_wasi_http::Error::HttpRequestBodySize(Some(limit)),
+            Self::Response => wasmtime_wasi_http::Error::HttpResponseBodySize(Some(limit)),
+        }
+    }
+
+    fn timeout(self) -> wasmtime_wasi_http::Error {
+        match self {
+            Self::Request => wasmtime_wasi_http::Error::ConnectionReadTimeout,
+            Self::Response => wasmtime_wasi_http::Error::HttpResponseTimeout,
+        }
+    }
+}
+
+/// Counts bytes and arms an idle timer on each wait. One frame is in flight
+/// inside `inner`; this does not collect the body.
+struct Capped {
+    inner: Pin<
+        Box<
+            dyn http_body::Body<Data = hyper::body::Bytes, Error = wasmtime_wasi_http::Error>
+                + Send,
+        >,
+    >,
+    left: u64,
+    idle: Duration,
+    limit: u64,
+    kind: CapKind,
+    sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+fn cap<B>(body: B, limit: u64, idle: Duration, kind: CapKind) -> Capped
+where
+    B: http_body::Body<Data = hyper::body::Bytes> + Send + 'static,
+    B::Error: Into<wasmtime_wasi_http::Error>,
+{
+    Capped {
+        inner: Box::pin(body.map_err(Into::into)),
+        left: limit,
+        idle,
+        limit,
+        kind,
+        sleep: None,
+    }
+}
+
+impl http_body::Body for Capped {
+    type Data = hyper::body::Bytes;
+    type Error = wasmtime_wasi_http::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        match this.inner.as_mut().poll_frame(cx) {
+            Poll::Pending => {
+                if this.sleep.is_none() {
+                    this.sleep = Some(Box::pin(tokio::time::sleep(this.idle)));
+                }
+                match this.sleep.as_mut().unwrap().as_mut().poll(cx) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(()) => {
+                        this.sleep = None;
+                        Poll::Ready(Some(Err(this.kind.timeout())))
+                    }
+                }
+            }
+            Poll::Ready(frame) => {
+                this.sleep = None;
+                match frame {
+                    Some(Ok(frame)) => {
+                        let n = frame.data_ref().map(|d| d.len() as u64).unwrap_or(0);
+                        if n > this.left {
+                            Poll::Ready(Some(Err(this.kind.too_big(this.limit))))
+                        } else {
+                            this.left -= n;
+                            Poll::Ready(Some(Ok(frame)))
+                        }
+                    }
+                    Some(Err(e)) => Poll::Ready(Some(Err(e))),
+                    None => Poll::Ready(None),
+                }
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// hyper's header timeout needs a [`hyper::rt::Timer`]. This is tokio's clock.
+#[derive(Clone, Copy)]
+struct TokioTimer;
+
+struct TokioSleep {
+    inner: Pin<Box<tokio::time::Sleep>>,
+}
+
+impl Future for TokioSleep {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        self.inner.as_mut().poll(cx)
+    }
+}
+
+impl hyper::rt::Sleep for TokioSleep {}
+
+impl hyper::rt::Timer for TokioTimer {
+    fn sleep(&self, duration: Duration) -> Pin<Box<dyn hyper::rt::Sleep>> {
+        Box::pin(TokioSleep {
+            inner: Box::pin(tokio::time::sleep(duration)),
+        })
+    }
+
+    fn sleep_until(&self, deadline: Instant) -> Pin<Box<dyn hyper::rt::Sleep>> {
+        Box::pin(TokioSleep {
+            inner: Box::pin(tokio::time::sleep_until(tokio::time::Instant::from_std(
+                deadline,
+            ))),
+        })
+    }
+
+    fn reset(&self, sleep: &mut Pin<Box<dyn hyper::rt::Sleep>>, new_deadline: Instant) {
+        if let Some(mut sleep) = sleep.as_mut().downcast_mut_pin::<TokioSleep>() {
+            sleep
+                .inner
+                .as_mut()
+                .reset(tokio::time::Instant::from_std(new_deadline));
+        }
+    }
+}
+
 fn full_body(bytes: hyper::body::Bytes) -> HyperOutgoingBody {
     http_body_util::Full::new(bytes)
         .map_err(|never: Infallible| -> wasmtime_wasi_http::Error { match never {} })
@@ -499,4 +720,103 @@ fn text(status: u16, msg: &str) -> hyper::Response<HyperOutgoingBody> {
         .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
         .body(body)
         .unwrap_or_else(|_| hyper::Response::new(full_body(hyper::body::Bytes::new())))
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use http_body_util::BodyExt;
+
+    use super::*;
+
+    struct Stall;
+
+    impl http_body::Body for Stall {
+        type Data = hyper::body::Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            Poll::Pending
+        }
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_body_over_the_limit_fails_at_that_frame() {
+        let err = runtime().block_on(async {
+            cap(
+                http_body_util::Full::new(hyper::body::Bytes::from_static(b"0123456789")),
+                8,
+                Duration::from_secs(5),
+                CapKind::Request,
+            )
+            .collect()
+            .await
+            .unwrap_err()
+        });
+        assert!(
+            matches!(err, wasmtime_wasi_http::Error::HttpRequestBodySize(Some(8))),
+            "{err}"
+        );
+        let err = runtime().block_on(async {
+            cap(
+                http_body_util::Full::new(hyper::body::Bytes::from_static(b"0123456789")),
+                8,
+                Duration::from_secs(5),
+                CapKind::Response,
+            )
+            .collect()
+            .await
+            .unwrap_err()
+        });
+        assert!(
+            matches!(
+                err,
+                wasmtime_wasi_http::Error::HttpResponseBodySize(Some(8))
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_body_at_the_limit_is_those_bytes() {
+        let got = runtime().block_on(async {
+            cap(
+                http_body_util::Full::new(hyper::body::Bytes::from_static(b"01234567")),
+                8,
+                Duration::from_secs(5),
+                CapKind::Response,
+            )
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+        });
+        assert_eq!(&got[..], b"01234567");
+    }
+
+    #[test]
+    fn an_idle_body_times_out() {
+        let err = runtime().block_on(async {
+            cap(Stall, 100, Duration::from_millis(30), CapKind::Request)
+                .collect()
+                .await
+                .unwrap_err()
+        });
+        assert!(
+            matches!(err, wasmtime_wasi_http::Error::ConnectionReadTimeout),
+            "{err}"
+        );
+    }
 }
