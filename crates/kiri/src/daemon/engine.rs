@@ -2096,13 +2096,32 @@ impl Engine {
             let bytes = std::fs::read(self.store.blob_path(&layer.digest)?)?;
             super::wasm::unpack_layer(&bytes, &layer.media_type, &root, &argv[0])?;
         }
-        let bytes = match super::wasm::module_bytes(&root, &argv[0]) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+        let image_labels = self
+            .store
+            .read_config(&image.config_digest)
+            .ok()
+            .map(|bytes| super::wasm::config_labels(&bytes))
+            .unwrap_or(serde_json::Value::Null);
+        let routes = super::wasm::port_modules(&image_labels, &spec.labels)
+            .map_err(|e| Error::BadRequest(e.to_string()))?;
+        let modules = match super::wasm::load_modules(&root, &argv[0], &routes) {
+            Ok(modules) => modules,
+            Err(e)
+                if e.kind() == io::ErrorKind::NotFound
+                    || e.kind() == io::ErrorKind::InvalidInput =>
+            {
                 return Err(Error::BadRequest(e.to_string()));
             }
-            other => other?,
+            Err(e) => return Err(Error::Io(e)),
         };
-        let http = super::wasm_http::prepare(&id, &bytes)?;
+        let bytes = modules[0].bytes.clone();
+        let http = match super::wasm_http::prepare(&id, &modules) {
+            Ok(http) => http,
+            Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
+                return Err(Error::BadRequest(e.to_string()));
+            }
+            Err(e) => return Err(Error::Io(e)),
+        };
         if !spec.ports.is_empty() {
             if http.is_none() {
                 return Err(Error::BadRequest(
@@ -2135,13 +2154,20 @@ impl Engine {
         let mut forwards = if spec.ports.is_empty() {
             None
         } else {
-            let Some(addr) = http.as_ref().map(|prep| prep.addr) else {
-                super::wasm_http::forget(&id);
-                return Err(Error::BadRequest(
-                    "only a wasi:http component can publish ports".into(),
-                ));
-            };
-            match super::ports::start_local(&spec.ports, addr) {
+            let mut dest = HashMap::new();
+            for b in spec.ports.iter().filter(|b| b.proto != "udp") {
+                let Some(addr) = super::wasm_http::http_addr_for(&id, b.container_port) else {
+                    super::wasm_http::forget(&id);
+                    return Err(Error::BadRequest(format!(
+                        "port {} has no wasi:http module; set {}{} to a component that exports wasi:http/incoming-handler",
+                        b.container_port,
+                        super::wasm::WASM_PORT_LABEL,
+                        b.container_port,
+                    )));
+                };
+                dest.insert(b.container_port, addr);
+            }
+            match super::ports::start_local(&spec.ports, |port| dest[&port]) {
                 Ok(fw) => Some(fw),
                 Err(e) => {
                     super::wasm_http::forget(&id);
@@ -2817,7 +2843,8 @@ impl Engine {
             }
         })?;
         // A wasi:http container has no guest address. The router dials the
-        // handler on loopback. A command module stays unroutable.
+        // handler for the container port it picked. A command module stays
+        // unroutable.
         let ip = if c.spec.network_mode == "host" || super::wasm_http::http_addr(&c.id).is_some() {
             [127, 0, 0, 1]
         } else {
