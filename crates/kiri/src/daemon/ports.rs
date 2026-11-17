@@ -746,11 +746,13 @@ fn accept_local(listener: &TcpListener, wake: &OwnedFd, to: SocketAddr) {
     }
 }
 
+/// A published port of a wasi:http container, to the handler on loopback.
+/// The same rules as any other published TCP port (#388): a quiet
+/// connection stays open, a write that makes no progress for
+/// [`TCP_STALL`] is given up, and keepalive notices a peer that vanished.
 fn relay_local(client: TcpStream, to: SocketAddr) -> io::Result<()> {
     client.set_nonblocking(false)?;
-    client.set_nodelay(true)?;
-    client.set_read_timeout(Some(TCP_IDLE))?;
-    client.set_write_timeout(Some(TCP_IDLE))?;
+    relayed_tcp(&client)?;
     let guest = TcpStream::connect_timeout(&to, DIRECT_CONNECT)?;
     relay_tcp(client, guest)
 }

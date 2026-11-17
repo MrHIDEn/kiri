@@ -29,9 +29,10 @@
 //! frame (default 60s, `KIRI_WASM_HTTP_IDLE_SECS`). The same idle applies
 //! to reading the request headers. A `Content-Length` already over the
 //! limit is refused with 413 before the guest runs. A chunked body that
-//! grows past the limit fails the read the guest is in. The
-//! published-port relay still closes a socket idle for 300s, and the
-//! domain router still uses a 30s read timeout on its own connection.
+//! grows past the limit fails the read the guest is in. A published
+//! port follows the other relays: a quiet connection stays open, and a
+//! write that makes no progress for 300s is given up. The domain router
+//! still uses a 30s read timeout on its own connection.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
