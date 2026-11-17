@@ -5,6 +5,10 @@
 //! the container-domain router dial that socket and copy bytes, so they do
 //! not grow a second HTTP stack. TLS stops at the domain router: the
 //! handler always sees plain HTTP.
+//!
+//! `wasi:http/outgoing-handler` is the same host network as a command
+//! component: this process dials, so loopback and DNS are the machine's,
+//! not the VM's. HTTPS uses the daemon's compiled-in CA set.
 
 use std::collections::HashMap;
 use std::convert::Infallible;

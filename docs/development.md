@@ -92,8 +92,14 @@ kiri UI ────┘
   `os` `wasi` and `architecture` `wasm`) runs the module in the daemon on
   wasmtime. It does not boot the VM. A component that exports
   `wasi:http/incoming-handler` stays up and serves HTTP, including
-  `<name>.kiri.local` and published ports. `tests/wasm.sh` covers both
-  through the docker CLI.
+  `<name>.kiri.local` and published ports. `wasi:http/outgoing-handler`
+  dials from the daemon process, on the host's network: `127.0.0.1` is
+  this machine's loopback and DNS is resolved here, not in the VM.
+  Addresses that exist only inside the VM are not reachable. HTTPS trusts
+  the CA set compiled into the daemon; a module's `HTTP_PROXY` is not
+  applied. A preview 1 core module has no `wasi:http`. `tests/wasm.sh`
+  covers the command, the incoming handler and an outgoing GET through
+  the docker CLI.
 
 ## Layout
 
@@ -108,7 +114,7 @@ kiri UI ────┘
 | `tests/e2e.sh` | ~350 checks through the real `docker` CLI, plus a leak soak (`K8S=1` adds Kubernetes) |
 | `tests/linux-host.sh` | the Linux host build, driven in a privileged container |
 | `tests/finder-mount.sh` | the Mac's Finder mount at `~/Kiri`: covers only an empty folder or its own old mount, never your files or another mount |
-| `tests/wasm.sh` | WASI workloads through the real `docker` CLI (hello, args and env, exit code, a read-only volume, `ps`/`stop`/`rm`, `--rm`, a wasi:http container on a published port and on `<name>.kiri.local`); needs a running daemon, no VM |
+| `tests/wasm.sh` | WASI workloads through the real `docker` CLI (hello, args and env, exit code, a read-only volume, `ps`/`stop`/`rm`, `--rm`, a wasi:http container on a published port and on `<name>.kiri.local` when that router is this engine's, and an outgoing GET); needs a running daemon, no VM |
 | `contrib/` | systemd unit, WSL2 and Windows install scripts |
 | `installer/windows` | the Windows MSI (WiX 5): `kiri.wxs`, licence, dialog bitmaps |
 | `packaging/` | Linux `.deb` and `.rpm` (`kiri` with the docker CLI, `kiri-lite` engine only), the Homebrew plan |

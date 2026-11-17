@@ -3,13 +3,18 @@
 # the daemon, on wasmtime, and does not boot the VM. This script checks that
 # path the way a person would: hello-world on stdout, args and env, a
 # non-zero exit, a read-only bind, a detached container's ps/stop/rm,
-# `--rm` actually removing the container, and a wasi:http component.
+# `--rm` actually removing the container, a wasi:http component, and a
+# component that calls out with wasi:http/outgoing-handler.
 #
 # The http section needs curl. It always checks the published port. It also
-# requests `http://<name>.kiri.local/users/1` when something is listening on
-# the domain router's port (80, or KIRI_HTTP_PORT). That request uses
-# curl --resolve, so it does not need DNS. If the router is not up, that
-# one check is skipped.
+# requests `http://<name>.kiri.local/users/1` when this engine says it is
+# serving container domains (`GET /kiri/domains`, the same call tests/e2e.sh
+# uses) and the process on that port lists this container. The request uses
+# curl --resolve, so it does not need DNS. Another Kiri may own port 80
+# while this one has domains off; that is a skip, not a failure.
+#
+# The outgoing section needs perl, which answers one small HTTP server the
+# modules call on this machine's loopback.
 #
 # Kiri has no image builder, so the image is not `docker build`ed. The
 # modules live as `.wat` in tests/wasm/ and a `cargo test` (no VM, no daemon)
@@ -46,11 +51,31 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 RUN=kiri-wasm-$$
 LABEL=kiri.wasm-test=$RUN
 IMAGE=kiri-wasm-test:latest
-PASS=0 FAIL=0
+PASS=0 FAIL=0 SKIP=0
 FAILED=()
 
 ok() { PASS=$((PASS + 1)); echo "  ok   $1"; }
 bad() { FAIL=$((FAIL + 1)); FAILED+=("$1"); echo "  FAIL $1${2:+: $2}"; }
+skip() { SKIP=$((SKIP + 1)); echo "  skip $1 ($2)"; }
+
+# GET on this engine's API. tests/e2e.sh reads the domain routers the same way.
+engine_get() {
+  local path=$1 host
+  if [ -n "${DOCKER_HOST:-}" ]; then
+    case "$DOCKER_HOST" in
+      unix://*) curl -fsS --max-time 2 --unix-socket "${DOCKER_HOST#unix://}" "http://localhost${path}" ;;
+      tcp://*)
+        host=${DOCKER_HOST#tcp://}
+        host=${host%/}
+        curl -fsS --max-time 2 "http://${host}${path}" ;;
+      *) return 1 ;;
+    esac
+  elif [ -n "${SOCK:-}" ]; then
+    curl -fsS --max-time 2 --unix-socket "$SOCK" "http://localhost${path}"
+  else
+    return 1
+  fi
+}
 
 # Seconds, then a command. `d` is this script's docker, which timeout cannot
 # exec (it is a function). GNU timeout where it exists, else perl's alarm.
@@ -72,6 +97,7 @@ cleanup() {
   fi
   if [ -n "${NOTE:-}" ]; then rm -rf "$NOTE"; fi
   if [ -n "${TAR:-}" ]; then rm -f "$TAR"; fi
+  if [ -n "${FETCH_PID:-}" ]; then kill "$FETCH_PID" >/dev/null 2>&1 || true; fi
 }
 trap cleanup EXIT
 
@@ -169,16 +195,40 @@ elif cid=$(run -d --name "$name" --entrypoint /http.wasm -p 127.0.0.1::80 "$IMAG
   fi
   logs=$(d logs "$name" 2>&1 || true)
   if printf '%s' "$logs" | grep -q 'GET /users/1'; then ok "the request is in the container log"; else bad "the request is in the container log" "$logs"; fi
-  dport=${KIRI_HTTP_PORT:-80}
-  probe=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:${dport}/" || true)
-  if [ "$probe" = "000" ] || [ -z "$probe" ]; then
-    ok "kiri.local skipped: nothing is listening on port ${dport}"
+  # The port in GET /kiri/domains is this engine's router, and only while
+  # `serving` is true. Port 80 can belong to the installed Kiri when this
+  # one (Kiri Dev) has domains off.
+  check="http://${name}.kiri.local/users/1 reaches the module"
+  if ! command -v python3 >/dev/null 2>&1; then
+    skip "$check" "python3 is needed to read /kiri/domains"
+  elif ! json=$(engine_get /kiri/domains 2>/dev/null); then
+    skip "$check" "this engine did not answer /kiri/domains"
   else
-    body=$(curl -fsS --max-time 5 --resolve "${name}.kiri.local:${dport}:127.0.0.1" -H 'X-Echo: name' "http://${name}.kiri.local:${dport}/users/1" 2>&1) && ec=0 || ec=$?
-    if [ "$ec" = 0 ] && printf '%s' "$body" | grep -q 'GET /users/1' && printf '%s' "$body" | grep -q 'name'; then
-      ok "http://${name}.kiri.local/users/1 reaches the module"
+    parsed=$(printf '%s' "$json" | python3 -c 'import json,sys; d=json.load(sys.stdin)["http"]; print(d["port"], "yes" if d.get("serving") else "no")' 2>/dev/null || true)
+    dport=${parsed%% *}
+    serving=${parsed##* }
+    if [ -z "$parsed" ] || [ "$dport" = "$serving" ]; then
+      skip "$check" "could not read this engine's domain router"
+    elif [ "$serving" != yes ]; then
+      skip "$check" "this engine's container domains are off"
     else
-      bad "http://${name}.kiri.local/users/1 reaches the module" "exit $ec: $body"
+      page=$(curl -sS --max-time 2 --resolve "kiri-wasm-probe.kiri.local:${dport}:127.0.0.1" "http://kiri-wasm-probe.kiri.local:${dport}/" 2>&1) && pec=0 || pec=$?
+      if [ "$pec" != 0 ]; then
+        bad "$check" "this engine's router on port ${dport} did not answer: $page"
+      elif ! printf '%s' "$page" | grep -q "$name"; then
+        if printf '%s' "$page" | grep -q 'No running container'; then
+          skip "$check" "port ${dport} belongs to another Kiri"
+        else
+          bad "$check" "port ${dport} is not this engine's router: $page"
+        fi
+      else
+        body=$(curl -fsS --max-time 5 --resolve "${name}.kiri.local:${dport}:127.0.0.1" -H 'X-Echo: name' "http://${name}.kiri.local:${dport}/users/1" 2>&1) && ec=0 || ec=$?
+        if [ "$ec" = 0 ] && printf '%s' "$body" | grep -q 'GET /users/1' && printf '%s' "$body" | grep -q 'name'; then
+          ok "$check"
+        else
+          bad "$check" "exit $ec: $body"
+        fi
+      fi
     fi
   fi
   if lim 20 d stop "$name" >/dev/null 2>&1; then
@@ -200,8 +250,72 @@ else
   bad "http container starts" "$cid"
 fi
 
+echo "== wasi:http outgoing"
+if ! command -v perl >/dev/null 2>&1; then
+  bad "outgoing checks need perl"
+else
+  FETCH_PORT_FILE=$(mktemp)
+  perl -e '
+    use IO::Socket::INET;
+    my $srv = IO::Socket::INET->new(LocalAddr => "127.0.0.1", LocalPort => 0, Listen => 5, Reuse => 1) or die $!;
+    print $srv->sockport, "\n";
+    STDOUT->flush;
+    while (my $c = $srv->accept) {
+      local $/ = "\r\n\r\n";
+      my $req = <$c>;
+      my $body = "kiri-fetched-ok\n";
+      print $c "HTTP/1.1 200 OK\r\nContent-Length: ".length($body)."\r\nConnection: close\r\n\r\n$body";
+      close $c;
+    }
+  ' >"$FETCH_PORT_FILE" &
+  FETCH_PID=$!
+  fport=
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    fport=$(head -n 1 "$FETCH_PORT_FILE" 2>/dev/null || true)
+    [ -n "$fport" ] && break
+    sleep 0.1
+  done
+  if [ -z "$fport" ]; then
+    bad "the test HTTP server starts"
+  else
+    url="http://127.0.0.1:${fport}/hello"
+    out=$(run --rm --name "$RUN-fetch" --entrypoint /fetch.wasm "$IMAGE" "$url" 2>&1) && ec=0 || ec=$?
+    if [ "$ec" = 0 ] && printf '%s' "$out" | grep -q 'kiri-fetched-ok'; then
+      ok "a command module GETs the test server"
+    else
+      bad "a command module GETs the test server" "exit $ec: $out"
+    fi
+    fname=$RUN-out
+    if cid=$(run -d --name "$fname" --entrypoint /http.wasm -p 127.0.0.1::80 "$IMAGE" 2>&1); then
+      hp=$(d port "$fname" 80/tcp 2>/dev/null | head -n 1 || true)
+      hp=${hp##*:}
+      body=
+      for _ in 1 2 3 4 5 6 7 8 9 10; do
+        body=$(curl -fsS --max-time 5 -H "X-Fetch: $url" "http://127.0.0.1:${hp}/" 2>&1) && break
+        sleep 0.2
+      done
+      if printf '%s' "$body" | grep -q 'kiri-fetched-ok'; then
+        ok "an incoming handler returns the fetched response"
+      else
+        bad "an incoming handler returns the fetched response" "$body"
+      fi
+      lim 20 d rm -f "$fname" >/dev/null 2>&1 || true
+    else
+      bad "an incoming handler returns the fetched response" "$cid"
+    fi
+  fi
+  kill "$FETCH_PID" >/dev/null 2>&1 || true
+  wait "$FETCH_PID" 2>/dev/null || true
+  FETCH_PID=
+  rm -f "$FETCH_PORT_FILE"
+fi
+
 echo
-echo "wasm: $PASS passed, $FAIL failed"
+if [ "$SKIP" = 0 ]; then
+  echo "wasm: $PASS passed, $FAIL failed"
+else
+  echo "wasm: $PASS passed, $FAIL failed, $SKIP skipped"
+fi
 if [ "$FAIL" != 0 ]; then
   printf '  %s\n' "${FAILED[@]}"
   exit 1

@@ -1,5 +1,6 @@
 /target
 tests/wasm/http/target
+tests/wasm/fetch/target
 # Raw benchmark output: kept outside this repository.
 /bench/results/
 /guest/out/

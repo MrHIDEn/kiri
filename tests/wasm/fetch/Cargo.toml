@@ -1,0 +1,14 @@
+[workspace]
+
+[package]
+name = "kiri-wasm-fetch"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Tiny wasi:cli command that GETs a URL, used by Kiri's wasm tests"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wasi = "0.14.7"
