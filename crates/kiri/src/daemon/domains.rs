@@ -320,6 +320,24 @@ pub fn set_ports(engine: &Arc<Engine>, http: u16, https: u16) -> Result<serde_js
     Ok(report())
 }
 
+/// The socket the request is copied to. A VM connection has to stay alive:
+/// dropping it closes the virtio stream, including on macOS where `Drop`
+/// releases the connection. A wasi:http handler is an ordinary TCP socket
+/// in this process.
+enum Upstream {
+    Vm(kiri_vmm::VsockStream),
+    Wasm(TcpStream),
+}
+
+impl Upstream {
+    fn fd(&self) -> io::Result<OwnedFd> {
+        match self {
+            Self::Vm(guest) => guest.fd.try_clone(),
+            Self::Wasm(sock) => Ok(OwnedFd::from(sock.try_clone()?)),
+        }
+    }
+}
+
 fn serve(mut client: TcpStream, engine: &Engine) -> io::Result<()> {
     // The listener faces the network; only this Mac may use it.
     if !client.peer_addr()?.ip().is_loopback() {
@@ -327,10 +345,10 @@ fn serve(mut client: TcpStream, engine: &Engine) -> io::Result<()> {
     }
     client.set_nodelay(true)?;
     let Some((head, guest)) = route(&mut client, engine, "http")? else { return Ok(()) };
-    let mut to_guest = std::fs::File::from(guest.fd.try_clone()?);
+    let mut to_guest = std::fs::File::from(guest.fd()?);
     // What the client sent so far goes first, unchanged.
     to_guest.write_all(&head)?;
-    let mut from_guest = std::fs::File::from(guest.fd.try_clone()?);
+    let mut from_guest = std::fs::File::from(guest.fd()?);
     let mut client_read = client.try_clone()?;
     let up = std::thread::Builder::new().name("kiri-domain-up".into()).spawn(move || {
         let _ = io::copy(&mut client_read, &mut to_guest);
@@ -347,7 +365,7 @@ fn serve(mut client: TcpStream, engine: &Engine) -> io::Result<()> {
 /// Reads the request head, finds the container its Host names and connects
 /// to it. `None` once it has answered by itself (no such container, an
 /// unreachable one, or a client that went away).
-fn route(client: &mut impl ReadWrite, engine: &Engine, scheme: &str) -> io::Result<Option<(Vec<u8>, kiri_vmm::VsockStream)>> {
+fn route(client: &mut impl ReadWrite, engine: &Engine, scheme: &str) -> io::Result<Option<(Vec<u8>, Upstream)>> {
     let mut head = Vec::with_capacity(2048);
     let mut buf = [0u8; 4096];
     let end = loop {
@@ -380,9 +398,23 @@ fn route(client: &mut impl ReadWrite, engine: &Engine, scheme: &str) -> io::Resu
         respond(client, 404, "Not Found", &body)?;
         return Ok(None);
     };
+    if let Some(addr) = super::wasm_http::http_addr(&target.id) {
+        match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
+            Ok(sock) => return Ok(Some((head, Upstream::Wasm(sock)))),
+            Err(e) => {
+                respond(
+                    client,
+                    502,
+                    "Bad Gateway",
+                    &format!("Kiri could not reach the container: {}", escape(&e.to_string())),
+                )?;
+                return Ok(None);
+            }
+        }
+    }
     let port = web_port(engine, &target);
     match engine.relay_to(target.ip, port) {
-        Ok(g) => Ok(Some((head, g))),
+        Ok(g) => Ok(Some((head, Upstream::Vm(g)))),
         Err(e) => {
             respond(client, 502, "Bad Gateway", &format!("Kiri could not reach the container: {}", escape(&e.to_string())))?;
             Ok(None)
@@ -487,7 +519,7 @@ fn serve_tls(tcp: TcpStream, engine: &Engine, config: Arc<rustls::ServerConfig>)
         let _ = tls.flush();
         return Ok(());
     };
-    let mut container = std::fs::File::from(guest.fd.try_clone()?);
+    let mut container = std::fs::File::from(guest.fd()?);
     container.write_all(&head)?;
     let (conn, sock) = (&mut tls.conn, &mut tls.sock);
     let mut buf = vec![0u8; 64 * 1024];

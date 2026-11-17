@@ -378,6 +378,81 @@ fn holder_in(lsof: &str) -> Option<String> {
     lsof.lines().filter_map(|l| l.strip_prefix('c')).map(str::trim).find(|c| !c.is_empty() && !c.to_ascii_lowercase().starts_with("kiri")).map(str::to_owned)
 }
 
+/// Published ports of a wasi:http container. The handler listens on `to`
+/// (loopback, in this process). Not [`start`]: that relays through the VM,
+/// and on macOS it does not dial a host loopback address. Every binding
+/// reaches the one handler; the container port is not a separate listener.
+/// UDP is refused.
+pub fn start_local(bindings: &[Binding], to: SocketAddr) -> io::Result<Forwards> {
+    if bindings.iter().any(|b| b.proto == "udp") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "wasm http does not publish udp",
+        ));
+    }
+    let mut listeners = Vec::with_capacity(bindings.len());
+    for b in bindings {
+        let mut port = b.host_port;
+        for (ip, required) in listen_addrs(b) {
+            let addr = host_addr(&ip, port)?;
+            let taken = |e: io::Error| {
+                if e.kind() == io::ErrorKind::AddrInUse {
+                    let shown = if addr.is_ipv6() { format!("[{ip}]") } else { ip.clone() };
+                    let by = holder(b.host_port, false)
+                        .map(|name| format!(" (in use by {name})"))
+                        .unwrap_or_default();
+                    io::Error::new(
+                        e.kind(),
+                        format!(
+                            "Bind for {shown}:{} failed: port is already allocated{by}",
+                            b.host_port
+                        ),
+                    )
+                } else {
+                    e
+                }
+            };
+            let bound = bind_socket(addr, false).or_else(|e| {
+                if e.kind() == io::ErrorKind::AddrInUse && port != 0 && super::domains::step_aside(port) {
+                    bind_socket(addr, false)
+                } else {
+                    Err(e)
+                }
+            });
+            let sock = match bound {
+                Ok(s) => s,
+                Err(e) if required => return Err(taken(e)),
+                Err(e) => {
+                    crate::diag::debug!("published port has no IPv6 listener", port = port, error = e);
+                    continue;
+                }
+            };
+            let l = TcpListener::from(sock);
+            l.set_nonblocking(true)?;
+            port = l.local_addr()?.port();
+            listeners.push((b.clone(), ip, port, l));
+        }
+    }
+    let mut fw = Forwards {
+        wake: Vec::new(),
+        threads: Vec::new(),
+        kernel: None,
+        nat: None,
+        bound: Vec::new(),
+    };
+    for (b, ip, port, listener) in listeners {
+        let (wake_r, wake_w) = pipe()?;
+        fw.wake.push(wake_w);
+        fw.threads.push(
+            std::thread::Builder::new()
+                .name(format!("kiri-port-{port}"))
+                .spawn(move || accept_local(&listener, &wake_r, to))?,
+        );
+        fw.bound.push((b, ip, port));
+    }
+    Ok(fw)
+}
+
 /// Binds every port first (so a clash fails the start cleanly), then starts
 /// one accept thread per listener.
 pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]) -> io::Result<Forwards> {
@@ -631,6 +706,41 @@ fn open_udp_session(sock: &UdpSocket, vm: &VmLink, ip: [u8; 4], port: u16, peer:
         reader,
         _guest: guest,
     })
+}
+
+fn accept_local(listener: &TcpListener, wake: &OwnedFd, to: SocketAddr) {
+    loop {
+        let mut fds = [
+            libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: wake.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+        ];
+        // SAFETY: polling two descriptors we own.
+        if unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) } < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return;
+        }
+        if fds[1].revents != 0 {
+            return;
+        }
+        while let Ok((client, from)) = listener.accept() {
+            let Some(permit) = tcp_permit(from.ip()) else { continue };
+            let _ = std::thread::Builder::new().name("kiri-conn".into()).spawn(move || {
+                let _permit = permit;
+                let _ = relay_local(client, to);
+            });
+        }
+    }
+}
+
+fn relay_local(client: TcpStream, to: SocketAddr) -> io::Result<()> {
+    client.set_nonblocking(false)?;
+    client.set_nodelay(true)?;
+    client.set_read_timeout(Some(TCP_IDLE))?;
+    client.set_write_timeout(Some(TCP_IDLE))?;
+    let guest = TcpStream::connect_timeout(&to, DIRECT_CONNECT)?;
+    relay_tcp(client, guest)
 }
 
 fn accept_loop(listener: &TcpListener, wake: &OwnedFd, vm: &Arc<VmLink>, ip: [u8; 4], port: u16, nat: Option<SocketAddr>) {

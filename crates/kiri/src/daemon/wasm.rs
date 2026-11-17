@@ -7,8 +7,9 @@
 //! exit go through the same log and `Event::Exited` path as a Linux container,
 //! which is what `docker logs`, `docker wait` and `--rm` already use.
 //!
-//! Preview 1 core modules and preview 2 command components both run. There is
-//! no network, no `wasi:http`, and no cgroup: a published port is refused.
+//! Preview 1 core modules and preview 2 command components both run. A
+//! component that exports `wasi:http/incoming-handler` is served by
+//! [`super::wasm_http`] instead of running once. There is no cgroup.
 
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -56,10 +57,15 @@ fn active() -> std::sync::MutexGuard<'static, HashMap<String, Active>> {
 /// `signal` is what `docker stop` / `docker kill` asked for. The module's
 /// exit becomes `128 + signal` unless it already called `proc_exit`.
 pub(super) fn interrupt(id: &str, signal: u32) {
-    let guard = active();
-    let Some(slot) = guard.get(id) else { return };
-    slot.killed.store(signal, Ordering::SeqCst);
-    slot.engine.increment_epoch();
+    {
+        let guard = active();
+        if let Some(slot) = guard.get(id) {
+            slot.killed.store(signal, Ordering::SeqCst);
+            slot.engine.increment_epoch();
+        }
+    }
+    // A wasi:http container is a thread blocked in accept, not in wasm.
+    super::wasm_http::shutdown(id);
 }
 
 pub(super) fn write_stdin(id: &str, data: &[u8]) -> io::Result<()> {
@@ -84,11 +90,28 @@ pub(super) fn close_stdin(id: &str) {
 
 pub(super) fn unregister(id: &str) {
     active().remove(id);
+    super::wasm_http::forget(id);
+}
+
+pub(super) fn register(
+    id: &str,
+    engine: wasmtime::Engine,
+    killed: Arc<AtomicU32>,
+    stdin: Option<File>,
+) {
+    active().insert(
+        id.to_owned(),
+        Active {
+            engine,
+            killed,
+            stdin,
+        },
+    );
 }
 
 /// Drops the registration when the module's thread ends, and not before the
 /// exit is reported: a restart can register the same id only after this.
-struct Leave(String);
+pub(super) struct Leave(pub(super) String);
 
 impl Drop for Leave {
     fn drop(&mut self) {
@@ -292,13 +315,13 @@ struct Job<'a> {
     interruptible: bool,
 }
 
-struct WasiIo {
-    stdin: Option<File>,
-    stdout: File,
-    stderr: File,
+pub(super) struct WasiIo {
+    pub(super) stdin: Option<File>,
+    pub(super) stdout: File,
+    pub(super) stderr: File,
 }
 
-fn os_pipe() -> io::Result<(File, File)> {
+pub(super) fn os_pipe() -> io::Result<(File, File)> {
     let mut fds = [0; 2];
     // SAFETY: pipe writes two owned descriptors into `fds`, or it fails and
     // writes nothing we keep. pipe2 is Linux-only; macOS sets CLOEXEC below.
@@ -321,7 +344,7 @@ fn os_pipe() -> io::Result<(File, File)> {
     unsafe { Ok((File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1]))) }
 }
 
-fn signal_code(signal: u32) -> i32 {
+pub(super) fn signal_code(signal: u32) -> i32 {
     128i32.saturating_add(i32::try_from(signal).unwrap_or(i32::MAX))
 }
 
@@ -350,23 +373,34 @@ fn execute(mut job: Job<'_>) -> i32 {
     code
 }
 
-/// A component's version word is `0x0001000a` (layer 1, version 10).
-fn is_component(bytes: &[u8]) -> bool {
-    bytes.len() >= 8 && bytes[0..4] == *b"\0asm" && bytes[4..8] == [0x0a, 0x00, 0x01, 0x00]
+/// A component's version word is layer 1. Toolchains emit `0x0001000d`;
+/// older components, including the `.wat` fixtures, are `0x0001000a`.
+pub(super) fn is_component(bytes: &[u8]) -> bool {
+    bytes.len() >= 8
+        && bytes[0..4] == *b"\0asm"
+        && bytes[5..8] == [0x00, 0x01, 0x00]
+        && matches!(bytes[4], 0x0a | 0x0d)
 }
 
-fn wasi_builder(job: &Job<'_>, io: WasiIo) -> Result<wasmtime_wasi::WasiCtxBuilder, String> {
+pub(super) fn wasi_builder_for(
+    args: &[String],
+    env: &[(String, String)],
+    cwd: &str,
+    preopens: &[Preopen],
+    io: WasiIo,
+) -> Result<wasmtime_wasi::WasiCtxBuilder, String> {
     let mut b = wasmtime_wasi::WasiCtx::builder();
-    // Preview 1 file ops block this thread. Each container has its own thread.
+    // Preview 1 file ops block this thread. Each container has its own thread,
+    // and a wasi:http request runs on its own worker.
     b.allow_blocking_current_thread(true);
-    b.args(job.args);
-    for (k, v) in job.env {
+    b.args(args);
+    for (k, v) in env {
         b.env(k, v);
     }
-    if !job.cwd.is_empty() {
-        b.initial_cwd(job.cwd);
+    if !cwd.is_empty() {
+        b.initial_cwd(cwd);
     }
-    for p in job.preopens {
+    for p in preopens {
         let perms = if p.read_only {
             wasmtime_wasi::FsPerms::ReadOnly
         } else {
@@ -381,6 +415,10 @@ fn wasi_builder(job: &Job<'_>, io: WasiIo) -> Result<wasmtime_wasi::WasiCtxBuild
         b.stdin(wasmtime_wasi::cli::InputFile::new(stdin));
     }
     Ok(b)
+}
+
+fn wasi_builder(job: &Job<'_>, io: WasiIo) -> Result<wasmtime_wasi::WasiCtxBuilder, String> {
+    wasi_builder_for(job.args, job.env, job.cwd, job.preopens, io)
 }
 
 fn arm_deadline(store: &mut wasmtime::Store<impl Sized>, job: &Job<'_>) -> Option<i32> {
@@ -518,7 +556,12 @@ fn run_component(job: &mut Job<'_>, stderr_note: &mut File) -> i32 {
     }
 }
 
-fn pump(engine: Arc<super::engine::Engine>, id: String, stream: Stream, mut file: File) {
+pub(super) fn pump(
+    engine: Arc<super::engine::Engine>,
+    id: String,
+    stream: Stream,
+    mut file: File,
+) {
     let mut buf = [0u8; 8192];
     loop {
         match file.read(&mut buf) {
@@ -567,14 +610,7 @@ pub(super) fn launch(
     killed: Arc<AtomicU32>,
 ) -> io::Result<()> {
     let id = guest.id.clone();
-    active().insert(
-        id.clone(),
-        Active {
-            engine: engine.clone(),
-            killed: killed.clone(),
-            stdin: stdin_write,
-        },
-    );
+    register(&id, engine.clone(), killed.clone(), stdin_write);
     let started = std::thread::Builder::new()
         .name("kiri-wasm".into())
         .spawn(move || {
@@ -654,7 +690,7 @@ pub(super) fn stdin_pipe() -> io::Result<(File, File)> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Read;
+    use std::io::{Read, Write};
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, OnceLock};
     use std::time::Duration;
@@ -861,6 +897,13 @@ mod tests {
                 header.set_cksum();
                 builder.append(&header, bytes.as_slice()).unwrap();
             }
+            let http = include_bytes!("../../../../tests/wasm/http.wasm");
+            let mut header = tar::Header::new_gnu();
+            header.set_path("http.wasm").unwrap();
+            header.set_size(http.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, http.as_slice()).unwrap();
             builder.finish().unwrap();
         }
         let mut gz = Vec::new();
@@ -979,5 +1022,131 @@ mod tests {
         );
         drop(engine);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn current_component_versions_are_recognised() {
+        let http = include_bytes!("../../../../tests/wasm/http.wasm");
+        assert!(
+            is_component(http),
+            "http.wasm version {:02x?}",
+            &http[4..8]
+        );
+    }
+
+    #[test]
+    fn a_command_module_still_cannot_publish_ports() {
+        let dir = scratch("ports");
+        let store = kiri_image::Store::open(&dir).unwrap();
+        let engine = super::super::engine::Engine::boot(store).unwrap();
+        engine.test_clear_stopped();
+        let image = install_wasi_image(&engine.store);
+        let spec: super::super::engine::Spec = serde_json::from_value(serde_json::json!({
+            "image": image.name, "image_id": image.digest, "entrypoint": ["/hello.wasm"], "cmd": [],
+            "env": [], "cwd": "/", "user": "", "auto_remove": false, "network_mode": "none", "labels": {},
+            "ports": [{"container_port": 80, "proto": "tcp", "host_ip": "127.0.0.1", "host_port": 0}]
+        }))
+        .unwrap();
+        let id = engine.create(Some("wasi-cmd".into()), spec, &image).unwrap();
+        let err = engine.start(&id).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("wasi:http"), "{msg}");
+        assert!(!engine.is_awake());
+        drop(engine);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_wasi_http_component_serves_until_stopped() {
+        let dir = scratch("http");
+        let store = kiri_image::Store::open(&dir).unwrap();
+        let engine = super::super::engine::Engine::boot(store).unwrap();
+        engine.test_clear_stopped();
+        let image = install_wasi_image(&engine.store);
+        let spec: super::super::engine::Spec = serde_json::from_value(serde_json::json!({
+            "image": image.name, "image_id": image.digest, "entrypoint": ["/http.wasm"], "cmd": [],
+            "env": ["WASM_IMAGE=1"], "cwd": "/", "user": "", "auto_remove": false,
+            "network_mode": "none", "labels": {},
+            "ports": [{"container_port": 80, "proto": "tcp", "host_ip": "127.0.0.1", "host_port": 0}]
+        }))
+        .unwrap();
+        let id = engine
+            .create(Some("wasi-http".into()), spec, &image)
+            .unwrap();
+        engine.start(&id).unwrap();
+        assert!(!engine.is_awake(), "serving http booted the VM");
+        let port = engine
+            .with(&id, |c| c.forwards.as_ref().unwrap().bound[0].2)
+            .unwrap();
+        assert_ne!(port, 0);
+        let routed = engine.route("wasi-http.kiri.local").expect("name route");
+        assert_eq!(routed.ip, [127, 0, 0, 1]);
+
+        let get = http_exchange(
+            port,
+            "GET /users/1 HTTP/1.1\r\nHost: wasi-http.kiri.local\r\nx-echo: hi\r\nConnection: close\r\n\r\n",
+        );
+        assert!(get.contains("HTTP/1.1 200"), "{get}");
+        assert!(get.contains("GET /users/1\nhi"), "{get}");
+        let post = http_exchange(
+            port,
+            "POST /v1 HTTP/1.1\r\nHost: wasi-http.kiri.local\r\nContent-Length: 4\r\nConnection: close\r\n\r\nping",
+        );
+        assert!(post.contains("POST /v1\nping"), "{post}");
+
+        let logs = engine.logs(&id, false).unwrap().unwrap();
+        let mut text = Vec::new();
+        for rec in logs.past.tail(None) {
+            if rec.stream == Stream::Stdout {
+                text.extend_from_slice(&rec.data);
+            }
+        }
+        let text = String::from_utf8_lossy(&text);
+        assert!(text.contains("GET /users/1"), "{text}");
+        assert!(text.contains("POST /v1"), "{text}");
+
+        engine.stop(&id, Duration::from_secs(5)).unwrap();
+        let code = engine.wait(&id, "not-running").unwrap();
+        assert!(code == 143 || code == 137, "exit {code}");
+        assert!(engine.route("wasi-http.kiri.local").is_none());
+        assert!(!engine.is_awake());
+        drop(engine);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn http_exchange(port: u16, req: &str) -> String {
+        let mut stream = None;
+        let mut last = String::new();
+        for _ in 0..20 {
+            match std::net::TcpStream::connect(("127.0.0.1", port)) {
+                Ok(s) => {
+                    stream = Some(s);
+                    break;
+                }
+                Err(e) => last = e.to_string(),
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let mut stream = stream.unwrap_or_else(|| panic!("no connection to {port}: {last}"));
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream.write_all(req.as_bytes()).unwrap();
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            match stream.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::TimedOut
+                        || e.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    break;
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
     }
 }

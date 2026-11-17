@@ -2065,11 +2065,6 @@ impl Engine {
     ) -> Result<(), Error> {
         let id = self.resolve(key)?;
         let spec = self.with(&id, |c| c.spec.clone())?;
-        if !spec.ports.is_empty() {
-            return Err(Error::BadRequest(
-                "wasm containers do not publish ports".into(),
-            ));
-        }
         {
             let st = self.lock();
             let c = st.containers.get(&id).expect("resolved");
@@ -2107,6 +2102,18 @@ impl Engine {
             }
             other => other?,
         };
+        let http = super::wasm_http::prepare(&id, &bytes)?;
+        if !spec.ports.is_empty() {
+            if http.is_none() {
+                return Err(Error::BadRequest(
+                    "only a wasi:http component can publish ports".into(),
+                ));
+            }
+            if spec.ports.iter().any(|b| b.proto == "udp") {
+                super::wasm_http::forget(&id);
+                return Err(Error::BadRequest("wasm http does not publish udp".into()));
+            }
+        }
         let volumes = self.store.root().join("wasm-volumes");
         let tmp = super::logfile::dir(self.store.root(), &id).join("tmpfs");
         let preopens = super::wasm::preopens(
@@ -2122,58 +2129,91 @@ impl Engine {
         } else {
             (None, None)
         };
+        // Bind published ports before the container is Running. `start`
+        // relays through the VM and, on macOS, never dials a host loopback
+        // socket, so a wasi:http handler cannot use it.
+        let mut forwards = if spec.ports.is_empty() {
+            None
+        } else {
+            let Some(addr) = http.as_ref().map(|prep| prep.addr) else {
+                super::wasm_http::forget(&id);
+                return Err(Error::BadRequest(
+                    "only a wasi:http component can publish ports".into(),
+                ));
+            };
+            match super::ports::start_local(&spec.ports, addr) {
+                Ok(fw) => Some(fw),
+                Err(e) => {
+                    super::wasm_http::forget(&id);
+                    return Err(Error::Conflict(e.to_string()));
+                }
+            }
+        };
+        let mut abort = false;
         {
             let mut st = self.lock();
             let c = st.containers.get_mut(&id).expect("resolved");
-            if c.status == Status::Running {
-                return Ok(());
+            if c.status == Status::Running
+                || (reason != Start::User && !std::mem::take(&mut c.restart_pending))
+            {
+                abort = true;
+            } else {
+                c.status = Status::Running;
+                c.restart_pending = false;
+                c.started = Some(SystemTime::now());
+                c.finished = None;
+                c.oom_killed = false;
+                c.vm_stopped = false;
+                c.exit_code = 0;
+                if c.spec.auto_remove && !c.attached.is_empty() {
+                    lock_log(&c.log).keep_in_memory();
+                }
+                if reason == Start::User {
+                    c.stopped_by_user = false;
+                    c.restart_count = 0;
+                }
+                c.forwards = forwards.take();
             }
-            if reason != Start::User && !std::mem::take(&mut c.restart_pending) {
-                return Ok(());
-            }
-            c.status = Status::Running;
-            c.restart_pending = false;
-            c.started = Some(SystemTime::now());
-            c.finished = None;
-            c.oom_killed = false;
-            c.vm_stopped = false;
-            c.exit_code = 0;
-            if c.spec.auto_remove && !c.attached.is_empty() {
-                lock_log(&c.log).keep_in_memory();
-            }
-            if reason == Start::User {
-                c.stopped_by_user = false;
-                c.restart_count = 0;
-            }
+        }
+        if abort {
+            drop(forwards);
+            drop(http);
+            super::wasm_http::forget(&id);
+            return Ok(());
         }
         let daemon = self
             .me
             .get()
             .and_then(Weak::upgrade)
             .ok_or_else(|| Error::Io(io::Error::other("engine is gone")))?;
-        let engine = super::wasm::new_engine()?;
         let killed = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-        if let Err(e) = super::wasm::launch(
-            daemon,
-            super::wasm::Guest {
-                id: id.clone(),
-                bytes,
-                args: argv,
-                env: super::wasm::split_env(&spec.env),
-                cwd: spec.cwd.clone(),
-                preopens,
-                stdin_read,
-            },
-            stdin_write,
-            engine,
-            killed,
-        ) {
+        let guest = super::wasm::Guest {
+            id: id.clone(),
+            bytes,
+            args: argv,
+            env: super::wasm::split_env(&spec.env),
+            cwd: spec.cwd.clone(),
+            preopens,
+            stdin_read,
+        };
+        let launched = if let Some(prep) = http {
+            super::wasm_http::spawn(daemon, guest, prep, stdin_write, killed)
+        } else {
+            match super::wasm::new_engine() {
+                Ok(engine) => super::wasm::launch(daemon, guest, stdin_write, engine, killed),
+                Err(e) => Err(e),
+            }
+        };
+        if let Err(e) = launched {
             crate::diag::warn!(
                 "wasm container did not start",
                 id = &id[..12],
                 image = spec.image,
                 error = e
             );
+            let fw = self.lock().containers.get_mut(&id).and_then(|c| c.forwards.take());
+            drop(fw);
+            super::wasm_http::forget(&id);
             self.fail_start(&id, &spec, &e);
             return Err(Error::Io(e));
         }
@@ -2776,7 +2816,13 @@ impl Engine {
                 chosen || c.name.eq_ignore_ascii_case(&name) || service.eq_ignore_ascii_case(&name) || (name.len() >= 12 && c.id.starts_with(&name))
             }
         })?;
-        let ip = if c.spec.network_mode == "host" { [127, 0, 0, 1] } else { c.ip? };
+        // A wasi:http container has no guest address. The router dials the
+        // handler on loopback. A command module stays unroutable.
+        let ip = if c.spec.network_mode == "host" || super::wasm_http::http_addr(&c.id).is_some() {
+            [127, 0, 0, 1]
+        } else {
+            c.ip?
+        };
         Some(super::domains::Target {
             ip,
             id: c.id.clone(),
