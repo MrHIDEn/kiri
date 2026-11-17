@@ -15,7 +15,9 @@
 //! the Mac's own network: `127.0.0.1` is the Mac's loopback, and a name is
 //! resolved here, not inside the VM. Container addresses that exist only
 //! in the VM are not reachable. HTTPS trusts the CA set compiled into the
-//! daemon, and the module's `HTTP_PROXY` is not applied. A preview 1 core
+//! daemon, and the module's `HTTP_PROXY` is not applied. Incoming request
+//! and response bodies are streamed, each capped by
+//! `KIRI_WASM_HTTP_BODY_LIMIT` (32 MiB unless set). A preview 1 core
 //! module has no `wasi:http`.
 
 use std::collections::HashMap;
@@ -581,12 +583,7 @@ fn run_component(job: &mut Job<'_>, stderr_note: &mut File) -> i32 {
     }
 }
 
-pub(super) fn pump(
-    engine: Arc<super::engine::Engine>,
-    id: String,
-    stream: Stream,
-    mut file: File,
-) {
+pub(super) fn pump(engine: Arc<super::engine::Engine>, id: String, stream: Stream, mut file: File) {
     let mut buf = [0u8; 8192];
     loop {
         match file.read(&mut buf) {
@@ -936,6 +933,13 @@ mod tests {
             header.set_mode(0o644);
             header.set_cksum();
             builder.append(&header, fetch.as_slice()).unwrap();
+            let stream = include_bytes!("../../../../tests/wasm/stream.wasm");
+            let mut header = tar::Header::new_gnu();
+            header.set_path("stream.wasm").unwrap();
+            header.set_size(stream.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, stream.as_slice()).unwrap();
             builder.finish().unwrap();
         }
         let mut gz = Vec::new();
@@ -1067,6 +1071,10 @@ mod tests {
                 "fetch.wasm",
                 include_bytes!("../../../../tests/wasm/fetch.wasm").as_slice(),
             ),
+            (
+                "stream.wasm",
+                include_bytes!("../../../../tests/wasm/stream.wasm").as_slice(),
+            ),
         ] {
             assert!(is_component(bytes), "{name} version {:02x?}", &bytes[4..8]);
         }
@@ -1085,7 +1093,9 @@ mod tests {
             "ports": [{"container_port": 80, "proto": "tcp", "host_ip": "127.0.0.1", "host_port": 0}]
         }))
         .unwrap();
-        let id = engine.create(Some("wasi-cmd".into()), spec, &image).unwrap();
+        let id = engine
+            .create(Some("wasi-cmd".into()), spec, &image)
+            .unwrap();
         let err = engine.start(&id).unwrap_err();
         let msg = format!("{err:?}");
         assert!(msg.contains("wasi:http"), "{msg}");
@@ -1201,6 +1211,89 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Four megabytes in, four megabytes out, past the old 1 MiB buffer.
+    /// The upload is chunked, so the length is not known up front. The
+    /// download is chunked because the guest sets no content-length.
+    #[test]
+    fn a_wasi_http_handler_streams_several_megabytes() {
+        const N: usize = 4 * 1024 * 1024;
+        let dir = scratch("stream");
+        let store = kiri_image::Store::open(&dir).unwrap();
+        let engine = super::super::engine::Engine::boot(store).unwrap();
+        engine.test_clear_stopped();
+        let image = install_wasi_image(&engine.store);
+        let spec: super::super::engine::Spec = serde_json::from_value(serde_json::json!({
+            "image": image.name, "image_id": image.digest, "entrypoint": ["/stream.wasm"], "cmd": [],
+            "env": [], "cwd": "/", "user": "", "auto_remove": false, "network_mode": "none", "labels": {},
+            "ports": [{"container_port": 80, "proto": "tcp", "host_ip": "127.0.0.1", "host_port": 0}]
+        }))
+        .unwrap();
+        let id = engine
+            .create(Some("wasi-stream".into()), spec, &image)
+            .unwrap();
+        engine.start(&id).unwrap();
+        assert!(!engine.is_awake(), "streaming http booted the VM");
+        let port = engine
+            .with(&id, |c| c.forwards.as_ref().unwrap().bound[0].2)
+            .unwrap();
+
+        let small = http_raw(
+            port,
+            "POST /upload HTTP/1.1\r\nHost: wasi-stream.kiri.local\r\nContent-Length: 3\r\nConnection: close\r\n\r\n",
+            b"abc",
+        );
+        let (_, small_body) = split_http(&small);
+        assert_eq!(
+            String::from_utf8_lossy(&small_body),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\n3\n",
+            "{}",
+            String::from_utf8_lossy(&small)
+        );
+
+        let payload = pattern(N);
+        let expect = sha256_hex(&payload);
+        let raw = http_raw(
+            port,
+            "POST /upload HTTP/1.1\r\nHost: wasi-stream.kiri.local\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            &chunked(&payload),
+        );
+        let (_, body) = split_http(&raw);
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(text, format!("{expect}\n{N}\n"), "{text}");
+
+        let down = http_raw(
+            port,
+            &format!(
+                "GET /download?n={N} HTTP/1.1\r\nHost: wasi-stream.kiri.local\r\nConnection: close\r\n\r\n"
+            ),
+            b"",
+        );
+        let (head, got) = split_http(&down);
+        assert!(
+            head.to_ascii_lowercase().contains("chunked"),
+            "response should stream: {head}"
+        );
+        assert_eq!(got.len(), N, "downloaded {} bytes\n{head}", got.len());
+        assert_eq!(sha256_hex(&got), expect);
+
+        let too_big = 32 * 1024 * 1024 + 1;
+        let refused = http_raw(
+            port,
+            &format!(
+                "POST /upload HTTP/1.1\r\nHost: wasi-stream.kiri.local\r\nContent-Length: {too_big}\r\nConnection: close\r\n\r\n"
+            ),
+            b"",
+        );
+        let refused = String::from_utf8_lossy(&refused);
+        assert!(refused.contains("413"), "{refused}");
+
+        engine.stop(&id, Duration::from_secs(5)).unwrap();
+        let _ = engine.wait(&id, "not-running");
+        assert!(!engine.is_awake());
+        drop(engine);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// One HTTP response, from this process. The wasm module dials it itself.
     fn serve_text(body: &'static [u8]) -> (u16, std::thread::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1281,5 +1374,104 @@ mod tests {
             }
         }
         String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    fn http_raw(port: u16, head: &str, body: &[u8]) -> Vec<u8> {
+        let mut stream = None;
+        let mut last = String::new();
+        for _ in 0..40 {
+            match std::net::TcpStream::connect(("127.0.0.1", port)) {
+                Ok(s) => {
+                    stream = Some(s);
+                    break;
+                }
+                Err(e) => last = e.to_string(),
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let mut stream = stream.unwrap_or_else(|| panic!("no connection to {port}: {last}"));
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        stream.write_all(head.as_bytes()).unwrap();
+        stream.write_all(body).unwrap();
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 64 * 1024];
+        loop {
+            match stream.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::TimedOut
+                        || e.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    break;
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        buf
+    }
+
+    fn pattern(n: usize) -> Vec<u8> {
+        (0..n)
+            .map(|i| (i as u64).wrapping_mul(131).wrapping_add(17) as u8)
+            .collect()
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::Digest;
+        sha2::Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    fn chunked(data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(data.len() + 64);
+        for chunk in data.chunks(64 * 1024) {
+            out.extend_from_slice(format!("{:X}\r\n", chunk.len()).as_bytes());
+            out.extend_from_slice(chunk);
+            out.extend_from_slice(b"\r\n");
+        }
+        out.extend_from_slice(b"0\r\n\r\n");
+        out
+    }
+
+    /// Headers and the decoded body. Chunked responses are unframed.
+    fn split_http(raw: &[u8]) -> (String, Vec<u8>) {
+        let sep = raw
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .unwrap_or_else(|| panic!("{}", String::from_utf8_lossy(raw)));
+        let head = String::from_utf8_lossy(&raw[..sep]).into_owned();
+        let mut rest = &raw[sep + 4..];
+        if head
+            .to_ascii_lowercase()
+            .contains("transfer-encoding: chunked")
+        {
+            let mut body = Vec::new();
+            loop {
+                let line_end = rest
+                    .windows(2)
+                    .position(|w| w == b"\r\n")
+                    .unwrap_or_else(|| panic!("chunk size in {head}"));
+                let line = std::str::from_utf8(&rest[..line_end]).unwrap();
+                let size =
+                    usize::from_str_radix(line.split(';').next().unwrap().trim(), 16).unwrap();
+                rest = &rest[line_end + 2..];
+                if size == 0 {
+                    break;
+                }
+                body.extend_from_slice(&rest[..size]);
+                rest = &rest[size + 2..];
+            }
+            (head, body)
+        } else {
+            (head, rest.to_vec())
+        }
     }
 }

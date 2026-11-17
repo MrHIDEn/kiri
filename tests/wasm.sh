@@ -4,7 +4,8 @@
 # path the way a person would: hello-world on stdout, args and env, a
 # non-zero exit, a read-only bind, a detached container's ps/stop/rm,
 # `--rm` actually removing the container, a wasi:http component, and a
-# component that calls out with wasi:http/outgoing-handler.
+# component that calls out with wasi:http/outgoing-handler, and a
+# multi-megabyte upload and download (sha256) through a streaming handler.
 #
 # The http section needs curl. It always checks the published port. It also
 # requests `http://<name>.kiri.local/users/1` when this engine says it is
@@ -14,7 +15,8 @@
 # while this one has domains off; that is a skip, not a failure.
 #
 # The outgoing section needs perl, which answers one small HTTP server the
-# modules call on this machine's loopback.
+# modules call on this machine's loopback. The streaming section needs
+# python3, for the sha256 of a generated body.
 #
 # Kiri has no image builder, so the image is not `docker build`ed. The
 # modules live as `.wat` in tests/wasm/ and a `cargo test` (no VM, no daemon)
@@ -98,6 +100,7 @@ cleanup() {
   if [ -n "${NOTE:-}" ]; then rm -rf "$NOTE"; fi
   if [ -n "${TAR:-}" ]; then rm -f "$TAR"; fi
   if [ -n "${FETCH_PID:-}" ]; then kill "$FETCH_PID" >/dev/null 2>&1 || true; fi
+  if [ -n "${STREAM:-}" ]; then rm -rf "$STREAM"; fi
 }
 trap cleanup EXIT
 
@@ -308,6 +311,58 @@ else
   wait "$FETCH_PID" 2>/dev/null || true
   FETCH_PID=
   rm -f "$FETCH_PORT_FILE"
+fi
+
+echo "== wasi:http streaming"
+MB=$((4 * 1024 * 1024))
+sname=$RUN-stream
+if ! command -v python3 >/dev/null 2>&1; then
+  bad "streaming checks need python3"
+elif ! command -v curl >/dev/null 2>&1; then
+  bad "streaming checks need curl"
+elif cid=$(run -d --name "$sname" --entrypoint /stream.wasm -p 127.0.0.1::80 "$IMAGE" 2>&1); then
+  hp=$(d port "$sname" 80/tcp 2>/dev/null | head -n 1 || true)
+  hp=${hp##*:}
+  STREAM=$(mktemp -d)
+  up=$STREAM/up
+  down=$STREAM/down
+  hash=$(python3 - "$up" "$MB" <<'PY'
+import hashlib, sys
+path, n = sys.argv[1], int(sys.argv[2])
+data = bytes(((i * 131 + 17) & 255) for i in range(n))
+open(path, "wb").write(data)
+print(hashlib.sha256(data).hexdigest())
+PY
+)
+  body=
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    body=$(curl -fsS --max-time 30 --data-binary @"$up" "http://127.0.0.1:${hp}/upload" 2>&1) && break
+    sleep 0.2
+  done
+  got=${body%%$'\n'*}
+  if [ "$got" = "$hash" ] && printf '%s' "$body" | grep -q "$MB"; then
+    ok "upload of 4 MiB matches sha256"
+  else
+    bad "upload of 4 MiB matches sha256" "$body"
+  fi
+  hdr=$STREAM/hdr
+  if curl -fsS --max-time 30 -D "$hdr" -o "$down" "http://127.0.0.1:${hp}/download?n=$MB"; then
+    dhash=$(python3 - "$down" <<'PY'
+import hashlib, sys
+print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())
+PY
+)
+    if [ "$dhash" = "$hash" ] && grep -qi 'chunked' "$hdr"; then
+      ok "download of 4 MiB is chunked and matches sha256"
+    else
+      bad "download of 4 MiB is chunked and matches sha256" "$dhash"
+    fi
+  else
+    bad "download of 4 MiB is chunked and matches sha256" "curl failed"
+  fi
+  lim 20 d rm -f "$sname" >/dev/null 2>&1 || true
+else
+  bad "streaming container starts" "$cid"
 fi
 
 echo

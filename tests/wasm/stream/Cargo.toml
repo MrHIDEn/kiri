@@ -1,0 +1,15 @@
+[workspace]
+
+[package]
+name = "kiri-wasm-stream"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "wasi:http incoming-handler that hashes an upload and streams a download"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wasi = "0.14.7"
+sha2 = "0.10"
