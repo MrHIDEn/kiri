@@ -34,6 +34,12 @@ kiri-vmm = { path = "../kiri-vmm" }
 # wasmtime-wasi's `p1` also enables preview 2 command components; preview 3 stays off.
 wasmtime = "50.0.2"
 wasmtime-wasi = { version = "50.0.2", default-features = false, features = ["p1"] }
+# wasi:http incoming-handler (`wasmtime serve`). p3 stays off. tokio and hyper
+# are what that crate serves requests on; versions follow it.
+wasmtime-wasi-http = { version = "50.0.2", default-features = false, features = ["p2", "default-send-request"] }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "time", "sync", "io-util", "macros"] }
+hyper = { version = "1", default-features = false, features = ["http1", "server"] }
+http-body-util = "0.1"
 # Layer archives: a wasm image is unpacked here. The tests read the builder's too.
 tar = "0.4"
 

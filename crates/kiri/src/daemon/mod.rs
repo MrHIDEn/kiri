@@ -35,6 +35,7 @@ mod vmcpu;
 mod vmlink;
 mod volumes;
 mod wasm;
+mod wasm_http;
 #[cfg(target_os = "macos")]
 mod watch;
 

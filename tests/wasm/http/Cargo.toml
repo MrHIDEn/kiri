@@ -1,0 +1,14 @@
+[workspace]
+
+[package]
+name = "kiri-wasm-http"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Tiny wasi:http/incoming-handler used by Kiri's wasm tests"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wasi = "0.14.7"

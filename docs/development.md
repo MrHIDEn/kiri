@@ -43,7 +43,7 @@ docker buildx create --name kiri-build --driver docker-container \
   --driver-opt default-load=true --use kiri    # for docker build
 ./target/release/kiri bench         # Kiri vs OrbStack vs Docker Desktop
 SOAK=600 tests/e2e.sh               # every check, then 600 runs watching for leaks
-DOCKER_CONTEXT=kiri tests/wasm.sh   # WASI workloads through the docker CLI; needs a running daemon
+DOCKER_CONTEXT=kiri tests/wasm.sh   # WASI workloads, including wasi:http, through the docker CLI; needs a running daemon
 ```
 
 Docker's commands also work as `kiri` commands, always on Kiri whatever
@@ -90,8 +90,10 @@ kiri UI ────┘
   into the guest once and unpacked there.
 - **WASI**: `docker run --platform wasi/wasm` (or an image whose config says
   `os` `wasi` and `architecture` `wasm`) runs the module in the daemon on
-  wasmtime. It does not boot the VM. `tests/wasm.sh` covers it through the
-  docker CLI.
+  wasmtime. It does not boot the VM. A component that exports
+  `wasi:http/incoming-handler` stays up and serves HTTP, including
+  `<name>.kiri.local` and published ports. `tests/wasm.sh` covers both
+  through the docker CLI.
 
 ## Layout
 
@@ -106,7 +108,7 @@ kiri UI ────┘
 | `tests/e2e.sh` | ~350 checks through the real `docker` CLI, plus a leak soak (`K8S=1` adds Kubernetes) |
 | `tests/linux-host.sh` | the Linux host build, driven in a privileged container |
 | `tests/finder-mount.sh` | the Mac's Finder mount at `~/Kiri`: covers only an empty folder or its own old mount, never your files or another mount |
-| `tests/wasm.sh` | WASI workloads through the real `docker` CLI (hello, args and env, exit code, a read-only volume, `ps`/`stop`/`rm`, `--rm`); needs a running daemon, no VM |
+| `tests/wasm.sh` | WASI workloads through the real `docker` CLI (hello, args and env, exit code, a read-only volume, `ps`/`stop`/`rm`, `--rm`, a wasi:http container on a published port and on `<name>.kiri.local`); needs a running daemon, no VM |
 | `contrib/` | systemd unit, WSL2 and Windows install scripts |
 | `installer/windows` | the Windows MSI (WiX 5): `kiri.wxs`, licence, dialog bitmaps |
 | `packaging/` | Linux `.deb` and `.rpm` (`kiri` with the docker CLI, `kiri-lite` engine only), the Homebrew plan |

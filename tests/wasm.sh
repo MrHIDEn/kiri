@@ -2,8 +2,14 @@
 # WASI workloads through the real docker CLI. Kiri runs `wasi/wasm` images in
 # the daemon, on wasmtime, and does not boot the VM. This script checks that
 # path the way a person would: hello-world on stdout, args and env, a
-# non-zero exit, a read-only bind, a detached container's ps/stop/rm, and
-# `--rm` actually removing the container.
+# non-zero exit, a read-only bind, a detached container's ps/stop/rm,
+# `--rm` actually removing the container, and a wasi:http component.
+#
+# The http section needs curl. It always checks the published port. It also
+# requests `http://<name>.kiri.local/users/1` when something is listening on
+# the domain router's port (80, or KIRI_HTTP_PORT). That request uses
+# curl --resolve, so it does not need DNS. If the router is not up, that
+# one check is skipped.
 #
 # Kiri has no image builder, so the image is not `docker build`ed. The
 # modules live as `.wat` in tests/wasm/ and a `cargo test` (no VM, no daemon)
@@ -69,7 +75,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "== image from tests/wasm/*.wat"
+echo "== image from tests/wasm"
 TAR=$(mktemp)
 export KIRI_WASM_IMAGE=$TAR
 if ! (cd "$ROOT" && cargo test -p kiri --bin kiri daemon::wasm::tests::a_loadable_wasi_image_can_be_written -- --exact) >"${TAR}.log" 2>&1; then
@@ -141,6 +147,58 @@ fi
 out=$(run --rm --name "$RUN-gone" "$IMAGE" 2>&1) && ec=0 || ec=$?
 left=$(d ps -aq --filter "name=^/${RUN}-gone$" 2>/dev/null || true)
 if [ "$ec" = 0 ] && [ -z "$left" ]; then ok "--rm removes the container"; else bad "--rm removes the container" "exit $ec left=${left:-none} $out"; fi
+
+echo "== wasi:http"
+name=$RUN-http
+if ! command -v curl >/dev/null 2>&1; then
+  bad "wasi:http checks need curl"
+elif cid=$(run -d --name "$name" --entrypoint /http.wasm -p 127.0.0.1::80 "$IMAGE" 2>&1); then
+  status=$(d ps --filter "name=^/${name}$" --format '{{.Status}}' 2>&1 || true)
+  if printf '%s' "$status" | grep -q '^Up'; then ok "detached http container is listed Up"; else bad "detached http container is listed Up" "$status"; fi
+  hp=$(d port "$name" 80/tcp 2>/dev/null | head -n 1 || true)
+  hp=${hp##*:}
+  body=
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    body=$(curl -fsS --max-time 5 -H 'X-Echo: hi' "http://127.0.0.1:${hp}/users/1" 2>&1) && break
+    sleep 0.2
+  done
+  if printf '%s' "$body" | grep -q 'GET /users/1' && printf '%s' "$body" | grep -q 'hi'; then
+    ok "published port serves /users/1"
+  else
+    bad "published port serves /users/1" "$body"
+  fi
+  logs=$(d logs "$name" 2>&1 || true)
+  if printf '%s' "$logs" | grep -q 'GET /users/1'; then ok "the request is in the container log"; else bad "the request is in the container log" "$logs"; fi
+  dport=${KIRI_HTTP_PORT:-80}
+  probe=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:${dport}/" || true)
+  if [ "$probe" = "000" ] || [ -z "$probe" ]; then
+    ok "kiri.local skipped: nothing is listening on port ${dport}"
+  else
+    body=$(curl -fsS --max-time 5 --resolve "${name}.kiri.local:${dport}:127.0.0.1" -H 'X-Echo: name' "http://${name}.kiri.local:${dport}/users/1" 2>&1) && ec=0 || ec=$?
+    if [ "$ec" = 0 ] && printf '%s' "$body" | grep -q 'GET /users/1' && printf '%s' "$body" | grep -q 'name'; then
+      ok "http://${name}.kiri.local/users/1 reaches the module"
+    else
+      bad "http://${name}.kiri.local/users/1 reaches the module" "exit $ec: $body"
+    fi
+  fi
+  if lim 20 d stop "$name" >/dev/null 2>&1; then
+    state=$(d inspect -f '{{.State.Status}} {{.State.ExitCode}}' "$name" 2>&1 || true)
+    case "$state" in
+      "exited 143"|"exited 137") ok "docker stop ends the http server ($state)" ;;
+      *) bad "docker stop ends the http server" "$state" ;;
+    esac
+  else
+    bad "docker stop ends the http server" "stop timed out"
+  fi
+  if d rm "$name" >/dev/null 2>&1; then
+    left=$(d ps -aq --filter "name=^/${name}$" 2>/dev/null || true)
+    if [ -z "$left" ]; then ok "docker rm removes the http container"; else bad "docker rm removes the http container" "$left"; fi
+  else
+    bad "docker rm removes the http container"
+  fi
+else
+  bad "http container starts" "$cid"
+fi
 
 echo
 echo "wasm: $PASS passed, $FAIL failed"
