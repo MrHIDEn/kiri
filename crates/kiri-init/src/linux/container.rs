@@ -1135,9 +1135,22 @@ fn apply_mount(root: BorrowedFd<'_>, image: Option<BorrowedFd<'_>>, m: &Mount) -
         // never from a bind mounted over it earlier (`./:/app` then
         // `/app/node_modules` must get the image's node_modules, not the
         // host's): looked up in the image's own tree when there is one.
-        let from = match image {
-            Some(img) => inroot::open(img, t, Last::Exists).ok(),
-            None => None,
+        // The image tree also holds the container's own layer, so it can show
+        // the folder Kiri just made (or made on an earlier start) for this
+        // mount. That isn't the image's: copying its root-owned 755 over the
+        // volume would undo a tmpfs volume's uid=, gid= and mode= (#296).
+        // So: when the lookup reaches the very folder this start created,
+        // it's marked and skipped; on later starts the mark skips it. The
+        // image's own folders have no mark, and one made inside an earlier
+        // bind (`./:/app` then `/app/node_modules`) is a different folder, so
+        // both still copy up as before.
+        let from = match image.and_then(|img| inroot::open(img, t, Last::Exists).ok()) {
+            Some(f) if at.created && same_dir(&f, &at) => {
+                mark_mountpoint(&target);
+                None
+            }
+            Some(f) if is_mountpoint_mark(&f.proc_path()) => None,
+            other => other,
         };
         let from_path = match &from {
             Some(f) => Some(f.proc_path()),
@@ -1161,6 +1174,29 @@ fn apply_mount(root: BorrowedFd<'_>, image: Option<BorrowedFd<'_>>, m: &Mount) -
         sys::mount(c"none", &at.proc_path(), c"none", libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_REC, None)?;
     }
     Ok(())
+}
+
+/// The xattr on a folder Kiri made in the container's layer to mount on.
+const MOUNTPOINT_MARK: &std::ffi::CStr = c"user.kiri.mountpoint";
+
+fn mark_mountpoint(dir: &std::ffi::CStr) {
+    // SAFETY: a valid NUL-terminated path and a one-byte value. A filesystem
+    // without user xattrs refuses it; the same-folder check still covers the
+    // first start then.
+    unsafe { libc::setxattr(dir.as_ptr(), MOUNTPOINT_MARK.as_ptr(), b"1".as_ptr().cast(), 1, 0) };
+}
+
+fn is_mountpoint_mark(dir: &std::ffi::CStr) -> bool {
+    let mut v = [0u8; 1];
+    // SAFETY: reads at most `v.len()` bytes into `v`.
+    unsafe { libc::getxattr(dir.as_ptr(), MOUNTPOINT_MARK.as_ptr(), v.as_mut_ptr().cast(), v.len()) >= 0 }
+}
+
+/// Both descriptors name the same folder (device and inode).
+fn same_dir(a: &inroot::Found, b: &inroot::Found) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let meta = |f: &inroot::Found| fs::metadata(Path::new(std::ffi::OsStr::from_bytes(f.proc_path().to_bytes())));
+    matches!((meta(a), meta(b)), (Ok(x), Ok(y)) if x.dev() == y.dev() && x.ino() == y.ino())
 }
 
 /// A detached copy of the current directory's mount (the container's
