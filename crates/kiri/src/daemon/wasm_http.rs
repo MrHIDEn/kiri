@@ -6,6 +6,14 @@
 //! not grow a second HTTP stack. TLS stops at the domain router: the
 //! handler always sees plain HTTP.
 //!
+//! A container with no `dev.kiri.wasm.port.<port>` label has one handler,
+//! and every published port relays to it. A label names another module for
+//! that container port (image `config.Labels`, overridden by the container).
+//! Each distinct module gets its own listener. Each listener reads the body
+//! limit and idle timeout below when it starts, and has its own cap on
+//! instantiations in flight. The domain router dials the listener for the
+//! container port it picked.
+//!
 //! `wasi:http/outgoing-handler` is the same host network as a command
 //! component: this process dials, so loopback and DNS are the machine's,
 //! not the VM's. HTTPS uses the daemon's compiled-in CA set. That client
@@ -90,7 +98,13 @@ impl WasiHttpView for State {
 }
 
 struct Running {
-    addr: SocketAddr,
+    /// The entrypoint's listener, or the first handler when the entrypoint
+    /// is not one. [`http_addr`] returns this.
+    default: SocketAddr,
+    by_port: HashMap<u16, SocketAddr>,
+    /// A port with no label is served by `default` only when the entrypoint
+    /// itself is an incoming-handler.
+    entry_is_handler: bool,
     stop: watch::Sender<bool>,
 }
 
@@ -101,14 +115,29 @@ fn running() -> std::sync::MutexGuard<'static, HashMap<String, Running>> {
     RUNNING.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Where the domain router and published ports connect, once the handler is
-/// listening.
+/// Where a caller connects when it has not picked a container port: the
+/// entrypoint's listener. `Some` means this container is serving HTTP.
 pub(super) fn http_addr(id: &str) -> Option<SocketAddr> {
-    running().get(id).map(|r| r.addr)
+    running().get(id).map(|r| r.default)
 }
 
-/// Wakes the accept loop. The in-flight request traps because `interrupt`
-/// already moved this container's epoch.
+/// The listener for `port`. A port whose label names a module uses that
+/// listener. Any other port uses the entrypoint when that is itself a handler.
+pub(super) fn http_addr_for(id: &str, port: u16) -> Option<SocketAddr> {
+    let guard = running();
+    let run = guard.get(id)?;
+    if let Some(addr) = run.by_port.get(&port) {
+        return Some(*addr);
+    }
+    if run.entry_is_handler {
+        Some(run.default)
+    } else {
+        None
+    }
+}
+
+/// Wakes every accept loop. The in-flight requests trap because `interrupt`
+/// already moved this container's epoch, and every handler shares that engine.
 pub(super) fn shutdown(id: &str) {
     if let Some(run) = running().get(id) {
         let _ = run.stop.send(true);
@@ -119,30 +148,85 @@ pub(super) fn forget(id: &str) {
     running().remove(id);
 }
 
-/// A compiled incoming-handler and the socket it will accept on.
-/// `None` means the bytes are not one: a core module, or a command
-/// component. The caller runs those the usual way.
-pub(super) struct Prep {
-    engine: wasmtime::Engine,
+struct Bound {
     pre: ProxyPre<State>,
     listener: std::net::TcpListener,
-    pub(super) addr: SocketAddr,
+    ports: Vec<u16>,
     stop: watch::Receiver<bool>,
 }
 
-pub(super) fn prepare(id: &str, bytes: &[u8]) -> io::Result<Option<Prep>> {
-    if !wasm::is_component(bytes) {
-        return Ok(None);
-    }
+/// The handlers for one container. `None` from [`prepare`] means the
+/// entrypoint is not an incoming-handler and no port named one either.
+pub(super) struct Prep {
+    engine: wasmtime::Engine,
+    handlers: Vec<Bound>,
+}
+
+pub(super) fn prepare(id: &str, modules: &[wasm::WasmModule]) -> io::Result<Option<Prep>> {
     if running().contains_key(id) {
         return Err(io::Error::other(
             "wasm http is already serving this container",
         ));
     }
     let engine = http_engine()?;
-    let component = Component::from_binary(&engine, bytes)
+    let (tx, rx) = watch::channel(false);
+    let mut handlers = Vec::new();
+    let mut by_port = HashMap::new();
+    let mut entry_is_handler = false;
+    for module in modules {
+        let Some(pre) = try_handler(&engine, &module.bytes)? else {
+            // The entrypoint may be a command. A port that names a module
+            // has to actually be an incoming-handler.
+            if module.entry && module.ports.is_empty() {
+                continue;
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is not a wasi:http component", module.path),
+            ));
+        };
+        if module.entry {
+            entry_is_handler = true;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let addr = listener.local_addr()?;
+        for port in &module.ports {
+            by_port.insert(*port, addr);
+        }
+        handlers.push(Bound {
+            pre,
+            listener,
+            ports: module.ports.clone(),
+            stop: rx.clone(),
+        });
+    }
+    if handlers.is_empty() {
+        return Ok(None);
+    }
+    let default = handlers[0].listener.local_addr()?;
+    running().insert(
+        id.to_owned(),
+        Running {
+            default,
+            by_port,
+            entry_is_handler,
+            stop: tx,
+        },
+    );
+    Ok(Some(Prep { engine, handlers }))
+}
+
+/// `Ok(None)` is a core module or a component that does not export
+/// `wasi:http/incoming-handler`. A blob that claims to be a component and
+/// does not parse is an error.
+fn try_handler(engine: &wasmtime::Engine, bytes: &[u8]) -> io::Result<Option<ProxyPre<State>>> {
+    if !wasm::is_component(bytes) {
+        return Ok(None);
+    }
+    let component = Component::from_binary(engine, bytes)
         .map_err(|e| io::Error::other(format!("wasm component: {e}")))?;
-    let mut linker = Linker::<State>::new(&engine);
+    let mut linker = Linker::<State>::new(engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)
         .map_err(|e| io::Error::other(e.to_string()))?;
     wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)
@@ -150,21 +234,7 @@ pub(super) fn prepare(id: &str, bytes: &[u8]) -> io::Result<Option<Prep>> {
     let Ok(pre) = linker.instantiate_pre(&component) else {
         return Ok(None);
     };
-    let Ok(pre) = ProxyPre::new(pre) else {
-        return Ok(None);
-    };
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-    listener.set_nonblocking(true)?;
-    let addr = listener.local_addr()?;
-    let (tx, stop) = watch::channel(false);
-    running().insert(id.to_owned(), Running { addr, stop: tx });
-    Ok(Some(Prep {
-        engine,
-        pre,
-        listener,
-        addr,
-        stop,
-    }))
+    Ok(ProxyPre::new(pre).ok())
 }
 
 fn http_engine() -> io::Result<wasmtime::Engine> {
@@ -267,8 +337,17 @@ fn run(
         }
     };
     // from_std registers the socket with the runtime that is current.
-    let listener = match rt.block_on(async { tokio::net::TcpListener::from_std(prep.listener) }) {
-        Ok(listener) => listener,
+    let engine = prep.engine;
+    let opened = rt.block_on(async {
+        let mut out = Vec::with_capacity(prep.handlers.len());
+        for handler in prep.handlers {
+            let listener = tokio::net::TcpListener::from_std(handler.listener)?;
+            out.push((listener, handler.pre, handler.ports, handler.stop));
+        }
+        Ok::<_, io::Error>(out)
+    });
+    let opened = match opened {
+        Ok(opened) => opened,
         Err(e) => {
             note(&daemon, &id, Stream::Stderr, &format!("wasm http: {e}\n"));
             drop(out_w);
@@ -278,28 +357,83 @@ fn run(
             return exit_code(&killed, 1);
         }
     };
-    let srv = Arc::new(Srv {
-        daemon: daemon.clone(),
-        id: id.clone(),
-        engine: prep.engine,
-        pre: prep.pre,
-        killed: killed.clone(),
-        args,
-        env,
-        cwd,
-        preopens,
-        stdout: Mutex::new(out_w),
-        stderr: Mutex::new(err_w),
-        limits: limits(),
-    });
-    let code = rt.block_on(serve(listener, prep.stop, srv.clone(), &killed));
+    let stdout = Arc::new(Mutex::new(out_w));
+    let stderr = Arc::new(Mutex::new(err_w));
+    let several = opened.len() > 1;
+    let mut listeners = Vec::with_capacity(opened.len());
+    let mut srvs = Vec::with_capacity(opened.len());
+    for (listener, pre, ports, stop) in opened {
+        let srv = Arc::new(Srv {
+            daemon: daemon.clone(),
+            id: id.clone(),
+            engine: engine.clone(),
+            pre,
+            killed: killed.clone(),
+            args: args.clone(),
+            env: env.clone(),
+            cwd: cwd.clone(),
+            preopens: preopens.clone(),
+            stdout: Arc::clone(&stdout),
+            stderr: Arc::clone(&stderr),
+            limits: limits(),
+            log: handler_log(several, &ports),
+        });
+        listeners.push((listener, Arc::clone(&srv), stop));
+        srvs.push(srv);
+    }
+    let code = rt.block_on(serve_all(listeners, killed.clone()));
     // Drop the files only after in-flight requests are gone, or the pumps
     // would wait on a write end a request still holds.
-    drop(srv);
+    drop(srvs);
+    drop(stdout);
+    drop(stderr);
     rt.shutdown_timeout(std::time::Duration::from_secs(2));
     let _ = pump_out.join();
     let _ = pump_err.join();
     code
+}
+
+fn handler_log(several: bool, ports: &[u16]) -> String {
+    if !several {
+        return String::new();
+    }
+    if ports.is_empty() {
+        return "entrypoint ".into();
+    }
+    let mut ports = ports.to_vec();
+    ports.sort_unstable();
+    let joined = ports
+        .iter()
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{joined} ")
+}
+
+async fn serve_all(
+    listeners: Vec<(tokio::net::TcpListener, Arc<Srv>, watch::Receiver<bool>)>,
+    killed: Arc<AtomicU32>,
+) -> i32 {
+    let mut joins = Vec::with_capacity(listeners.len());
+    for (listener, srv, stop) in listeners {
+        let killed = Arc::clone(&killed);
+        joins.push(tokio::spawn(async move {
+            serve(listener, stop, srv, &killed).await
+        }));
+    }
+    let mut code = 0;
+    for join in joins {
+        match join.await {
+            Ok(c) if c != 0 => code = c,
+            Ok(_) => {}
+            Err(_) => code = exit_code(&killed, 1),
+        }
+    }
+    if code == 0 {
+        exit_code(&killed, 0)
+    } else {
+        code
+    }
 }
 
 fn worker_count() -> usize {
@@ -331,9 +465,12 @@ struct Srv {
     env: Vec<(String, String)>,
     cwd: String,
     preopens: Vec<Preopen>,
-    stdout: Mutex<File>,
-    stderr: Mutex<File>,
+    stdout: Arc<Mutex<File>>,
+    stderr: Arc<Mutex<File>>,
     limits: Limits,
+    /// Empty when this container has one handler. Otherwise the container
+    /// ports this listener serves, so `docker logs` shows which one ran.
+    log: String,
 }
 
 /// Read once, when the handler starts. A later change of the environment
@@ -431,7 +568,7 @@ impl Srv {
             &self.daemon,
             &self.id,
             Stream::Stdout,
-            &format!("{method} {}\n", one_line(&path)),
+            &format!("{}{method} {}\n", self.log, one_line(&path)),
         );
         self.dispatch(req).await
     }
@@ -459,7 +596,7 @@ impl Srv {
                 CapKind::Request,
             ),
         );
-        let (stdout, stderr) = match (dup(&self.stdout), dup(&self.stderr)) {
+        let (stdout, stderr) = match (dup(self.stdout.as_ref()), dup(self.stderr.as_ref())) {
             (Ok(stdout), Ok(stderr)) => (stdout, stderr),
             (Err(e), _) | (_, Err(e)) => return text(500, &format!("{e}\n")),
         };

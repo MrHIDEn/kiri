@@ -398,7 +398,17 @@ fn route(client: &mut impl ReadWrite, engine: &Engine, scheme: &str) -> io::Resu
         respond(client, 404, "Not Found", &body)?;
         return Ok(None);
     };
-    if let Some(addr) = super::wasm_http::http_addr(&target.id) {
+    if super::wasm_http::http_addr(&target.id).is_some() {
+        let port = web_port(engine, &target);
+        let Some(addr) = super::wasm_http::http_addr_for(&target.id, port) else {
+            respond(
+                client,
+                502,
+                "Bad Gateway",
+                &format!("Kiri could not reach the container: no wasi:http handler for port {port}"),
+            )?;
+            return Ok(None);
+        };
         match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
             Ok(sock) => return Ok(Some((head, Upstream::Wasm(sock)))),
             Err(e) => {
@@ -602,6 +612,39 @@ fn respond(client: &mut impl Write, status: u16, reason: &str, body: &str) -> io
 
 fn escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+/// What [`route`] connects for `req`, and the bytes the handler answered.
+/// The request is one write, so a short body travels with the head.
+#[cfg(test)]
+pub(super) fn test_exchange(engine: &Engine, req: &[u8]) -> io::Result<Option<Vec<u8>>> {
+    let (mut client, mut peer) = std::os::unix::net::UnixStream::pair()?;
+    peer.write_all(req)?;
+    let Some((head, upstream)) = route(&mut client, engine, "http")? else {
+        return Ok(None);
+    };
+    drop(peer);
+    let Upstream::Wasm(mut sock) = upstream else {
+        return Ok(None);
+    };
+    sock.set_read_timeout(Some(Duration::from_secs(5)))?;
+    sock.write_all(&head)?;
+    sock.shutdown(Shutdown::Write)?;
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 1024];
+    loop {
+        match sock.read(&mut tmp) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            Err(e)
+                if e.kind() == io::ErrorKind::TimedOut || e.kind() == io::ErrorKind::WouldBlock =>
+            {
+                break;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(Some(buf))
 }
 
 #[cfg(test)]

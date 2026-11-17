@@ -378,12 +378,14 @@ fn holder_in(lsof: &str) -> Option<String> {
     lsof.lines().filter_map(|l| l.strip_prefix('c')).map(str::trim).find(|c| !c.is_empty() && !c.to_ascii_lowercase().starts_with("kiri")).map(str::to_owned)
 }
 
-/// Published ports of a wasi:http container. The handler listens on `to`
-/// (loopback, in this process). Not [`start`]: that relays through the VM,
-/// and on macOS it does not dial a host loopback address. Every binding
-/// reaches the one handler; the container port is not a separate listener.
-/// UDP is refused.
-pub fn start_local(bindings: &[Binding], to: SocketAddr) -> io::Result<Forwards> {
+/// Published ports of a wasi:http container. `dest` is the listener for a
+/// container port (loopback, in this process). Not [`start`]: that relays
+/// through the VM, and on macOS it does not dial a host loopback address.
+/// Two container ports can name different listeners. UDP is refused.
+pub fn start_local(
+    bindings: &[Binding],
+    mut dest: impl FnMut(u16) -> SocketAddr,
+) -> io::Result<Forwards> {
     if bindings.iter().any(|b| b.proto == "udp") {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -442,6 +444,7 @@ pub fn start_local(bindings: &[Binding], to: SocketAddr) -> io::Result<Forwards>
     };
     for (b, ip, port, listener) in listeners {
         let (wake_r, wake_w) = pipe()?;
+        let to = dest(b.container_port);
         fw.wake.push(wake_w);
         fw.threads.push(
             std::thread::Builder::new()

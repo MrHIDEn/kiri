@@ -9,7 +9,10 @@
 //!
 //! Preview 1 core modules and preview 2 command components both run. A
 //! component that exports `wasi:http/incoming-handler` is served by
-//! [`super::wasm_http`] instead of running once. There is no cgroup.
+//! [`super::wasm_http`] instead of running once. A container port can name
+//! a different module with the label `dev.kiri.wasm.port.<port>`: image
+//! `config.Labels` are the base, and the same key on the container replaces
+//! that port. A port with no label keeps the entrypoint. There is no cgroup.
 //!
 //! `wasi:http/outgoing-handler` dials from this process. On a Mac that is
 //! the Mac's own network: `127.0.0.1` is the Mac's loopback, and a name is
@@ -20,7 +23,7 @@
 //! `KIRI_WASM_HTTP_BODY_LIMIT` (32 MiB unless set). A preview 1 core
 //! module has no `wasi:http`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::fd::FromRawFd;
@@ -169,6 +172,126 @@ pub(super) fn unpack_layer(
 }
 
 /// The entrypoint file, or the only `.wasm` file when the entrypoint misses.
+/// `dev.kiri.wasm.port.<container-port>`. The value is a module path, the
+/// same shape as the image `Entrypoint`. OCI wasm images and the wasm
+/// runtimes declare one entrypoint (and annotations that only choose the
+/// runtime), so a port map lives in the label family Kiri already uses.
+pub(super) const WASM_PORT_LABEL: &str = "dev.kiri.wasm.port.";
+
+/// One module the container may serve. `ports` are the container ports
+/// whose label names this path. Empty means the entrypoint, which serves
+/// every port that names nothing else.
+pub(super) struct WasmModule {
+    pub path: String,
+    pub bytes: Vec<u8>,
+    pub ports: Vec<u16>,
+    pub entry: bool,
+}
+
+/// `config.Labels` from an image config blob. Missing or not an object is
+/// no labels, which is every image that does not name ports.
+pub(super) fn config_labels(config: &[u8]) -> serde_json::Value {
+    serde_json::from_slice::<serde_json::Value>(config)
+        .ok()
+        .and_then(|v| v.get("config")?.get("Labels").cloned())
+        .filter(|v| v.is_object())
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// Container ports that name their own module. Image labels are the base.
+/// A container label with the same key replaces that port.
+pub(super) fn port_modules(
+    image_labels: &serde_json::Value,
+    container_labels: &serde_json::Value,
+) -> io::Result<BTreeMap<u16, String>> {
+    let mut out = BTreeMap::new();
+    apply_port_labels(&mut out, image_labels)?;
+    apply_port_labels(&mut out, container_labels)?;
+    Ok(out)
+}
+
+fn apply_port_labels(
+    out: &mut BTreeMap<u16, String>,
+    labels: &serde_json::Value,
+) -> io::Result<()> {
+    let Some(obj) = labels.as_object() else {
+        return Ok(());
+    };
+    for (key, value) in obj {
+        let Some(rest) = key.strip_prefix(WASM_PORT_LABEL) else {
+            continue;
+        };
+        let port: u16 = rest.parse().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("bad wasm port label {key}"),
+            )
+        })?;
+        if port == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("bad wasm port label {key}"),
+            ));
+        }
+        let Some(path) = value
+            .as_str()
+            .map(str::trim)
+            .filter(|p| !p.trim_start_matches('/').is_empty())
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{key} needs a module path"),
+            ));
+        };
+        out.insert(port, path.to_owned());
+    }
+    Ok(())
+}
+
+fn module_key(path: &str) -> &str {
+    path.trim_start_matches('/')
+}
+
+/// The entrypoint, then each other module a port label names. Two ports
+/// that name the same path share one entry.
+pub(super) fn load_modules(
+    root: &Path,
+    entry: &str,
+    routes: &BTreeMap<u16, String>,
+) -> io::Result<Vec<WasmModule>> {
+    let entry_key = module_key(entry);
+    let mut entry_ports = Vec::new();
+    let mut extras: BTreeMap<String, (String, Vec<u16>)> = BTreeMap::new();
+    for (port, path) in routes {
+        if module_key(path) == entry_key {
+            entry_ports.push(*port);
+        } else {
+            extras
+                .entry(module_key(path).to_owned())
+                .or_insert_with(|| (path.clone(), Vec::new()))
+                .1
+                .push(*port);
+        }
+    }
+    entry_ports.sort_unstable();
+    let mut out = vec![WasmModule {
+        path: entry.to_owned(),
+        bytes: module_bytes(root, entry)?,
+        ports: entry_ports,
+        entry: true,
+    }];
+    for (_, (path, mut ports)) in extras {
+        ports.sort_unstable();
+        out.push(WasmModule {
+            path: path.clone(),
+            bytes: module_bytes(root, &path)?,
+            ports,
+            entry: false,
+        });
+    }
+    Ok(out)
+}
+
 pub(super) fn module_bytes(root: &Path, argv0: &str) -> io::Result<Vec<u8>> {
     let rel = argv0.trim_start_matches('/');
     if !rel.is_empty()
@@ -894,6 +1017,14 @@ mod tests {
 
     /// The image `tests/wasm.sh` loads: every module, entrypoint `/hello.wasm`.
     fn install_wasi_image(store: &kiri_image::Store) -> kiri_image::Image {
+        install_named(store, "kiri-wasm-test:latest", serde_json::Value::Null)
+    }
+
+    fn install_named(
+        store: &kiri_image::Store,
+        name: &str,
+        labels: serde_json::Value,
+    ) -> kiri_image::Image {
         let files = [
             (
                 "hello.wasm",
@@ -948,7 +1079,7 @@ mod tests {
             enc.write_all(&raw).unwrap();
             enc.finish().unwrap();
         }
-        let config = serde_json::json!({
+        let mut config = serde_json::json!({
             "os": "wasi",
             "architecture": "wasm",
             "created": "2026-01-01T00:00:00Z",
@@ -959,10 +1090,13 @@ mod tests {
                 "WorkingDir": "/"
             }
         });
+        if labels.as_object().is_some_and(|o| !o.is_empty()) {
+            config["config"]["Labels"] = labels;
+        }
         let (cfg, _) = put(store, &serde_json::to_vec(&config).unwrap());
         let (layer, size) = put(store, &gz);
         let image = kiri_image::archive::from_config(
-            "kiri-wasm-test:latest".into(),
+            name.into(),
             &cfg,
             &config,
             vec![kiri_image::Layer {
@@ -1105,6 +1239,70 @@ mod tests {
     }
 
     #[test]
+    fn port_labels_let_the_container_override_the_image() {
+        let image = serde_json::json!({
+            "dev.kiri.wasm.port.80": "/api.wasm",
+            "dev.kiri.wasm.port.81": "/admin.wasm",
+            "dev.kiri.http.port": "80",
+        });
+        let container = serde_json::json!({
+            "dev.kiri.wasm.port.81": "/other.wasm",
+            "dev.kiri.domain": "api",
+        });
+        let map = super::port_modules(&image, &container).unwrap();
+        assert_eq!(map.get(&80).map(String::as_str), Some("/api.wasm"));
+        assert_eq!(map.get(&81).map(String::as_str), Some("/other.wasm"));
+        assert_eq!(map.len(), 2);
+        let blob = br#"{"config":{"Labels":{"dev.kiri.wasm.port.80":"/api.wasm"}}}"#;
+        assert_eq!(
+            super::config_labels(blob)["dev.kiri.wasm.port.80"],
+            "/api.wasm"
+        );
+        assert!(super::config_labels(b"{}").is_null());
+        let bad = super::port_modules(
+            &serde_json::json!({"dev.kiri.wasm.port.nope": "/a.wasm"}),
+            &serde_json::json!({}),
+        );
+        assert!(bad.unwrap_err().to_string().contains("bad wasm port"));
+        let empty = super::port_modules(
+            &serde_json::json!({"dev.kiri.wasm.port.80": ""}),
+            &serde_json::json!({}),
+        );
+        assert!(
+            empty
+                .unwrap_err()
+                .to_string()
+                .contains("needs a module path")
+        );
+    }
+
+    #[test]
+    fn a_port_label_must_name_an_incoming_handler() {
+        let dir = scratch("port-bad");
+        let store = kiri_image::Store::open(&dir).unwrap();
+        let engine = super::super::engine::Engine::boot(store).unwrap();
+        engine.test_clear_stopped();
+        let image = install_wasi_image(&engine.store);
+        let spec: super::super::engine::Spec = serde_json::from_value(serde_json::json!({
+            "image": image.name, "image_id": image.digest, "entrypoint": ["/http.wasm"], "cmd": [],
+            "env": [], "cwd": "/", "user": "", "auto_remove": false, "network_mode": "none",
+            "labels": {"dev.kiri.wasm.port.81": "/hello.wasm"},
+            "ports": [{"container_port": 81, "proto": "tcp", "host_ip": "127.0.0.1", "host_port": 0}]
+        }))
+        .unwrap();
+        let id = engine
+            .create(Some("wasi-bad-port".into()), spec, &image)
+            .unwrap();
+        let err = engine.start(&id).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("hello.wasm"), "{msg}");
+        assert!(msg.contains("wasi:http"), "{msg}");
+        assert!(!engine.is_awake());
+        drop(engine);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_wasi_http_component_serves_until_stopped() {
         let dir = scratch("http");
         let store = kiri_image::Store::open(&dir).unwrap();
@@ -1157,6 +1355,163 @@ mod tests {
         let code = engine.wait(&id, "not-running").unwrap();
         assert!(code == 143 || code == 137, "exit {code}");
         assert!(engine.route("wasi-http.kiri.local").is_none());
+        assert!(!engine.is_awake());
+        drop(engine);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn published_ports_can_serve_different_modules() {
+        let dir = scratch("ports-http");
+        let store = kiri_image::Store::open(&dir).unwrap();
+        let engine = super::super::engine::Engine::boot(store).unwrap();
+        engine.test_clear_stopped();
+        let labels = serde_json::json!({
+            "dev.kiri.wasm.port.80": "/http.wasm",
+            "dev.kiri.wasm.port.81": "/stream.wasm",
+        });
+        let image = install_named(&engine.store, "kiri-wasm-ports:latest", labels);
+        let ports = serde_json::json!([
+            {"container_port": 80, "proto": "tcp", "host_ip": "127.0.0.1", "host_port": 0},
+            {"container_port": 81, "proto": "tcp", "host_ip": "127.0.0.1", "host_port": 0},
+        ]);
+        let spec = |name_labels: serde_json::Value, entry: &str| {
+            serde_json::from_value(serde_json::json!({
+                "image": image.name, "image_id": image.digest, "entrypoint": [entry], "cmd": [],
+                "env": [], "cwd": "/", "user": "", "auto_remove": false, "network_mode": "none",
+                "labels": name_labels, "ports": ports,
+            }))
+            .unwrap()
+        };
+        let id = engine
+            .create(
+                Some("wasi-ports".into()),
+                spec(
+                    serde_json::json!({"dev.kiri.http.port": "81"}),
+                    "/hello.wasm",
+                ),
+                &image,
+            )
+            .unwrap();
+        engine.start(&id).unwrap();
+        assert!(!engine.is_awake(), "two handlers booted the VM");
+        let (p80, p81) = engine
+            .with(&id, |c| {
+                let bound = &c.forwards.as_ref().unwrap().bound;
+                (bound[0].2, bound[1].2)
+            })
+            .unwrap();
+        let echo = http_exchange(
+            p80,
+            "GET /users/1 HTTP/1.1\r\nHost: wasi-ports.kiri.local\r\nx-echo: hi\r\nConnection: close\r\n\r\n",
+        );
+        assert!(echo.contains("GET /users/1\nhi"), "{echo}");
+        let hashed = sha256_hex(b"abc");
+        let upload = http_exchange(
+            p81,
+            "POST /upload HTTP/1.1\r\nHost: wasi-ports.kiri.local\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc",
+        );
+        assert!(upload.contains(&hashed), "{upload}");
+        assert!(
+            upload.contains("\n3\n") || upload.contains("\n3\r"),
+            "{upload}"
+        );
+        let routed = super::super::domains::test_exchange(
+            &engine,
+            b"POST /upload HTTP/1.1\r\nHost: wasi-ports.kiri.local\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc",
+        )
+        .unwrap()
+        .expect("domain router");
+        let routed = String::from_utf8_lossy(&routed);
+        // dev.kiri.http.port=81, so the name reaches stream.wasm, not the entry port.
+        assert!(routed.contains(&hashed), "{routed}");
+        assert!(!routed.contains("POST /upload"), "{routed}");
+        assert_ne!(
+            super::super::wasm_http::http_addr_for(&id, 80),
+            super::super::wasm_http::http_addr_for(&id, 81)
+        );
+
+        let over = engine
+            .create(
+                Some("wasi-override".into()),
+                spec(
+                    serde_json::json!({"dev.kiri.wasm.port.81": "/http.wasm", "dev.kiri.http.port": "81"}),
+                    "/hello.wasm",
+                ),
+                &image,
+            )
+            .unwrap();
+        engine.start(&over).unwrap();
+        let target = engine.route("wasi-override.kiri.local").expect("name");
+        assert_eq!(target.label, Some(81));
+        let (o80, o81) = engine
+            .with(&over, |c| {
+                let bound = &c.forwards.as_ref().unwrap().bound;
+                (bound[0].2, bound[1].2)
+            })
+            .unwrap();
+        let left = http_exchange(
+            o80,
+            "GET /left HTTP/1.1\r\nHost: wasi-override.kiri.local\r\nConnection: close\r\n\r\n",
+        );
+        let right = http_exchange(
+            o81,
+            "GET /right HTTP/1.1\r\nHost: wasi-override.kiri.local\r\nConnection: close\r\n\r\n",
+        );
+        assert!(left.contains("GET /left"), "{left}");
+        assert!(right.contains("GET /right"), "{right}");
+        assert_eq!(
+            super::super::wasm_http::http_addr_for(&over, 80),
+            super::super::wasm_http::http_addr_for(&over, 81)
+        );
+        let via_name = super::super::domains::test_exchange(
+            &engine,
+            b"GET /admin HTTP/1.1\r\nHost: wasi-override.kiri.local\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap()
+        .expect("domain router for port 81");
+        let via_name = String::from_utf8_lossy(&via_name);
+        assert!(via_name.contains("GET /admin"), "{via_name}");
+
+        let plain = install_wasi_image(&engine.store);
+        let one: super::super::engine::Spec = serde_json::from_value(serde_json::json!({
+            "image": plain.name, "image_id": plain.digest, "entrypoint": ["/http.wasm"], "cmd": [],
+            "env": [], "cwd": "/", "user": "", "auto_remove": false, "network_mode": "none",
+            "labels": {},
+            "ports": [
+                {"container_port": 80, "proto": "tcp", "host_ip": "127.0.0.1", "host_port": 0},
+                {"container_port": 81, "proto": "tcp", "host_ip": "127.0.0.1", "host_port": 0}
+            ]
+        }))
+        .unwrap();
+        let shared = engine
+            .create(Some("wasi-shared".into()), one, &plain)
+            .unwrap();
+        engine.start(&shared).unwrap();
+        assert_eq!(
+            super::super::wasm_http::http_addr_for(&shared, 80),
+            super::super::wasm_http::http_addr_for(&shared, 81)
+        );
+        let (s80, s81) = engine
+            .with(&shared, |c| {
+                let bound = &c.forwards.as_ref().unwrap().bound;
+                (bound[0].2, bound[1].2)
+            })
+            .unwrap();
+        let a = http_exchange(
+            s80,
+            "GET /a HTTP/1.1\r\nHost: wasi-shared.kiri.local\r\nConnection: close\r\n\r\n",
+        );
+        let b = http_exchange(
+            s81,
+            "GET /b HTTP/1.1\r\nHost: wasi-shared.kiri.local\r\nConnection: close\r\n\r\n",
+        );
+        assert!(a.contains("GET /a"), "{a}");
+        assert!(b.contains("GET /b"), "{b}");
+
+        engine.stop(&id, Duration::from_secs(5)).unwrap();
+        engine.stop(&over, Duration::from_secs(5)).unwrap();
+        engine.stop(&shared, Duration::from_secs(5)).unwrap();
         assert!(!engine.is_awake());
         drop(engine);
         let _ = fs::remove_dir_all(&dir);

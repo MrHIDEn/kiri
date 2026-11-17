@@ -4,8 +4,10 @@
 # path the way a person would: hello-world on stdout, args and env, a
 # non-zero exit, a read-only bind, a detached container's ps/stop/rm,
 # `--rm` actually removing the container, a wasi:http component, and a
-# component that calls out with wasi:http/outgoing-handler, and a
-# multi-megabyte upload and download (sha256) through a streaming handler.
+# component that calls out with wasi:http/outgoing-handler, a
+# multi-megabyte upload and download (sha256) through a streaming handler,
+# and two published ports that serve different modules
+# (`dev.kiri.wasm.port.<port>`).
 #
 # The http section needs curl. It always checks the published port. It also
 # requests `http://<name>.kiri.local/users/1` when this engine says it is
@@ -363,6 +365,113 @@ PY
   lim 20 d rm -f "$sname" >/dev/null 2>&1 || true
 else
   bad "streaming container starts" "$cid"
+fi
+
+echo "== wasi:http handlers per port"
+# Port 80 is the echo handler, port 81 hashes the body. The entrypoint is a
+# command module: the labels name the handlers. With no such label, both
+# ports stay on the entrypoint.
+pname=$RUN-ports
+sname=$RUN-same
+if ! command -v curl >/dev/null 2>&1; then
+  bad "per-port checks need curl"
+elif ! command -v python3 >/dev/null 2>&1; then
+  bad "per-port checks need python3"
+elif cid=$(run -d --name "$pname" --entrypoint /hello.wasm \
+  -p 127.0.0.1::80 -p 127.0.0.1::81 \
+  --label dev.kiri.wasm.port.80=/http.wasm \
+  --label dev.kiri.wasm.port.81=/stream.wasm \
+  --label dev.kiri.http.port=81 \
+  "$IMAGE" 2>&1); then
+  p80=$(d port "$pname" 80/tcp 2>/dev/null | head -n 1 || true)
+  p80=${p80##*:}
+  p81=$(d port "$pname" 81/tcp 2>/dev/null | head -n 1 || true)
+  p81=${p81##*:}
+  hash=$(printf abc | python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')
+  body=
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    body=$(curl -fsS --max-time 5 -H 'X-Echo: hi' "http://127.0.0.1:${p80}/users/1" 2>&1) && break
+    sleep 0.2
+  done
+  if printf '%s' "$body" | grep -q 'GET /users/1' && printf '%s' "$body" | grep -q 'hi'; then
+    ok "port 80 serves the echo module"
+  else
+    bad "port 80 serves the echo module" "$body"
+  fi
+  up=
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    up=$(curl -fsS --max-time 10 --data-binary abc "http://127.0.0.1:${p81}/upload" 2>&1) && break
+    sleep 0.2
+  done
+  if printf '%s' "$up" | grep -q "$hash" && printf '%s' "$up" | grep -q '^3$'; then
+    ok "port 81 serves the upload module"
+  else
+    bad "port 81 serves the upload module" "$up"
+  fi
+  logs=$(d logs "$pname" 2>&1 || true)
+  if printf '%s' "$logs" | grep -q '80 GET /users/1' && printf '%s' "$logs" | grep -q '81 POST /upload'; then
+    ok "each port is named in the container log"
+  else
+    bad "each port is named in the container log" "$logs"
+  fi
+  check="http://${pname}.kiri.local/upload reaches port 81's module"
+  if ! json=$(engine_get /kiri/domains 2>/dev/null); then
+    skip "$check" "this engine did not answer /kiri/domains"
+  else
+    parsed=$(printf '%s' "$json" | python3 -c 'import json,sys; d=json.load(sys.stdin)["http"]; print(d["port"], "yes" if d.get("serving") else "no")' 2>/dev/null || true)
+    dport=${parsed%% *}
+    serving=${parsed##* }
+    if [ -z "$parsed" ] || [ "$dport" = "$serving" ]; then
+      skip "$check" "could not read this engine's domain router"
+    elif [ "$serving" != yes ]; then
+      skip "$check" "this engine's container domains are off"
+    else
+      page=$(curl -sS --max-time 2 --resolve "kiri-wasm-probe.kiri.local:${dport}:127.0.0.1" "http://kiri-wasm-probe.kiri.local:${dport}/" 2>&1) && pec=0 || pec=$?
+      if [ "$pec" != 0 ]; then
+        bad "$check" "this engine's router on port ${dport} did not answer: $page"
+      elif ! printf '%s' "$page" | grep -q "$pname"; then
+        if printf '%s' "$page" | grep -q 'No running container'; then
+          skip "$check" "port ${dport} belongs to another Kiri"
+        else
+          bad "$check" "port ${dport} is not this engine's router: $page"
+        fi
+      else
+        via=$(curl -fsS --max-time 10 --resolve "${pname}.kiri.local:${dport}:127.0.0.1" --data-binary abc "http://${pname}.kiri.local:${dport}/upload" 2>&1) && ec=0 || ec=$?
+        if [ "$ec" = 0 ] && printf '%s' "$via" | grep -q "$hash" && ! printf '%s' "$via" | grep -q 'POST /upload'; then
+          ok "$check"
+        else
+          bad "$check" "exit $ec: $via"
+        fi
+      fi
+    fi
+  fi
+  lim 20 d rm -f "$pname" >/dev/null 2>&1 || true
+  if cid=$(run -d --name "$sname" --entrypoint /http.wasm -p 127.0.0.1::80 -p 127.0.0.1::81 "$IMAGE" 2>&1); then
+    h80=$(d port "$sname" 80/tcp 2>/dev/null | head -n 1 || true)
+    h80=${h80##*:}
+    h81=$(d port "$sname" 81/tcp 2>/dev/null | head -n 1 || true)
+    h81=${h81##*:}
+    a=
+    b=
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      a=$(curl -fsS --max-time 5 "http://127.0.0.1:${h80}/only" 2>&1) && break
+      sleep 0.2
+    done
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      b=$(curl -fsS --max-time 5 "http://127.0.0.1:${h81}/also" 2>&1) && break
+      sleep 0.2
+    done
+    if printf '%s' "$a" | grep -q 'GET /only' && printf '%s' "$b" | grep -q 'GET /also'; then
+      ok "two ports with no port label share the entrypoint"
+    else
+      bad "two ports with no port label share the entrypoint" "$a / $b"
+    fi
+    lim 20 d rm -f "$sname" >/dev/null 2>&1 || true
+  else
+    bad "two ports with no port label share the entrypoint" "$cid"
+  fi
+else
+  bad "two-port container starts" "$cid"
 fi
 
 echo
