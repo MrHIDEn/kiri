@@ -300,11 +300,22 @@ struct WasiIo {
 
 fn os_pipe() -> io::Result<(File, File)> {
     let mut fds = [0; 2];
-    // SAFETY: pipe2 writes two owned descriptors into `fds`, or it fails and
-    // writes nothing we keep.
-    let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
-    if rc != 0 {
+    // SAFETY: pipe writes two owned descriptors into `fds`, or it fails and
+    // writes nothing we keep. pipe2 is Linux-only; macOS sets CLOEXEC below.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
         return Err(io::Error::last_os_error());
+    }
+    for fd in fds {
+        // SAFETY: F_SETFD on a descriptor pipe just opened and that we own.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+            let err = io::Error::last_os_error();
+            // SAFETY: both ends are still ours. Close them before returning.
+            unsafe {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+            }
+            return Err(err);
+        }
     }
     // SAFETY: both descriptors are open, CLOEXEC, and not owned by anyone else.
     unsafe { Ok((File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1]))) }
