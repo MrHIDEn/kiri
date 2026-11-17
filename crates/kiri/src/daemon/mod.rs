@@ -34,6 +34,7 @@ mod usb;
 mod vmcpu;
 mod vmlink;
 mod volumes;
+mod wasm;
 #[cfg(target_os = "macos")]
 mod watch;
 

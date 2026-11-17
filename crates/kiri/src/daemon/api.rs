@@ -1676,6 +1676,8 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
             },
             max_retries: host["RestartPolicy"]["MaximumRetryCount"].as_u64().unwrap_or(0) as u32,
         },
+        // `create` sets this from the image. The field has to be named here.
+        wasm: false,
     };
     if !matches!(spec.restart.name.as_str(), "no" | "always" | "unless-stopped" | "on-failure") {
         return Err(Error::BadRequest(format!("invalid restart policy {}", spec.restart.name)));
@@ -2001,8 +2003,8 @@ fn inspect(c: &Container, nets: &[super::network::Network]) -> Value {
         "Name": format!("/{}", c.name),
         "RestartCount": c.restart_count,
         "LogPath": Engine::log_path(c),
-        "Driver": "overlayfs",
-        "Platform": "linux",
+        "Driver": if c.spec.wasm { "wasmtime" } else { "overlayfs" },
+        "Platform": if c.spec.wasm { "wasi" } else { "linux" },
         "Config": {
             "Hostname": if c.spec.hostname.is_empty() { c.short_id() } else { c.spec.hostname.as_str() },
             "Domainname": c.spec.domainname,

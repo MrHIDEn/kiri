@@ -267,6 +267,10 @@ pub struct Spec {
     /// GroupAdd as given; see [`super::hostopts`].
     #[serde(default)]
     pub host_opts: serde_json::Value,
+    /// The image is `wasi`/`wasm`: its module runs in this process, on
+    /// wasmtime, and the VM stays asleep. Old records predate the field.
+    #[serde(default)]
+    pub wasm: bool,
 }
 
 /// One `--link name:alias`.
@@ -1245,13 +1249,22 @@ impl Engine {
         }
         *self.held_restarts.lock().unwrap_or_else(|e| e.into_inner()) = held;
         let running = self.each(|c| (c.status == Status::Running).then(|| c.id.clone()));
+        let (wasm, linux): (Vec<String>, Vec<String>) =
+            running.into_iter().partition(|id| self.is_wasm(id));
         // All at once, as for a daemon shutdown, each with its own stop
         // signal and timeout: seven `sleep 1d`s take one timeout, not seven.
-        if let Some(vm) = self.awake().filter(|_| !running.is_empty()) {
+        // Wasm ids are not given to the VM: it cannot see them, and waiting
+        // on them would hang Stop while the modules kept running.
+        if !wasm.is_empty() || (self.awake().is_some() && !linux.is_empty()) {
             self.parking.store(true, std::sync::atomic::Ordering::SeqCst);
-            let left = self.stop_together(&vm, &running, Stopping::Engine);
+            let left_wasm = self.halt_wasm(&wasm, true);
+            let left_linux = if let Some(vm) = self.awake().filter(|_| !linux.is_empty()) {
+                self.stop_together(&vm, &linux, Stopping::Engine)
+            } else {
+                Vec::new()
+            };
             self.parking.store(false, std::sync::atomic::Ordering::SeqCst);
-            if let Some(id) = left.first() {
+            if let Some(id) = left_wasm.first().or(left_linux.first()) {
                 return Err(Error::Io(io::Error::other(format!("cannot stop container: {}: it did not exit after SIGKILL", &id[..12]))));
             }
         }
@@ -1298,6 +1311,13 @@ impl Engine {
     /// Whether the VM is running right now.
     pub fn is_awake(&self) -> bool {
         self.awake().is_some()
+    }
+
+    /// Tests must not inherit a window Stop from the developer's HOME.
+    #[cfg(test)]
+    pub(super) fn test_clear_stopped(&self) {
+        self.stopped
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -1388,13 +1408,29 @@ impl Engine {
                 // daemon still comes up, so Start has something to talk to
                 // and launchd has nothing to start again and again.
                 *self.held_restarts.lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut restart);
-            } else if !restart.is_empty() && self.vm().is_err() {
-                // vm() has said why. The daemon stays up, since exiting only
-                // had launchd start one that failed the same way every 10 s;
-                // the containers wait and the VM is tried again (retry_held).
-                crate::diag::warn!("the VM did not boot: the containers that restart wait while it is tried again", containers = restart.len());
-                *self.held_restarts.lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut restart);
-                self.retry_held();
+            } else if !restart.is_empty() {
+                // A wasm container must not boot the VM just because its
+                // restart policy says to come back. Linux containers below
+                // are unchanged.
+                let mut linux = Vec::new();
+                for id in std::mem::take(&mut restart) {
+                    if self.lock().containers.get(&id).is_some_and(|c| c.spec.wasm) {
+                        if let Err(e) = self.start_inner(&id, Start::DaemonRestart) {
+                            crate::diag::warn!("container did not restart", id = &id[..12], error = format!("{e:?}"));
+                        }
+                    } else {
+                        linux.push(id);
+                    }
+                }
+                restart = linux;
+                if !restart.is_empty() && self.vm().is_err() {
+                    // vm() has said why. The daemon stays up, since exiting only
+                    // had launchd start one that failed the same way every 10 s;
+                    // the containers wait and the VM is tried again (retry_held).
+                    crate::diag::warn!("the VM did not boot: the containers that restart wait while it is tried again", containers = restart.len());
+                    *self.held_restarts.lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut restart);
+                    self.retry_held();
+                }
             }
         }
         for id in restart {
@@ -1438,6 +1474,18 @@ impl Engine {
         if let Err(e) = std::fs::write(&tmp, &json).and_then(|()| std::fs::rename(&tmp, &self.records)) {
             crate::diag::error!("saving containers failed", error = e);
         }
+    }
+
+    pub(super) fn on_wasm_output(&self, id: &str, stream: Stream, data: &[u8]) {
+        self.on_event(Event::Output { id, stream, data });
+    }
+
+    pub(super) fn on_wasm_exit(&self, id: &str, code: i32) {
+        self.on_event(Event::Exited {
+            id,
+            code,
+            oom: false,
+        });
     }
 
     fn on_event(&self, ev: Event<'_>) {
@@ -1853,9 +1901,16 @@ impl Engine {
     }
 
     /// Records a container and makes sure its layers are in the guest, so
-    /// `start` has nothing left to do but run it.
-    pub fn create(&self, name: Option<String>, spec: Spec, image: &Image) -> Result<String, Error> {
-        if !image.layers.is_empty() {
+    /// `start` has nothing left to do but run it. A wasm image stays on the
+    /// host: its layers are unpacked when it starts, and the VM is not booted.
+    pub fn create(
+        &self,
+        name: Option<String>,
+        mut spec: Spec,
+        image: &Image,
+    ) -> Result<String, Error> {
+        spec.wasm = super::wasm::is_wasm_platform(&image.platform);
+        if !spec.wasm && !image.layers.is_empty() {
             let vm = self.vm()?;
             self.ensure_layers(&vm, image.layers.iter().map(|l| (l.digest.as_str(), l.media_type.as_str())))?;
         }
@@ -1967,6 +2022,18 @@ impl Engine {
                 return Err(Error::Io(io::Error::new(io::ErrorKind::WouldBlock, STOPPED)));
             }
         }
+        let wasm = {
+            let st = self.lock();
+            let id = resolve(&st, key)?;
+            st.containers[&id].spec.wasm
+        };
+        if wasm {
+            // The window's Stop blocks a Linux start inside vm(); match that.
+            if reason == Start::User && self.is_stopped() {
+                return Err(Error::Io(io::Error::other(STOPPED)));
+            }
+            return self.start_wasm(key, reason, _starting);
+        }
         drop(_starting);
         // Retirement and boot own no container lock. A manual action can
         // invalidate this attempt while the previous VM is stopping.
@@ -1986,6 +2053,160 @@ impl Engine {
             }
         };
         self.start_on_vm(key, reason, vm)
+    }
+
+    /// The lifecycle lock is held for setup, not while the module runs:
+    /// `stop` takes that lock, then interrupts wasmtime.
+    fn start_wasm(
+        &self,
+        key: &str,
+        reason: Start,
+        _lifecycle: MutexGuard<'_, u64>,
+    ) -> Result<(), Error> {
+        let id = self.resolve(key)?;
+        let spec = self.with(&id, |c| c.spec.clone())?;
+        if !spec.ports.is_empty() {
+            return Err(Error::BadRequest(
+                "wasm containers do not publish ports".into(),
+            ));
+        }
+        {
+            let st = self.lock();
+            let c = st.containers.get(&id).expect("resolved");
+            if c.status == Status::Running || (reason == Start::Restart && c.stopped_by_user) {
+                return Ok(());
+            }
+            if reason != Start::User && !c.restart_pending {
+                return Ok(());
+            }
+        }
+        let argv = spec
+            .entrypoint
+            .iter()
+            .chain(&spec.cmd)
+            .cloned()
+            .collect::<Vec<_>>();
+        if argv.is_empty() {
+            return Err(Error::BadRequest("no command specified".into()));
+        }
+        let image = self
+            .image(&spec.image)?
+            .ok_or_else(|| Error::NotFound(format!("No such image: {}", spec.image)))?;
+        let root = super::logfile::dir(self.store.root(), &id).join("rootfs");
+        if root.exists() {
+            std::fs::remove_dir_all(&root)?;
+        }
+        std::fs::create_dir_all(&root)?;
+        for layer in &image.layers {
+            let bytes = std::fs::read(self.store.blob_path(&layer.digest)?)?;
+            super::wasm::unpack_layer(&bytes, &layer.media_type, &root, &argv[0])?;
+        }
+        let bytes = match super::wasm::module_bytes(&root, &argv[0]) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(Error::BadRequest(e.to_string()));
+            }
+            other => other?,
+        };
+        let volumes = self.store.root().join("wasm-volumes");
+        let tmp = super::logfile::dir(self.store.root(), &id).join("tmpfs");
+        let preopens = super::wasm::preopens(
+            &root,
+            &spec.mount_info,
+            spec.readonly_rootfs,
+            &volumes,
+            &tmp,
+        )?;
+        let (stdin_read, stdin_write) = if spec.open_stdin {
+            let (read, write) = super::wasm::stdin_pipe()?;
+            (Some(read), Some(write))
+        } else {
+            (None, None)
+        };
+        {
+            let mut st = self.lock();
+            let c = st.containers.get_mut(&id).expect("resolved");
+            if c.status == Status::Running {
+                return Ok(());
+            }
+            if reason != Start::User && !std::mem::take(&mut c.restart_pending) {
+                return Ok(());
+            }
+            c.status = Status::Running;
+            c.restart_pending = false;
+            c.started = Some(SystemTime::now());
+            c.finished = None;
+            c.oom_killed = false;
+            c.vm_stopped = false;
+            c.exit_code = 0;
+            if c.spec.auto_remove && !c.attached.is_empty() {
+                lock_log(&c.log).keep_in_memory();
+            }
+            if reason == Start::User {
+                c.stopped_by_user = false;
+                c.restart_count = 0;
+            }
+        }
+        let daemon = self
+            .me
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| Error::Io(io::Error::other("engine is gone")))?;
+        let engine = super::wasm::new_engine()?;
+        let killed = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        if let Err(e) = super::wasm::launch(
+            daemon,
+            super::wasm::Guest {
+                id: id.clone(),
+                bytes,
+                args: argv,
+                env: super::wasm::split_env(&spec.env),
+                cwd: spec.cwd.clone(),
+                preopens,
+                stdin_read,
+            },
+            stdin_write,
+            engine,
+            killed,
+        ) {
+            crate::diag::warn!(
+                "wasm container did not start",
+                id = &id[..12],
+                image = spec.image,
+                error = e
+            );
+            self.fail_start(&id, &spec, &e);
+            return Err(Error::Io(e));
+        }
+        loop {
+            let (early, close) = {
+                let mut st = self.lock();
+                let Some(c) = st.containers.get_mut(&id) else {
+                    break;
+                };
+                if c.status != Status::Running {
+                    break;
+                }
+                let early = std::mem::take(&mut c.early_input);
+                if !early.is_empty() {
+                    (early, false)
+                } else {
+                    c.live = true;
+                    (early, std::mem::take(&mut c.early_close))
+                }
+            };
+            if early.is_empty() {
+                if close {
+                    super::wasm::close_stdin(&id);
+                }
+                break;
+            }
+            let _ = super::wasm::write_stdin(&id, &early);
+        }
+        if !spec.auto_remove {
+            self.save();
+        }
+        self.emit_container("start", &id, &[]);
+        Ok(())
     }
 
     /// The lifecycle lock is held by start_inner for this entire attempt.
@@ -2568,18 +2789,33 @@ impl Engine {
     /// For the Finder view (macOS).
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn fs_stat(&self, id: &str, path: &str) -> io::Result<super::vmlink::FileInfo> {
+        if self.is_wasm(id) {
+            return Err(io::Error::other(
+                "wasm containers have no guest filesystem view",
+            ));
+        }
         self.vm()?.fs_stat(id, path)
     }
 
     /// For the Finder view (macOS).
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn fs_list(&self, id: &str, path: &str) -> io::Result<Vec<super::vmlink::FileInfo>> {
+        if self.is_wasm(id) {
+            return Err(io::Error::other(
+                "wasm containers have no guest filesystem view",
+            ));
+        }
         self.vm()?.fs_list(id, path)
     }
 
     /// For the Finder view (macOS).
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn fs_read(&self, id: &str, path: &str, offset: u64, len: u32) -> io::Result<Vec<u8>> {
+        if self.is_wasm(id) {
+            return Err(io::Error::other(
+                "wasm containers have no guest filesystem view",
+            ));
+        }
         self.vm()?.fs_read(id, path, offset, len)
     }
 
@@ -2596,6 +2832,9 @@ impl Engine {
             let st = self.lock();
             let id = resolve(&st, key)?;
             let layers = st.containers.get(&id).map(|c| c.layers.clone()).unwrap_or_default();
+            if st.containers.get(&id).is_some_and(|c| c.spec.wasm) {
+                return Err(Error::BadRequest("wasm containers do not support docker cp".into()));
+            }
             (id, layers)
         };
         let vm = self.vm()?;
@@ -2690,7 +2929,7 @@ impl Engine {
     }
 
     pub fn input(&self, id: &str, data: &[u8]) -> io::Result<()> {
-        {
+        let wasm = {
             let mut st = self.lock();
             if let Some(c) = st.containers.get_mut(id) {
                 if !c.live {
@@ -2700,22 +2939,37 @@ impl Engine {
                     c.early_input.extend_from_slice(data);
                     return Ok(());
                 }
+                c.spec.wasm
+            } else {
+                false
             }
+        };
+        if wasm {
+            super::wasm::write_stdin(id, data)
+        } else {
+            self.vm()?.input(id, data)
         }
-        self.vm()?.input(id, data)
     }
 
     pub fn close_stdin(&self, id: &str) -> io::Result<()> {
-        {
+        let wasm = {
             let mut st = self.lock();
             if let Some(c) = st.containers.get_mut(id) {
                 if !c.live {
                     c.early_close = true;
                     return Ok(());
                 }
+                c.spec.wasm
+            } else {
+                false
             }
+        };
+        if wasm {
+            super::wasm::close_stdin(id);
+            Ok(())
+        } else {
+            self.vm()?.close_stdin(id)
         }
-        self.vm()?.close_stdin(id)
     }
 
     /// Resizes a container's (or exec's) terminal; remembered for a container
@@ -2729,9 +2983,9 @@ impl Engine {
         let id = resolve(&st, key)?;
         let c = st.containers.get_mut(&id).expect("resolved");
         c.size = Some((rows, cols));
-        let running = c.status == Status::Running;
+        let (running, wasm) = (c.status == Status::Running, c.spec.wasm);
         drop(st);
-        if running {
+        if running && !wasm {
             self.vm()?.resize(&id, rows, cols)?;
         }
         Ok(())
@@ -2907,6 +3161,9 @@ impl Engine {
             if c.paused == paused {
                 return Err(Error::Conflict(format!("Container {} is {}paused", &id[..12], if paused { "already " } else { "not " })));
             }
+            if c.spec.wasm {
+                return Err(Error::BadRequest("wasm containers cannot be paused".into()));
+            }
         }
         self.vm()?.freeze(&id, paused)?;
         if let Some(c) = self.lock().containers.get_mut(&id) {
@@ -2928,17 +3185,18 @@ impl Engine {
     /// `docker update`: new limits now, and at every later start.
     pub fn update(&self, key: &str, limits: Limits, restart: Option<RestartPolicy>) -> Result<(), Error> {
         let id = self.resolve(key)?;
-        let running = {
+        let (running, wasm) = {
             let mut st = self.lock();
             let c = st.containers.get_mut(&id).expect("resolved");
             c.spec.limits = limits;
             if let Some(r) = restart {
                 c.spec.restart = r;
             }
-            c.status == Status::Running
+            let running = c.status == Status::Running;
+            (running, c.spec.wasm)
         };
         self.save();
-        if running {
+        if running && !wasm {
             self.vm()?.update(&id, limits.wire())?;
         }
         self.emit_container("update", &id, &[]);
@@ -2952,6 +3210,11 @@ impl Engine {
         if !self.is_running(&id) {
             return Err(Error::Conflict(format!("Container {} is not running", &id[..12])));
         }
+        if self.is_wasm(&id) {
+            return Err(Error::BadRequest(
+                "wasm containers do not support stats".into(),
+            ));
+        }
         Ok((id.clone(), name, self.vm()?.container_stats(&id)?))
     }
 
@@ -2960,6 +3223,11 @@ impl Engine {
         let id = self.resolve(key)?;
         if !self.is_running(&id) {
             return Err(Error::Conflict(format!("Container {} is not running", &id[..12])));
+        }
+        if self.is_wasm(&id) {
+            return Err(Error::BadRequest(
+                "wasm containers do not support top".into(),
+            ));
         }
         Ok(self.vm()?.top(&id)?)
     }
@@ -2970,6 +3238,9 @@ impl Engine {
         let id = self.resolve(key)?;
         if !self.is_running(&id) {
             return Err(Error::Conflict(format!("Container {} is not running", &id[..12])));
+        }
+        if self.is_wasm(&id) {
+            return Err(Error::BadRequest("wasm containers do not support listening ports".into()));
         }
         let mode = self.lock().containers.get(&id).map(|c| c.spec.network_mode.clone()).unwrap_or_default();
         let lines = self.vm()?.listening(&id)?;
@@ -3103,7 +3374,9 @@ impl Engine {
         }
         self.emit_container("kill", &id, &[("signal", (libc::SIGTERM).to_string())]);
         let sig = self.lock().containers.get(&id).and_then(|c| c.spec.stop_signal).unwrap_or(libc::SIGTERM as u32);
-        if let Some(vm) = self.awake() {
+        if self.is_wasm(&id) {
+            super::wasm::interrupt(&id, sig);
+        } else if let Some(vm) = self.awake() {
             vm.kill(&id, sig)?;
         }
         let deadline = std::time::Instant::now() + timeout;
@@ -3113,7 +3386,9 @@ impl Engine {
             if left.is_zero() {
                 drop(st);
                 // Never boots a VM: a lost one has already ended it.
-                if let Some(vm) = self.awake() {
+                if self.is_wasm(&id) {
+                    super::wasm::interrupt(&id, libc::SIGKILL as u32);
+                } else if let Some(vm) = self.awake() {
                     vm.kill(&id, libc::SIGKILL as u32)?;
                 }
                 // Docker's stop response means the process has exited, even
@@ -3174,7 +3449,9 @@ impl Engine {
             self.mark_stopped(&id);
         }
         self.emit_container("kill", &id, &[("signal", signal.to_string())]);
-        if let Some(vm) = self.awake() {
+        if self.is_wasm(&id) {
+            super::wasm::interrupt(&id, signal);
+        } else if let Some(vm) = self.awake() {
             vm.kill(&id, signal)?;
         }
         // Like Docker: a SIGKILL returns only once the exit is recorded, so
@@ -3205,7 +3482,9 @@ impl Engine {
                 )));
             }
             self.mark_stopped(&id);
-            if let Some(vm) = self.awake() {
+            if self.is_wasm(&id) {
+                super::wasm::interrupt(&id, libc::SIGKILL as u32);
+            } else if let Some(vm) = self.awake() {
                 vm.kill(&id, libc::SIGKILL as u32)?;
             }
             let mut st = self.lock();
@@ -3381,6 +3660,19 @@ impl Engine {
             }
             (container_id, config, env)
         };
+        if self.is_wasm(&container_id) {
+            let mut st = self.lock();
+            if let Some(x) = st.execs.get_mut(exec_id) {
+                x.running = false;
+                x.exit_code = Some(1);
+                x.attached.clear();
+            }
+            drop(st);
+            self.changed.notify_all();
+            return Err(Error::BadRequest(
+                "wasm containers do not support exec".into(),
+            ));
+        }
         // Paused by the idle watch since the exec was made: started frozen, it
         // would hang. Marked running first, so pause_idle_builder sees it if
         // it pauses after this look.
@@ -3455,6 +3747,10 @@ impl Engine {
         self.lock().containers.get(id).is_some_and(|c| c.status == Status::Running)
     }
 
+    fn is_wasm(&self, id: &str) -> bool {
+        self.lock().containers.get(id).is_some_and(|c| c.spec.wasm)
+    }
+
     /// Records a stop asked for by the user. True when that cancelled a
     /// restart its policy had pending.
     fn mark_stopped(&self, id: &str) -> bool {
@@ -3510,8 +3806,11 @@ impl Engine {
             lock_log(&log).flush();
         }
         let ids: Vec<String> = self.each(|c| (c.status == Status::Running).then(|| c.id.clone()));
+        let (wasm, linux): (Vec<String>, Vec<String>) =
+            ids.into_iter().partition(|id| self.is_wasm(id));
+        let _ = self.halt_wasm(&wasm, false);
         if let Some(vm) = self.awake() {
-            self.stop_together(&vm, &ids, Stopping::Shutdown);
+            self.stop_together(&vm, &linux, Stopping::Shutdown);
         }
         if let Some(vm) = self.awake() {
             vm.shutdown();
@@ -3810,6 +4109,89 @@ impl Engine {
     /// container's `--stop-timeout`, else 10 s.
     pub fn stop_timeout(&self, key: &str) -> Duration {
         stop_wait(self.with(key, |c| c.spec.stop_timeout).ok().flatten().unwrap_or(DEFAULT_STOP_TIMEOUT))
+    }
+
+    /// `stop_together` for wasm modules: the VM is not involved, and must
+    /// not be woken. Returns the ones still running after SIGKILL.
+    fn halt_wasm(&self, ids: &[String], engine_stop: bool) -> Vec<String> {
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        let t0 = std::time::Instant::now();
+        let mut pending: Vec<(String, std::time::Instant, Option<std::time::Instant>)> = Vec::new();
+        for id in ids {
+            let Some((sig, secs)) = self.lock().containers.get(id).map(|c| {
+                (
+                    c.spec.stop_signal.unwrap_or(libc::SIGTERM as u32),
+                    c.spec.stop_timeout.unwrap_or(DEFAULT_STOP_TIMEOUT),
+                )
+            }) else {
+                continue;
+            };
+            if engine_stop {
+                self.emit_container("kill", id, &[("signal", sig.to_string())]);
+            }
+            super::wasm::interrupt(id, sig);
+            let wait = if engine_stop {
+                stop_wait(secs)
+            } else {
+                stop_wait(secs).min(SHUTDOWN_WAIT_CAP)
+            };
+            pending.push((id.clone(), t0 + wait, None));
+        }
+        let grace = if engine_stop {
+            Duration::from_secs(10)
+        } else {
+            Duration::from_secs(2)
+        };
+        let mut exited = Vec::new();
+        let mut st = self.lock();
+        loop {
+            let now = std::time::Instant::now();
+            pending.retain(|(id, _, _)| {
+                let running = st
+                    .containers
+                    .get(id)
+                    .is_some_and(|c| c.status == Status::Running);
+                if !running {
+                    exited.push(id.clone());
+                }
+                running
+            });
+            for (id, deadline, killed) in &mut pending {
+                if *deadline <= now && killed.is_none() {
+                    super::wasm::interrupt(id, libc::SIGKILL as u32);
+                    *killed = Some(now);
+                }
+            }
+            if pending
+                .iter()
+                .all(|(_, _, k)| k.is_some_and(|k| now.duration_since(k) > grace))
+            {
+                break;
+            }
+            let next = pending
+                .iter()
+                .filter(|(_, _, k)| k.is_none())
+                .map(|(_, d, _)| d.saturating_duration_since(now))
+                .min()
+                .unwrap_or(Duration::from_millis(100));
+            st = self
+                .changed
+                .wait_timeout(
+                    st,
+                    next.clamp(Duration::from_millis(10), Duration::from_millis(250)),
+                )
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        drop(st);
+        if engine_stop {
+            for id in &exited {
+                self.emit_container("stop", id, &[]);
+            }
+        }
+        pending.into_iter().map(|(id, _, _)| id).collect()
     }
 
     /// Daemon shutdown and Kiri's Stop: every running container gets its
