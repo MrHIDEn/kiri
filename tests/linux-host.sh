@@ -163,6 +163,46 @@ t crash-restart-count "1 1" "echo \$(docker inspect -f '{{.RestartCount}}' cr-al
 t crash-rm-frees-layer "gone" "id=\$(docker inspect -f '{{.Id}}' cr-no); docker rm cr-no >/dev/null; for i in \$(seq 20); do test -e /var/lib/kiri/containers/\$id || break; sleep 0.1; done; test -e /var/lib/kiri/containers/\$id && echo kept || echo gone"
 t created-rm-frees-layer "gone" "id=\$(docker create alpine true); docker cp /etc/hostname \$id:/f >/dev/null; docker rm \$id >/dev/null; for i in \$(seq 20); do test -e /var/lib/kiri/containers/\$id || break; sleep 0.1; done; test -e /var/lib/kiri/containers/\$id && echo kept || echo gone"
 t crash-cleanup "cr-always" "docker rm -f cr-always cr-unless-stopped cr-user"
+# A containers.json cut short (a crash, a full disk) is kept aside as
+# containers.json.corrupt-*, the records still readable are loaded, and
+# nothing is deleted because of the damaged list: no log folder and no
+# writable layer, also once another container has started and after the
+# next start, which finds a readable but shorter list (#438).
+ST=/root/.local/share/kiri
+CJ="export DOCKER_HOST=unix:///root/.kiri/run/docker.sock"
+t cj-setup "ok" "docker run --name cj1 -v cjv1:/v alpine sh -c 'echo line-one; echo precious > /data' >/dev/null && docker run --name cj2 -v cjv2:/v alpine sh -c 'echo line-two; echo precious > /data' >/dev/null && echo ok"
+CJ_IDS=$($D exec "$N" sh -c "$CJ; docker inspect -f '{{.Id}}' cj1 cj2" | tr '\n' ' ')
+$D stop -t 20 "$N" >/dev/null
+# Cut inside the record of whichever of the two comes later in the file, so
+# the other one can still be read; print that one's id.
+CJ_READ=$($D run --rm -i --name "$N-edit" -e "IDS=$CJ_IDS" -v "$N"-store:/s alpine sh <<'SH'
+f=/s/containers.json
+set -- $IDS
+a=$(awk -v id="$1" '{print index($0, "{\"id\":\"" id "\"")}' $f)
+b=$(awk -v id="$2" '{print index($0, "{\"id\":\"" id "\"")}' $f)
+[ "$a" -gt 0 ] && [ "$b" -gt 0 ] || exit
+if [ "$a" -lt "$b" ]; then cut=$b read=$1; else cut=$a read=$2; fi
+truncate -s $((cut + 20)) $f && echo "$read"
+SH
+)
+$D start "$N" >/dev/null; up
+CJ_KEPT="n=0; for id in $CJ_IDS; do test -d $ST/containers/\$id && test -d /var/lib/kiri/containers/\$id && n=\$((n+1)); done; echo kept \$n"
+t cj-copy-kept "containers.json.corrupt-" "ls $ST"
+t cj-info-warns "containers.json.corrupt-" "docker info --format '{{json .Warnings}}'"
+t cj-readable-listed "${CJ_READ:-no id read}" "docker ps -a -q --no-trunc"
+t cj-nothing-deleted "kept 2" "$CJ_KEPT"
+t cj-nothing-deleted-after-run "kept 2" "docker run --rm alpine true; $CJ_KEPT"
+t cj-readable-logs "line-" "docker logs ${CJ_READ:-none}"
+t cj-readable-files "precious" "docker cp ${CJ_READ:-none}:/data - | tar -xO"
+# The cut container's volume is used by no listed container: neither a
+# prune nor a removal without --force takes it while the list is damaged.
+t cj-prune-refused "were not pruned" "docker volume prune -af 2>&1"
+t cj-prune-kept-volumes "volumes 2" "echo volumes \$(docker volume ls -q | grep -c '^cjv')"
+t cj-volume-rm-refused "was not removed" "docker volume rm cjv1 cjv2 2>&1"
+t cj-volume-rm-kept-volumes "volumes 2" "echo volumes \$(docker volume ls -q | grep -c '^cjv')"
+$D restart -t 20 "$N" >/dev/null; up
+t cj-next-start-deletes-nothing "kept 2" "docker run --rm alpine true; $CJ_KEPT"
+t cj-cleanup "done" "docker rm -f cj1 cj2 >/dev/null 2>&1; docker volume rm -f cjv1 cjv2 >/dev/null 2>&1; for id in $CJ_IDS; do rm -rf $ST/containers/\$id /var/lib/kiri/containers/\$id; done; rm -f $ST/containers.json.corrupt-*; echo done"
 $D rm -f "$N" >/dev/null
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ]

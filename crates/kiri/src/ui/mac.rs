@@ -241,6 +241,23 @@ pub(super) fn set_appearance(theme: &str) {
         };
         let _: () = msg_send![&*app, setAppearance: appearance.as_deref()];
     }
+    // AppKit lays the title bar out again for the new appearance, which puts
+    // the traffic lights back where it keeps them (#187). Lay it out now and
+    // move them into the strip again, as after a resize.
+    WINDOW.with(|w| {
+        if let Some(w) = w.borrow().as_ref() {
+            // SAFETY: main thread; the content view's superview is the
+            // window's frame view, which holds the title bar.
+            unsafe {
+                let content: Option<Retained<AnyObject>> = msg_send![&**w, contentView];
+                let frame: Option<Retained<AnyObject>> = content.and_then(|c| msg_send![&*c, superview]);
+                if let Some(frame) = frame {
+                    let _: () = msg_send![&*frame, layoutSubtreeIfNeeded];
+                }
+            }
+            place_lights(w);
+        }
+    });
 }
 
 /// Shows the window (after it was closed or hidden) and brings Kiri forward,
@@ -257,7 +274,8 @@ fn show_window(mtm: MainThreadMarker) {
 }
 
 /// The app menu, so the standard shortcuts work: ⌘Q quits (the daemon keeps
-/// running), ⌘W closes, ⌘H hides, ⌘, opens Settings.
+/// running), ⌘W closes, ⌘H hides, ⌘, opens Settings, and Edit's keys reach
+/// the window's text fields.
 fn main_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
     let l = super::lang::resolve(prefs()["lang"].as_str());
     let tr = |en: &str| super::lang::tr(l, en);
@@ -285,6 +303,18 @@ fn main_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
     app_menu.addItem(&item(&app("Quit {app}"), sel!(terminate:), "q"));
     let app_item = NSMenuItem::new(mtm);
     app_item.setSubmenu(Some(&app_menu));
+    // Edit: text fields get ⌘Z ⇧⌘Z ⌘X ⌘C ⌘V ⌘A only from a menu item's key.
+    let edit_menu = NSMenu::new(mtm);
+    edit_menu.setTitle(&NSString::from_str(&tr("Edit")));
+    edit_menu.addItem(&item(&tr("Undo"), sel!(undo:), "z"));
+    edit_menu.addItem(&item(&tr("Redo"), sel!(redo:), "Z"));
+    edit_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    edit_menu.addItem(&item(&tr("Cut"), sel!(cut:), "x"));
+    edit_menu.addItem(&item(&tr("Copy"), sel!(copy:), "c"));
+    edit_menu.addItem(&item(&tr("Paste"), sel!(paste:), "v"));
+    edit_menu.addItem(&item(&tr("Select All"), sel!(selectAll:), "a"));
+    let edit_item = NSMenuItem::new(mtm);
+    edit_item.setSubmenu(Some(&edit_menu));
     // View: ⌘+ / ⌘− / ⌘0 step the text size Settings → Appearance sets.
     let view_menu = NSMenu::new(mtm);
     view_menu.setTitle(&NSString::from_str(&tr("View")));
@@ -295,6 +325,7 @@ fn main_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
     view_item.setSubmenu(Some(&view_menu));
     let bar = NSMenu::new(mtm);
     bar.addItem(&app_item);
+    bar.addItem(&edit_item);
     bar.addItem(&view_item);
     bar
 }
