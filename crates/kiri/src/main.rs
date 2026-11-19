@@ -91,7 +91,7 @@ usage: kiri COMMAND          docker's commands, on Kiri: kiri run, ps, exec,
        kiri k8s start [--use] | stop | status | delete | set [--lan on|off] [--tls-san NAME,…] [--port N]
        kiri usb [list] | attach DEVICE | detach DEVICE   USB devices for containers, beta (Mac: pass through to the VM)
        kiri machine create NAME [--distro D] | list | shell NAME | stop | delete NAME
-       kiri import [orbstack | desktop-linux] [--list]
+       kiri import [orbstack | desktop-linux] [--list | [--force] [image|volume|container NAME]]
        kiri bench [--runs N] [--image IMAGE] [--network none|bridge]
        kiri boot [--console] [--pings N]
        kiri raw run [--rm] [-e KEY=VALUE]... IMAGE [COMMAND...]   (its own guest, no daemon)
@@ -163,7 +163,10 @@ fn main() -> ExitCode {
         Some("diag") => diag::run(&args[1..]),
         // Opening Kiri.app: set up on first launch, then the window.
         #[cfg(target_os = "macos")]
-        None if setup::launched_from_app() => setup::first_launch().and_then(|()| ui::run(true, None)),
+        None if setup::launched_from_app() => {
+            setup::first_launch();
+            ui::run(true, None)
+        }
         #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "window")))]
         Some("ui") => ui::run(
             args.iter().any(|a| a == "--start"),
