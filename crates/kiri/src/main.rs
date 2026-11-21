@@ -37,6 +37,9 @@ mod daemon;
 mod diag;
 #[cfg(any(unix, windows))]
 mod docker;
+// `kiri domains`: the container-domain routers' ports (Windows: in WSL).
+#[cfg(unix)]
+mod domains_cli;
 mod flavor;
 mod images;
 #[cfg(unix)]
@@ -83,7 +86,8 @@ usage: kiri COMMAND          docker's commands, on Kiri: kiri run, ps, exec,
        kiri ui [--start] [--view containers|images|volumes|networks]
        kiri setup [--use] [--no-agent] | kiri setup --uninstall
        kiri build-with [docker|kiri]   which builder docker build uses
-       kiri update [--check]
+       kiri domains [set [--http N] [--https N] | reset]   the *.kiri.local routers' ports
+       kiri update [--check]      update Kiri (with a container: docker's update)
        kiri diag logs [-f] [--ui|--engine|--cli] [--errors] [-n N]
        kiri diag report [--out PATH] [--send]   (a file to send us, tokens taken out)
        kiri PORT [NAME]           share a local port on the internet (same as kiri share PORT)
@@ -150,6 +154,8 @@ fn main() -> ExitCode {
         #[cfg(unix)]
         Some("build-with") => buildwith::cli(&args[1..]),
         #[cfg(unix)]
+        Some("domains") => domains_cli::run(&args[1..]),
+        #[cfg(unix)]
         Some("k8s") => k8s::run(&args[1..]),
         #[cfg(unix)]
         Some("machine") => machine::run(&args[1..]),
@@ -158,7 +164,7 @@ fn main() -> ExitCode {
         #[cfg(target_os = "macos")]
         Some("import") => import::run(&args[1..]),
         #[cfg(target_os = "macos")]
-        Some("update") => update::run(&args[1..]),
+        Some("update") if !docker::is_container_update(&args[1..]) => update::run(&args[1..]),
         #[cfg(unix)]
         Some("diag") => diag::run(&args[1..]),
         // Opening Kiri.app: set up on first launch, then the window.
