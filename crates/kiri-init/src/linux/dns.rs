@@ -1,6 +1,8 @@
 //! The embedded DNS server for user-defined networks, as Docker has: at
 //! 127.0.0.11:53 inside each container's network namespace (what its
-//! resolv.conf names, as with Docker), and on each bridge's gateway address,
+//! resolv.conf names, as with Docker; the socket is on a high port there,
+//! with port 53 redirected to it, so the container can bind port 53
+//! itself: see `embedded_socket`), and on each bridge's gateway address,
 //! port 53. Container names and aliases on the container's networks resolve
 //! to their addresses (A, and AAAA on an IPv6 network); everything else is
 //! forwarded to the VM's upstream resolver (or the container's own `--dns`
@@ -99,6 +101,9 @@ pub struct Dns {
     /// bridge → name → (the container's IPv4 address there, its IPv6 one):
     /// the IPv4 address is what `unregister` names the container by.
     names6: HashMap<String, HashMap<String, Owned6>>,
+    /// bridge → its Docker network's name: the order a container's server
+    /// searches its networks in.
+    networks: HashMap<String, String>,
     /// Container address → its `--dns` servers, used instead of the VM's.
     clients: HashMap<[u8; 4], Vec<[u8; 4]>>,
     pending: Vec<Pending>,
@@ -107,6 +112,9 @@ pub struct Dns {
     pub relay: bool,
     /// The host didn't take a relayed lookup: none are tried until then.
     relay_down_until: Option<Instant>,
+    /// Bridges whose gateway wouldn't take the listener (`serve_or_warn`):
+    /// the warning is said once for each.
+    refused: std::collections::HashSet<String>,
 }
 
 fn udp_socket() -> io::Result<OwnedFd> {
@@ -148,9 +156,32 @@ impl Dns {
         if self.servers.iter().any(|s| s.container.is_none() && s.bridges.iter().any(|b| b == bridge)) {
             return Ok(());
         }
-        let sock = bound(gateway)?;
+        let sock = bound(gateway, 53)?;
         self.servers.push(Server { bridges: vec![bridge.to_owned()], sock, container: None });
         Ok(())
+    }
+
+    /// `serve`, for a container start that can go on without it: false
+    /// when the gateway's listener can't be made, said once per bridge.
+    /// The container then asks the resolver in its own namespace, at
+    /// 127.0.0.11 (container.rs `settle_resolver`). A WSL 2 host under
+    /// `networkingMode=Consomme` answers EINVAL to every fixed-port bind on
+    /// a bridge address in its own namespace (#477), and a gateway can be
+    /// held by another program; binds in a container's namespace are not
+    /// affected.
+    pub fn serve_or_warn(&mut self, bridge: &str, gateway: [u8; 4]) -> bool {
+        match self.serve(bridge, gateway) {
+            Ok(()) => true,
+            Err(e) => {
+                if self.refused.insert(bridge.to_owned()) {
+                    eprintln!(
+                        "kiri-init: dns: cannot listen on {bridge}'s gateway {}:53 ({e}); its containers ask Kiri's resolver at 127.0.0.11 in their own network instead",
+                        super::net::ip_str(gateway)
+                    );
+                }
+                false
+            }
+        }
     }
 
     /// Starts answering at 127.0.0.11:53 in container `pid`'s network
@@ -164,7 +195,7 @@ impl Dns {
             }
             return Ok(());
         }
-        let sock = super::netlink::in_netns(netns, || bound(EMBEDDED))?;
+        let sock = super::netlink::in_netns(netns, embedded_socket)?;
         self.servers.push(Server { bridges: vec![bridge.to_owned()], sock, container: Some((pid, owner)) });
         Ok(())
     }
@@ -174,6 +205,23 @@ impl Dns {
         for s in self.servers.iter_mut().filter(|s| s.container.is_some_and(|(p, _)| p == pid)) {
             s.bridges.retain(|b| b != bridge);
         }
+    }
+
+    /// The address container `pid`'s 127.0.0.11 server keeps its `--dns`
+    /// servers under (`set_upstream`), if it has one.
+    pub fn owner_of(&self, pid: i32) -> Option<[u8; 4]> {
+        self.servers.iter().find_map(|s| s.container.filter(|(p, _)| *p == pid).map(|(_, owner)| owner))
+    }
+
+    /// Whether the agent answers DNS at `ip` on a bridge (its gateway).
+    pub fn serves_at(&self, ip: [u8; 4]) -> bool {
+        self.servers.iter().filter(|s| s.container.is_none()).any(|s| {
+            // SAFETY: sockaddr_in is plain data; getsockname fills at most `len` bytes.
+            let mut a: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+            let named = unsafe { libc::getsockname(s.sock.as_raw_fd(), (&mut a as *mut libc::sockaddr_in).cast(), &mut len) } == 0;
+            named && a.sin_addr.s_addr.to_ne_bytes() == ip
+        })
     }
 
     /// Container `pid` is gone: its 127.0.0.11 server goes.
@@ -210,6 +258,13 @@ impl Dns {
         }
     }
 
+    /// `bridge` is Docker network `name` (`net_opts::NETWORK`).
+    pub fn name_network(&mut self, bridge: &str, name: &str) {
+        if self.networks.get(bridge).is_none_or(|n| n != name) {
+            self.networks.insert(bridge.to_owned(), name.to_owned());
+        }
+    }
+
     /// A removed network's bridge: its server and names go.
     pub fn forget_bridge(&mut self, bridge: &str) {
         self.servers.retain(|s| s.container.is_some() || !s.bridges.iter().any(|b| b == bridge));
@@ -218,6 +273,8 @@ impl Dns {
         }
         self.names.remove(bridge);
         self.names6.remove(bridge);
+        self.networks.remove(bridge);
+        self.refused.remove(bridge);
         self.forget_pending();
     }
 
@@ -309,10 +366,16 @@ impl Dns {
     fn answer(&self, server: usize, q: &[u8]) -> Option<Vec<u8>> {
         let (name, qtype, end) = parse_question(q)?;
         let host = vec![super::net::HOST_ADDR];
-        // The first of the server's networks that has the name answers.
-        let bridge = self.servers[server].bridges.iter().find(|b| {
-            self.names.get(*b).is_some_and(|t| t.contains_key(&name)) || self.names6.get(*b).is_some_and(|t| t.contains_key(&name))
-        });
+        // Of the server's networks that have the name, the first by Docker
+        // network name answers, as with Docker: not the first joined. A
+        // name Compose gives a service on every network it joins then
+        // answers from the project's own network rather than a shared one
+        // where another project's service has it too (#294).
+        let bridge = self.servers[server]
+            .bridges
+            .iter()
+            .filter(|b| self.names.get(*b).is_some_and(|t| t.contains_key(&name)) || self.names6.get(*b).is_some_and(|t| t.contains_key(&name)))
+            .min_by_key(|b| self.networks.get(*b).map_or(b.as_str(), String::as_str));
         let addrs = bridge.and_then(|b| self.names.get(b)).and_then(|t| t.get(&name));
         let addrs6 = bridge.and_then(|b| self.names6.get(b)).and_then(|t| t.get(&name));
         // The host's names answer A with the host's address, and AAAA with
@@ -530,10 +593,41 @@ fn framed_reply(got: &[u8]) -> Option<&[u8]> {
     got.get(2..2 + len)
 }
 
-/// A UDP socket bound to `ip`:53.
-fn bound(ip: [u8; 4]) -> io::Result<OwnedFd> {
+/// The embedded DNS's socket in a container's network namespace, which
+/// the calling thread is in: on a free high port of 127.0.0.11, with
+/// 127.0.0.11:53 redirected to it, as Docker does, so that a DNS server of
+/// the container's own (dnsmasq, Pi-hole, CoreDNS, AdGuard) can bind
+/// 0.0.0.0:53 while the container's lookups still reach this one. Where the
+/// redirect can't be made (a kernel without nf_nat), port 53 itself.
+fn embedded_socket() -> io::Result<OwnedFd> {
+    let sock = bound(EMBEDDED, 0)?;
+    match local_port(&sock).and_then(|port| super::netlink::redirect_embedded_dns(EMBEDDED, port)) {
+        Ok(()) => Ok(sock),
+        Err(e) => {
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("kiri-init: dns: no redirect to the embedded DNS ({e}); it takes port 53 in each container");
+            }
+            drop(sock);
+            bound(EMBEDDED, 53)
+        }
+    }
+}
+
+/// The port socket `sock` is bound to.
+fn local_port(sock: &OwnedFd) -> io::Result<u16> {
+    // SAFETY: sockaddr_in is plain data; getsockname fills at most `len` bytes.
+    let mut a: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    // SAFETY: a socket we own and a buffer of `len` bytes.
+    sys::check(unsafe { libc::getsockname(sock.as_raw_fd(), (&mut a as *mut libc::sockaddr_in).cast(), &mut len) } as _, "dns getsockname")?;
+    Ok(u16::from_be(a.sin_port))
+}
+
+/// A UDP socket bound to `ip`:`port` (0: a free one).
+fn bound(ip: [u8; 4], port: u16) -> io::Result<OwnedFd> {
     let sock = udp_socket()?;
-    let addr = sockaddr(ip, 53);
+    let addr = sockaddr(ip, port);
     // SAFETY: binding to a valid sockaddr_in.
     sys::check(
         unsafe { libc::bind(sock.as_raw_fd(), (&addr as *const libc::sockaddr_in).cast(), std::mem::size_of::<libc::sockaddr_in>() as u32) } as _,
@@ -619,6 +713,36 @@ mod tests {
         assert!(dns.answer(0, &query("db", 1)).is_none(), "gone with the network");
         dns.drop_container(42);
         assert!(dns.servers.is_empty());
+    }
+
+    /// #294: a container on its project's network and on a shared one, both
+    /// with a `db`, joining the shared one first. Docker searches the
+    /// networks by name, whatever the join order.
+    #[test]
+    fn a_containers_networks_are_searched_by_docker_network_name() {
+        // (shared network, project network, which one answers)
+        for (shared, project, shared_answers) in [("kiri_shared_t", "kra_default", true), ("ddev_default", "ddev-a_default", false), ("zz_shared", "kca_default", false)] {
+            let mut dns = Dns::default();
+            dns.servers.push(Server { bridges: vec!["kiri1".into(), "kiri2".into()], sock: udp_socket().unwrap(), container: Some((42, [10, 1, 0, 2])) });
+            dns.name_network("kiri1", shared);
+            dns.name_network("kiri2", project);
+            // This project's db on both networks, another project's on the shared one.
+            dns.register("kiri1", ["db"].iter(), [10, 1, 0, 3]);
+            dns.register("kiri1", ["db"].iter(), [10, 1, 0, 4]);
+            dns.register("kiri2", ["db"].iter(), [10, 2, 0, 3]);
+            let q = query("db", 1);
+            let got = answers(&dns.answer(0, &q).unwrap(), q.len());
+            let want = if shared_answers { vec![(1, vec![10, 1, 0, 3]), (1, vec![10, 1, 0, 4])] } else { vec![(1, vec![10, 2, 0, 3])] };
+            assert_eq!(got, want, "{shared} and {project}");
+        }
+    }
+
+    #[test]
+    fn a_removed_networks_name_goes_with_its_bridge() {
+        let mut dns = Dns::default();
+        dns.name_network("kiri1", "frontend");
+        dns.forget_bridge("kiri1");
+        assert!(dns.networks.is_empty());
     }
 
     #[test]
