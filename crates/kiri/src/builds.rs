@@ -17,13 +17,27 @@ use crate::flavor::{CONTEXT, Name};
 /// Kiri's BuildKit builder, a docker-container one on Kiri's context.
 pub const BUILDER: Name = Name("kiri-build", "kiri-dev-build");
 
+#[cfg(unix)]
+fn kiri_host() -> io::Result<String> {
+    Ok(format!("unix://{}", crate::client::socket()?.display()))
+}
+
+#[cfg(windows)]
+fn kiri_host() -> io::Result<String> {
+    Ok(format!("npipe://{}", crate::client::pipe().replace('\\', "/")))
+}
+
 fn buildx(args: &[&str]) -> io::Result<(String, String)> {
     let docker = crate::client::docker_cli().ok_or_else(|| io::Error::other("no docker CLI found (Kiri.app bundles one)"))?;
+    let host = kiri_host()?;
     let mut cmd = Command::new(docker);
     // No console window flashing up from Kiri's window on Windows.
     #[cfg(windows)]
     std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
-    let out = cmd.args(["--context", CONTEXT.get(), "buildx"]).args(args).stdin(Stdio::null()).output()?;
+    // Clear DOCKER_CONTEXT and point DOCKER_HOST at Kiri's socket/pipe so the
+    // implicit "default" builder (used by `docker compose build`) resolves to
+    // Kiri's engine while named builders on Kiri's context still work.
+    let out = cmd.env_remove("DOCKER_CONTEXT").env("DOCKER_HOST", host).arg("buildx").args(args).stdin(Stdio::null()).output()?;
     let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned());
     if !out.status.success() {
         let msg = stderr.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("buildx failed").trim_start_matches("ERROR: ").to_owned();
@@ -37,7 +51,45 @@ fn values(s: &str) -> Vec<Value> {
     serde_json::Deserializer::from_str(s).into_iter::<Value>().map_while(Result::ok).collect()
 }
 
-/// The docker-container builders on Kiri's context whose BuildKit container exists.
+fn endpoint_is_kiri(endpoint: Option<&str>, kiri_context: &str, kiri_host: &str) -> bool {
+    let Some(ep) = endpoint.filter(|s| !s.is_empty()) else { return false };
+    if ep == kiri_context || ep == "default" || ep == kiri_host {
+        return true;
+    }
+    if kiri_host.get(..8).is_some_and(|s| s.eq_ignore_ascii_case("npipe://")) && ep.get(..8).is_some_and(|s| s.eq_ignore_ascii_case("npipe://")) {
+        return ep.replace('\\', "/").eq_ignore_ascii_case(&kiri_host.replace('\\', "/"));
+    }
+    false
+}
+
+fn builders_from(buildx_ls: &[Value], containers: &Value, kiri_context: &str, kiri_host: &str) -> Vec<String> {
+    let have: Vec<String> = containers
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|c| c["Names"].as_array().into_iter().flatten().filter_map(|n| n.as_str().map(|n| n.trim_start_matches('/').to_owned())))
+        .collect();
+    let mut found = Vec::new();
+    for b in buildx_ls {
+        if b["Driver"] != "docker-container" {
+            continue;
+        }
+        let on_kiri = b["Nodes"].as_array().into_iter().flatten().any(|n| {
+            endpoint_is_kiri(n["Endpoint"].as_str(), kiri_context, kiri_host)
+                && n["Name"].as_str().is_some_and(|name| have.iter().any(|c| *c == format!("buildx_buildkit_{name}")))
+        });
+        if on_kiri
+            && let Some(name) = b["Name"].as_str()
+            && !name.is_empty()
+            && !found.iter().any(|existing| existing == name)
+        {
+            found.push(name.to_owned());
+        }
+    }
+    found
+}
+
+/// The docker-container builders on Kiri's engine whose BuildKit container exists.
 /// No buildx plugin (a distribution's plain docker CLI) means no builds yet, not an error.
 fn builders() -> io::Result<Vec<String>> {
     // Without the plugin, docker reads `buildx` as an unknown command or flag.
@@ -45,22 +97,8 @@ fn builders() -> io::Result<Vec<String>> {
         return Ok(Vec::new());
     }
     let (out, _) = buildx(&["ls", "--format", "json"])?;
-    let have: Vec<String> = crate::client::get_background("/containers/json?all=1")?
-        .as_array()
-        .into_iter()
-        .flatten()
-        .flat_map(|c| c["Names"].as_array().into_iter().flatten().filter_map(|n| n.as_str().map(|n| n.trim_start_matches('/').to_owned())))
-        .collect();
-    Ok(values(&out)
-        .into_iter()
-        .filter(|b| b["Driver"] == "docker-container")
-        .filter(|b| {
-            b["Nodes"].as_array().into_iter().flatten().any(|n| {
-                n["Endpoint"] == CONTEXT.get() && n["Name"].as_str().is_some_and(|name| have.iter().any(|c| *c == format!("buildx_buildkit_{name}")))
-            })
-        })
-        .filter_map(|b| b["Name"].as_str().map(str::to_owned))
-        .collect())
+    let containers = crate::client::get_background("/containers/json?all=1")?;
+    Ok(builders_from(&values(&out), &containers, CONTEXT.get(), &kiri_host()?))
 }
 
 /// The newest builds first, from every builder: {builder, id, name, status,
@@ -83,10 +121,14 @@ pub fn list() -> io::Result<Vec<Value>> {
     Ok(all)
 }
 
+fn valid_build_ref(builder: &str, id: &str) -> bool {
+    !builder.is_empty() && !builder.starts_with('-') && !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
 /// One build: the record, its steps in the order they ran (each with its
 /// start, end, cached, error and output) and its warnings.
 pub fn detail(builder: &str, id: &str) -> io::Result<Value> {
-    if !id.bytes().all(|b| b.is_ascii_alphanumeric()) || builder.starts_with('-') {
+    if !valid_build_ref(builder, id) {
         return Err(io::Error::other("not a build"));
     }
     let (info, _) = buildx(&["history", "inspect", "--builder", builder, id, "--format", "json"])?;
@@ -172,7 +214,7 @@ pub fn detail(builder: &str, id: &str) -> io::Result<Value> {
 /// config, read from the manifest and config BuildKit keeps with the record.
 /// Builds that made no image (cache only, or failed) have none.
 pub fn layers(builder: &str, id: &str) -> io::Result<Value> {
-    if !id.bytes().all(|b| b.is_ascii_alphanumeric()) || builder.starts_with('-') {
+    if !valid_build_ref(builder, id) {
         return Err(io::Error::other("not a build"));
     }
     let (info, _) = buildx(&["history", "inspect", "--builder", builder, id, "--format", "json"])?;
@@ -271,10 +313,28 @@ pub(crate) fn image(manifest: &Value, config: &Value, platform: Option<&str>) ->
 
 /// Removes a build from the history.
 pub fn remove(builder: &str, id: &str) -> io::Result<()> {
-    if !id.bytes().all(|b| b.is_ascii_alphanumeric()) || builder.starts_with('-') {
+    if !valid_build_ref(builder, id) {
         return Err(io::Error::other("not a build"));
     }
-    buildx(&["history", "rm", "--builder", builder, id]).map(|_| ())
+    already_gone(buildx(&["history", "rm", "--builder", builder, id]).map(|_| ()), id, || listed(builder, id))
+}
+
+/// A build another removal got to first (a second click, or several removed
+/// at once) is removed. BuildKit then answers `lease "ref_<id>": not found`,
+/// which showed as "Couldn't remove the build". It answers the same for a
+/// build still running, which stays: so only a build `builder`'s history no
+/// longer lists counts as removed, and a listing that fails keeps the error.
+fn already_gone(result: io::Result<()>, id: &str, listed: impl FnOnce() -> io::Result<bool>) -> io::Result<()> {
+    match result {
+        Err(e) if e.to_string().contains(&format!("lease \"ref_{id}\": not found")) && matches!(listed(), Ok(false)) => Ok(()),
+        r => r,
+    }
+}
+
+/// Whether `builder`'s history still has build `id` (its refs end in the id).
+fn listed(builder: &str, id: &str) -> io::Result<bool> {
+    let (out, _) = buildx(&["history", "ls", "--builder", builder, "--format", "json"])?;
+    Ok(values(&out).iter().any(|r| r["ref"].as_str().and_then(|r| r.rsplit('/').next()) == Some(id)))
 }
 
 /// Standard base64, padding optional; anything else is skipped.
@@ -392,6 +452,25 @@ fn failure(what: &str, stderr: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    /// A build already removed (a second click, or several removed at once)
+    /// is removed: BuildKit's "lease not found" isn't an error to show. But
+    /// BuildKit says the same for a build still running, which stays listed:
+    /// that one, or one Kiri can't list, still says so.
+    #[test]
+    fn removing_a_build_already_gone_is_done() {
+        let lost = r#"lease "ref_b1d0ne": not found"#;
+        let answer = |e: &str| Err(io::Error::other(e.to_owned()));
+        let gone = || Ok(false);
+        assert!(already_gone(answer(lost), "b1d0ne", gone).is_ok(), "removed by the other click");
+        assert!(already_gone(Ok(()), "b1d0ne", || -> io::Result<bool> { panic!("no listing when rm worked") }).is_ok());
+        assert_eq!(already_gone(answer(lost), "b1d0ne", || Ok(true)).unwrap_err().to_string(), lost, "still running, still there");
+        assert_eq!(already_gone(answer(lost), "b1d0ne", || Err(io::Error::other("no builder"))).unwrap_err().to_string(), lost);
+        // Another build's lease, or any other failure, still says so.
+        assert!(already_gone(answer(r#"lease "ref_0ther1": not found"#), "b1d0ne", gone).is_err());
+        let ro = "write /var/lib/buildkit/runc-overlayfs/containerdmeta.db: read-only file system";
+        assert_eq!(already_gone(answer(ro), "b1d0ne", gone).unwrap_err().to_string(), ro);
+    }
+
     #[test]
     fn a_failure_carries_the_tools_last_error_line() {
         assert_eq!(failure("docker buildx create failed", b""), "docker buildx create failed");
@@ -432,6 +511,62 @@ mod tests {
     fn reads_values_run_together_or_by_line() {
         assert_eq!(values("{\"a\":1}\n{\"a\":2}").len(), 2);
         assert_eq!(values("{\"a\":1}{\"a\":2}").len(), 2);
+    }
+
+    #[test]
+    fn discovers_every_buildkit_builder_on_kiris_engine() {
+        let host = "unix:///Users/alice/.kiri/run/docker.sock";
+        let buildx_ls = vec![
+            json!({"Name": "kiri-build", "Driver": "docker-container", "Nodes": [{"Name": "kiri-build0", "Endpoint": "kiri"}]}),
+            json!({"Name": "default", "Driver": "docker-container", "Nodes": [{"Name": "default", "Endpoint": "default"}]}),
+            json!({"Name": "compose-url", "Driver": "docker-container", "Nodes": [{"Name": "compose-url0", "Endpoint": host}]}),
+            json!({"Name": "custom-kiri", "Driver": "docker-container", "Nodes": [{"Name": "custom-kiri0", "Endpoint": "kiri"}]}),
+            // Duplicate name must appear only once, keeping first-seen order.
+            json!({"Name": "kiri-build", "Driver": "docker-container", "Nodes": [{"Name": "kiri-build0", "Endpoint": "kiri"}]}),
+            // Builder on Kiri without an existing BuildKit container must be skipped (never wake/create).
+            json!({"Name": "not-started", "Driver": "docker-container", "Nodes": [{"Name": "not-started0", "Endpoint": "kiri"}]}),
+            json!({"Name": "default-missing", "Driver": "docker-container", "Nodes": [{"Name": "default-missing0", "Endpoint": "default"}]}),
+            // Non-docker-container driver must be skipped.
+            json!({"Name": "plain-docker", "Driver": "docker", "Nodes": [{"Name": "default", "Endpoint": "default"}]}),
+            // Foreign contexts / sockets must be rejected even if a container of that name exists.
+            json!({"Name": "desktop-builder", "Driver": "docker-container", "Nodes": [{"Name": "desktop-builder0", "Endpoint": "desktop-linux"}]}),
+            json!({"Name": "orb-builder", "Driver": "docker-container", "Nodes": [{"Name": "orb-builder0", "Endpoint": "orbstack"}]}),
+            json!({"Name": "other-sock", "Driver": "docker-container", "Nodes": [{"Name": "other-sock0", "Endpoint": "unix:///var/run/other.sock"}]}),
+        ];
+        let containers = json!([
+            {"Names": ["/buildx_buildkit_kiri-build0"], "Image": "moby/buildkit:buildx-stable-1"},
+            {"Names": ["/buildx_buildkit_default"], "Image": "moby/buildkit:buildx-stable-1"},
+            {"Names": ["/buildx_buildkit_compose-url0"], "Image": "moby/buildkit:buildx-stable-1"},
+            {"Names": ["/buildx_buildkit_custom-kiri0"], "Image": "moby/buildkit:buildx-stable-1"},
+            {"Names": ["/buildx_buildkit_desktop-builder0"], "Image": "moby/buildkit:buildx-stable-1"},
+            {"Names": ["/buildx_buildkit_orb-builder0"], "Image": "moby/buildkit:buildx-stable-1"},
+            {"Names": ["/buildx_buildkit_other-sock0"], "Image": "moby/buildkit:buildx-stable-1"},
+        ]);
+        let found = builders_from(&buildx_ls, &containers, "kiri", host);
+        assert_eq!(found, vec!["kiri-build", "default", "compose-url", "custom-kiri"]);
+    }
+
+    #[test]
+    fn matches_windows_npipe_endpoints_case_and_slash_insensitively() {
+        let host = "npipe:////./pipe/kiri";
+        let buildx_ls = vec![
+            json!({"Name": "default", "Driver": "docker-container", "Nodes": [{"Name": "default", "Endpoint": r"NPIPE://\\.\pipe\KIRI"}]}),
+            json!({"Name": "other-pipe", "Driver": "docker-container", "Nodes": [{"Name": "other-pipe0", "Endpoint": "npipe:////./pipe/docker_engine"}]}),
+        ];
+        let containers = json!([
+            {"Names": ["/buildx_buildkit_default"]},
+            {"Names": ["/buildx_buildkit_other-pipe0"]},
+        ]);
+        assert_eq!(builders_from(&buildx_ls, &containers, "kiri", host), vec!["default"]);
+    }
+
+    #[test]
+    fn rejects_empty_or_flag_like_builder_in_detail_layers_and_remove() {
+        for (builder, id) in [("", "abc123"), ("-bad", "abc123"), ("--builder", "abc123"), ("kiri-build", ""), ("kiri-build", "bad/id")] {
+            assert_eq!(detail(builder, id).unwrap_err().to_string(), "not a build", "detail({builder:?}, {id:?})");
+            assert_eq!(layers(builder, id).unwrap_err().to_string(), "not a build", "layers({builder:?}, {id:?})");
+            assert_eq!(remove(builder, id).unwrap_err().to_string(), "not a build", "remove({builder:?}, {id:?})");
+        }
     }
 }
 

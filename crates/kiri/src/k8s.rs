@@ -194,6 +194,10 @@ fn ok(r: io::Result<client::Response>) -> io::Result<client::Response> {
 pub fn run(args: &[String]) -> io::Result<()> {
     let what = args.first().map(String::as_str).unwrap_or("");
     let logged = matches!(what, "start" | "stop" | "delete" | "set");
+    // A recreate from the command line (`kiri k8s set`) is attributed to this
+    // op, so the node's stop is logged as `k8s set`, not as a memory kill. A
+    // child the window started already has its own op (KIRI_OP).
+    let _op = (logged && crate::diag::op().is_none()).then(|| crate::diag::enter_op(crate::diag::new_op(&format!("k8s{what}"))));
     if logged {
         crate::diag::info!(format!("Kubernetes {what}"));
     }
@@ -211,7 +215,11 @@ fn run_inner(args: &[String]) -> io::Result<()> {
         Some("start") => start(flag("--use")),
         Some("stop") => {
             ensure_daemon()?;
-            ok(client::request("POST", &format!("/containers/{NAME}/stop"), None))?;
+            // Stopped already: Docker's 304, with no body, is done (as Start's is).
+            let stopped = client::request("POST", &format!("/containers/{NAME}/stop"), None)?;
+            if !stopped.ok() && stopped.status != 304 {
+                return Err(io::Error::other(stopped.error()));
+            }
             println!("Kubernetes stopped (its state is kept; `kiri k8s start` resumes it)");
             Ok(())
         }
@@ -347,7 +355,11 @@ const HOST_MANIFEST: &str = "kiri-host-names.yaml";
 /// everything else resolves as before. A `hosts` block in a `.override`
 /// would clash with the NodeHosts one k3s' Corefile already has.
 fn host_manifest() -> String {
-    let addr = crate::daemon::ports::HOST_ADDR;
+    let addr = if crate::hostrelay::wsl_host_active() {
+        crate::hostrelay::WSL_HOST_ADDR_STR
+    } else {
+        crate::daemon::ports::HOST_ADDR
+    };
     let zones: Vec<String> = HOST_NAMES.iter().map(|n| format!("{n}:53")).collect();
     format!(
         "# Written by Kiri at each `kiri k8s start`: pods resolve the host's names, as containers do.\n\
