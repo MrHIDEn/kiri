@@ -1,10 +1,13 @@
 //! Moving to Kiri from OrbStack or Docker Desktop: images, volumes and
 //! containers, copied through the docker CLI so each engine speaks its own
 //! API. The source is only read: `docker save` for images, `inspect` for
-//! containers, and for a volume `docker cp` out of a container that mounts
-//! it read-only, is never started and is removed after (that keeps file
-//! owners, which a copy through the Finder would lose). Containers arrive
-//! stopped.
+//! containers, and for a volume a short-lived official GNU tar helper that
+//! mounts it read-only and is removed after (keeping file owners and `user.*`
+//! extended attributes, which `docker cp` or a copy through the Finder would
+//! lose; falling back to `docker cp` when offline without GNU tar).
+//! Containers arrive stopped, with the files they wrote outside their
+//! volumes: what `docker diff` lists, read path by path with `docker cp`
+//! into the container's writable layer in Kiri (#410).
 
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -174,7 +177,14 @@ fn has(ctx: &str, kind: &str, name: &str) -> bool {
 
 /// `from` piped through `retar` (in this process) into `to`, both docker
 /// commands already set up; the first failure that explains the others.
-fn pipe(mut from: Command, mut to: Command, from_ctx: &str, retar: impl FnOnce(&mut dyn Read, &mut dyn Write) -> io::Result<()>) -> io::Result<()> {
+fn pipe(from: Command, to: Command, from_ctx: &str, retar: impl FnOnce(&mut dyn Read, &mut dyn Write) -> io::Result<()>) -> io::Result<()> {
+    pipe_with(from, to, from_ctx, false, retar)
+}
+
+/// [`pipe`]; when `allow_file_changed` is set (`--force` with GNU tar), GNU
+/// tar's exit status 1 ("file changed as we read it") is accepted once the
+/// tar stream itself reached its end and the writer succeeded.
+fn pipe_with(mut from: Command, mut to: Command, from_ctx: &str, allow_file_changed: bool, retar: impl FnOnce(&mut dyn Read, &mut dyn Write) -> io::Result<()>) -> io::Result<()> {
     let mut from = from.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
     let mut out = from.stdout.take().ok_or_else(|| io::Error::other("no output from docker"))?;
     let mut to = match to.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn() {
@@ -205,7 +215,8 @@ fn pipe(mut from: Command, mut to: Command, from_ctx: &str, retar: impl FnOnce(&
     }
     drop((out, into));
     let written = to.wait()?.success();
-    let read = from.wait()?.success();
+    let from_status = from.wait()?;
+    let read = from_status.success() || (allow_file_changed && copied.is_ok() && from_status.code() == Some(1));
     let to_said = to_said.join().unwrap_or_default();
     let from_said = from_said.join().unwrap_or_default();
     // A writer that stopped reading breaks the reader's pipe: its reason first.
@@ -359,9 +370,33 @@ fn retar(mut from: impl Read, mut to: impl Write, name: Option<&str>) -> io::Res
     }
 }
 
-/// Official images with `tar` and `sh`: one of these does Kiri's half of a
-/// volume copy.
+/// Official images with `tar` and `sh`: any of these can inspect volumes or
+/// unpack when offline; the GNU tar ones ([`GNU_TAR_IMAGES`]) preserve
+/// extended attributes on both ends of a volume copy (#485).
 const TAR_IMAGES: [&str; 4] = ["alpine", "busybox", "debian", "ubuntu"];
+
+/// BusyBox tar (alpine, busybox) silently drops `user.*` xattrs, which is
+/// where Supabase Storage keeps object metadata: reads then fail with
+/// ENODATA. Both ends of a volume copy use an official GNU tar image (#485).
+const GNU_TAR_IMAGES: [&str; 2] = ["debian", "ubuntu"];
+
+/// xattrs travel as pax records: the format and `--xattrs` are both needed
+/// when writing them, and `--numeric-owner` keeps raw UID/GID across
+/// differing `/etc/passwd` tables. Passed as argv, so `*` is literal.
+const STORE_XATTRS: [&str; 4] = ["--numeric-owner", "--format=pax", "--xattrs", "--xattrs-include=*"];
+
+/// Only `user.*` is portable to apply on the other engine; system-defined
+/// namespaces (security, trusted) are not (GNU tar's extraction default).
+/// `--numeric-owner` keeps raw UID/GID across differing `/etc/passwd` tables.
+const RESTORE_XATTRS: &str = "--numeric-owner --xattrs '--xattrs-include=user.*'";
+
+/// Whether an official image name is one of [`GNU_TAR_IMAGES`]. An
+/// official digest for the very same repository is checked separately in
+/// [`pick_helper_matching`], so a look-alike still cannot be run (#506).
+fn gnu_tar(name: &str) -> bool {
+    let repo = name.rsplit_once(':').filter(|(_, tag)| !tag.contains('/')).map_or(name, |(r, _)| r);
+    GNU_TAR_IMAGES.iter().any(|base| repo == *base || repo.ends_with(&format!("/{base}")))
+}
 
 /// Whether a `RepoDigests` entry shows the engine pulled the image from an
 /// official repository of [`TAR_IMAGES`]: Docker Hub's, or one of its two
@@ -377,55 +412,142 @@ fn official(repo_digest: &str) -> bool {
     homes.iter().any(|home| repo.strip_prefix(home).is_some_and(|base| TAR_IMAGES.contains(&base)))
 }
 
-/// The name to run Kiri's half of a volume copy by: a `repo:tag` of the
-/// first of `images` (Kiri's image list: `RepoTags`, `RepoDigests`) whose
+/// A `repo:tag` of the first of `images` (`RepoTags`, `RepoDigests`) whose
 /// own record shows it was pulled under that name from an official
-/// repository ([`official`]). Run by that name, it is that record.
-fn pick_helper(images: &[Value]) -> Option<String> {
+/// repository ([`official`]). When `only_gnu` is set, only [`GNU_TAR_IMAGES`]
+/// qualify.
+fn pick_helper_matching(images: &[Value], only_gnu: bool) -> Option<String> {
     let strings = |v: &Value| v.as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>();
     images.iter().find_map(|i| {
         let digests = strings(&i["RepoDigests"]);
         strings(&i["RepoTags"]).into_iter().find(|name| {
             let Some((repo, _)) = name.rsplit_once(':').filter(|(_, tag)| !tag.is_empty() && !tag.contains('/')) else { return false };
-            digests.iter().any(|d| official(d) && d.split_once('@').is_some_and(|(r, _)| r == repo))
+            (!only_gnu || gnu_tar(name)) && digests.iter().any(|d| official(d) && d.split_once('@').is_some_and(|(r, _)| r == repo))
         })
     })
 }
 
-/// [`pick_helper`] of the images Kiri has, read once from its API.
-fn helper_in_kiri() -> io::Result<Option<String>> {
+/// Official GNU tar helper (`debian`, `ubuntu`), verified by digest (#506).
+fn pick_gnu_helper(images: &[Value]) -> Option<String> {
+    pick_helper_matching(images, true)
+}
+
+/// The name to run a volume helper by: an official GNU tar image when
+/// present, else any official [`TAR_IMAGES`] image (for volume inspection or
+/// offline fallback).
+fn pick_helper(images: &[Value]) -> Option<String> {
+    pick_gnu_helper(images).or_else(|| pick_helper_matching(images, false))
+}
+
+/// Kiri's image records (`RepoTags`, `RepoDigests`), read once from its API.
+fn kiri_images() -> io::Result<Vec<Value>> {
     let r = client::request("GET", "/images/json", None)?;
     if !r.ok() {
         return Err(io::Error::other(format!("kiri: {}", r.error())));
     }
-    Ok(r.json().as_array().and_then(|images| pick_helper(images)))
+    Ok(r.json().as_array().cloned().unwrap_or_default())
 }
 
-/// When Kiri last failed to fetch a helper: tried once per import, not
-/// once per volume.
+/// [`pick_helper`] of the images Kiri has (GNU tar preferred, else
+/// alpine/busybox).
+fn helper_in_kiri() -> io::Result<Option<String>> {
+    Ok(pick_helper(&kiri_images()?))
+}
+
+/// [`pick_gnu_helper`] of the images Kiri has (official debian/ubuntu only).
+fn gnu_helper_in_kiri() -> io::Result<Option<String>> {
+    Ok(pick_gnu_helper(&kiri_images()?))
+}
+
+/// Pull an official GNU tar image (`debian:trixie`) into `ctx`, preferring
+/// public mirrors over Docker Hub and never overwriting an existing local
+/// `debian:trixie` tag.
+fn pull_gnu_image(ctx: &str) -> bool {
+    let pull = |name: &str| {
+        cli().is_ok_and(|mut c| {
+            c.args(["--context", ctx, "pull", "-q", name])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        })
+    };
+    pull("mirror.gcr.io/library/debian:trixie")
+        || pull("public.ecr.aws/docker/library/debian:trixie")
+        || (!has(ctx, "image", "debian:trixie") && pull("debian:trixie"))
+}
+
+/// When Kiri last failed to fetch a GNU tar helper: tried once per import,
+/// not once per volume.
 static PULL_FAILED: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 
-/// [`helper_in_kiri`], else busybox fetched by Kiri: from the public mirror,
-/// else from Docker Hub when no image of the person's is called that.
-/// Nothing is taken from the source.
+/// [`gnu_helper_in_kiri`], else Debian fetched by Kiri: from a public mirror,
+/// else from Docker Hub when no image of the person's is called that. When
+/// offline, falls back to an official `alpine`/`busybox` already in Kiri so
+/// volume import still works without xattrs (#376). Nothing is taken from
+/// the source.
 fn helper() -> io::Result<String> {
-    if let Some(name) = helper_in_kiri()? {
+    if let Some(name) = gnu_helper_in_kiri()? {
         return Ok(name);
     }
-    let none = || io::Error::other("Kiri needs one small official image to unpack volumes with: pull alpine or busybox in Kiri (docker pull alpine) and import again. A re-tagged or loaded copy does not count");
+    let none = || io::Error::other("Kiri needs one official GNU tar image to unpack volumes with: pull debian in Kiri (docker pull debian:trixie) and import again. A re-tagged or loaded copy does not count");
     let mut failed = PULL_FAILED.lock().unwrap_or_else(|e| e.into_inner());
     if failed.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(60)) {
-        return Err(none());
+        return helper_in_kiri()?.ok_or_else(none);
     }
     let kiri = crate::flavor::CONTEXT.get();
-    let pull = |name: &str| cli().is_ok_and(|mut c| c.args(["--context", kiri, "pull", "-q", name]).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success()));
-    if (pull("mirror.gcr.io/library/busybox") || (!has(kiri, "image", "busybox:latest") && pull("busybox")))
-        && let Some(name) = helper_in_kiri()?
+    if pull_gnu_image(kiri)
+        && let Some(name) = gnu_helper_in_kiri()?
     {
         return Ok(name);
     }
     *failed = Some(std::time::Instant::now());
-    Err(none())
+    helper_in_kiri()?.ok_or_else(none)
+}
+
+/// Official GNU tar image already present on the source engine `ctx`,
+/// verified by `RepoDigests` just like Kiri's helper (#506).
+fn gnu_helper_in_source(ctx: &str) -> io::Result<Option<String>> {
+    let rows = json_lines(ctx, &["image", "ls", "--no-trunc", "--format", "{{json .}}"])?;
+    let mut ids: Vec<String> = Vec::new();
+    for v in &rows {
+        let repo = v["Repository"].as_str().unwrap_or("");
+        let id = v["ID"].as_str().unwrap_or("");
+        if !id.is_empty() && gnu_tar(repo) && !ids.iter().any(|x| x == id) {
+            ids.push(id.to_owned());
+        }
+    }
+    if ids.is_empty() {
+        return Ok(None);
+    }
+    let mut args = vec!["image", "inspect", "--format", r#"{"RepoTags":{{json .RepoTags}},"RepoDigests":{{json .RepoDigests}}}"#];
+    let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    args.extend(id_refs);
+    let inspected = json_lines_found(ctx, &args)?;
+    Ok(pick_gnu_helper(&inspected))
+}
+
+/// When pulling the source's GNU tar helper last failed: `(context, when)`.
+static SRC_PULL_FAILED: std::sync::Mutex<Option<(String, std::time::Instant)>> = std::sync::Mutex::new(None);
+
+/// An official GNU tar image on `ctx`, pulled if needed and verified by
+/// `RepoDigests` (#485, #506). Returns `None` when offline or unable to pull,
+/// so volume copy falls back to `docker cp` instead of failing (#376).
+fn source_gnu_helper(ctx: &str) -> io::Result<Option<String>> {
+    if let Some(name) = gnu_helper_in_source(ctx)? {
+        return Ok(Some(name));
+    }
+    let mut failed = SRC_PULL_FAILED.lock().unwrap_or_else(|e| e.into_inner());
+    if failed.as_ref().is_some_and(|(c, t)| c == ctx && t.elapsed() < std::time::Duration::from_secs(60)) {
+        return Ok(None);
+    }
+    if pull_gnu_image(ctx)
+        && let Some(name) = gnu_helper_in_source(ctx)?
+    {
+        return Ok(Some(name));
+    }
+    *failed = Some((ctx.to_owned(), std::time::Instant::now()));
+    Ok(None)
 }
 
 /// The label on the containers an import makes for itself.
@@ -544,8 +666,8 @@ pub fn volume_with(source: &str, name: &str, force: bool) -> io::Result<()> {
         return Err(io::Error::other(why));
     }
     let img = match kiri_img {
-        Some(img) => img,
-        None => helper()?,
+        Some(img) if gnu_tar(&img) => img,
+        _ => helper()?,
     };
     if state.is_none() {
         state = Some(kiri_states(&[name.to_owned()], &img)?[0].1);
@@ -569,61 +691,111 @@ pub fn volume_with(source: &str, name: &str, force: bool) -> io::Result<()> {
             return Err(io::Error::other(why));
         }
     }
-    // Nothing runs on the source: a container that is made and never
-    // started mounts the volume read-only (`volume-nocopy`: its image's
-    // files don't go in), from any image there and never pulled, and
-    // `docker cp` reads it as an archive with owners, modes and links as
-    // they are. It goes after, with any anonymous volume its image made;
-    // one an import that was stopped left behind goes first.
-    let names = image_names(ctx)?;
-    let reader_image = match names.first() {
-        Some(n) => n.clone(),
-        None => json_lines(ctx, &["image", "ls", "--format", "{{json .ID}}"])?
-            .first()
-            .and_then(|v| v.as_str().map(str::to_owned))
-            .ok_or_else(|| io::Error::other(format!("{ctx} has no image to read volumes through; pull any image there and import again")))?,
-    };
+    let src_gnu = if gnu_tar(&img) { source_gnu_helper(ctx)? } else { None };
     let reader = format!("kiri-import-{name}");
     let leftover = json_lines(ctx, &["inspect", "--type", "container", "--format", "{{json .Config.Labels}}", &reader]).unwrap_or_default();
     if leftover.first().is_some_and(|l| l["dev.kiri.import-helper"] == "1") {
         let _ = cli()?.args(["--context", ctx, "rm", "-fv", &reader]).stdout(Stdio::null()).stderr(Stdio::null()).status();
     }
-    // At a path no image can have a VOLUME of its own at or under.
-    use std::hash::BuildHasher;
-    let at = format!("/kiri-import-{:016x}", std::collections::hash_map::RandomState::new().hash_one(name));
-    let mount = format!("type=volume,src={name},dst={at},readonly,volume-nocopy");
-    let made = cli()?
-        .args(["--context", ctx, "create", "--name", &reader, "--pull", "never", "--network", "none", "--label", HELPER, "--entrypoint", &at, "--mount", &mount, &reader_image])
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()?;
-    if !made.status.success() {
-        return Err(io::Error::other(format!("{ctx}: {}", String::from_utf8_lossy(&made.stderr).trim())));
-    }
-    let copied = copy_volume(ctx, &format!("{reader}:{at}/."), name, &img);
-    let _ = cli()?.args(["--context", ctx, "rm", "-v", &reader]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    let copied = if let Some(src_img) = src_gnu {
+        // GNU tar in an official helper on the source reads the volume
+        // read-only (`volume-nocopy`: no image files go in) and puts numeric
+        // owners and `user.*` xattrs in the stream; `docker cp` leaves xattrs
+        // out (#485).
+        let mount = format!("type=volume,src={name},dst=/from,readonly,volume-nocopy");
+        let mut read = cli()?;
+        read.args(volume_reader_args(ctx, &reader, &mount, &src_img));
+        let r = copy_volume(read, ctx, name, &img, force);
+        if r.is_err() {
+            let _ = cli()?.args(["--context", ctx, "rm", "-fv", &reader]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        }
+        r
+    } else {
+        // Offline / no official GNU tar helper on both engines: fall back to
+        // a stopped reader + `docker cp` so volume import still works (#376)
+        // without running any unverified image on the source (#506).
+        eprintln!("kiri: importing volume {name} without extended attributes (no official Debian or Ubuntu image available on both engines)");
+        let names = image_names(ctx)?;
+        let reader_image = match names.first() {
+            Some(n) => n.clone(),
+            None => json_lines(ctx, &["image", "ls", "--format", "{{json .ID}}"])?
+                .first()
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .ok_or_else(|| io::Error::other(format!("{ctx} has no image to read volumes through; pull any image there and import again")))?,
+        };
+        // At a path no image can have a VOLUME of its own at or under.
+        use std::hash::BuildHasher;
+        let at = format!("/kiri-import-{:016x}", std::collections::hash_map::RandomState::new().hash_one(name));
+        let mount = format!("type=volume,src={name},dst={at},readonly,volume-nocopy");
+        let made = cli()?
+            .args(["--context", ctx, "create", "--name", &reader, "--pull", "never", "--network", "none", "--label", HELPER, "--entrypoint", &at, "--mount", &mount, &reader_image])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()?;
+        if !made.status.success() {
+            return Err(io::Error::other(format!("{ctx}: {}", String::from_utf8_lossy(&made.stderr).trim())));
+        }
+        let mut read = cli()?;
+        read.args(["--context", ctx, "cp", &format!("{reader}:{at}/."), "-"]);
+        let r = copy_volume(read, ctx, name, &img, false);
+        let _ = cli()?.args(["--context", ctx, "rm", "-v", &reader]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        r
+    };
     copied.map_err(|e| io::Error::other(format!("{e}; {name} is unfinished in Kiri: the next import empties it and copies it again, replacing what is in it then")))
 }
 
-/// `docker cp` out of the reader on the source, through [`retar`], untarred
-/// into the volume by a helper on Kiri that removes itself. The helper
-/// marks the volume unfinished first (emptying what an unfinished copy
-/// left), and the mark goes only once every part of the copy succeeded.
-fn copy_volume(ctx: &str, from: &str, name: &str, img: &str) -> io::Result<()> {
+/// GNU tar in an official helper on the source, streaming the volume with
+/// numeric owners and xattrs. `--entrypoint tar` guarantees the image's own
+/// entrypoint never runs instead of `tar`.
+fn volume_reader_args<'a>(ctx: &'a str, reader: &'a str, mount: &'a str, img: &'a str) -> Vec<&'a str> {
+    let mut args = vec![
+        "--context",
+        ctx,
+        "run",
+        "--rm",
+        "--name",
+        reader,
+        "--network",
+        "none",
+        "--label",
+        HELPER,
+        "--pull",
+        "never",
+        "--mount",
+        mount,
+        "--entrypoint",
+        "tar",
+        img,
+    ];
+    args.extend(STORE_XATTRS);
+    args.extend(["-C", "/from", "-cf", "-", "."]);
+    args
+}
+
+/// Shell script run in Kiri's helper container to clear an unfinished copy,
+/// mark the volume unfinished, and unpack the tar stream from stdin.
+fn restore_script(with_gnu_tar: bool) -> String {
+    let flags = if with_gnu_tar { format!(" {RESTORE_XATTRS}") } else { String::new() };
+    format!(
+        r#"set -e; cd /to; if [ -e {m} ]; then find . -mindepth 1 -maxdepth 1 ! -name {m} -exec rm -rf -- {{}} + || true; for f in .[!.]* ..?* *; do if [ "$f" != {m} ] && {{ [ -e "$f" ] || [ -L "$f" ]; }}; then echo "could not empty the volume: $f is left" >&2; exit 1; fi; done; fi; touch {m}; tar{flags} -xpf -"#,
+        m = UNFINISHED
+    )
+}
+
+/// A tar stream out of the reader on the source, through [`retar`], untarred
+/// into the volume by a helper on Kiri that removes itself. The helper marks
+/// the volume unfinished first (emptying what an unfinished copy left), and
+/// the mark goes only once every part of the copy succeeded.
+fn copy_volume(read: Command, ctx: &str, name: &str, img: &str, allow_file_changed: bool) -> io::Result<()> {
     let kiri = crate::flavor::CONTEXT.get();
     let dst_mount = format!("{name}:/to");
-    let mut read = cli()?;
-    read.args(["--context", ctx, "cp", from, "-"]);
     let mut write = cli()?;
     // Emptied in one pass, all but the mark (a folder by that name counts as
     // it); anything still there after, hidden names too, stops the copy with
     // the mark left on.
-    let script = format!(
-        r#"set -e; cd /to; if [ -e {m} ]; then find . -mindepth 1 -maxdepth 1 ! -name {m} -exec rm -rf -- {{}} + || true; for f in .[!.]* ..?* *; do if [ "$f" != {m} ] && {{ [ -e "$f" ] || [ -L "$f" ]; }}; then echo "could not empty the volume: $f is left" >&2; exit 1; fi; done; fi; touch {m}; tar -xpf -"#,
-        m = UNFINISHED
-    );
+    let script = restore_script(gnu_tar(img));
     write.args(["--context", kiri, "run", "--rm", "-i", "--network", "none", "--label", HELPER, "-v", &dst_mount, "--pull", "never", "--entrypoint", "sh", img, "-c", &script]);
-    pipe(read, write, ctx, |from, to| retar(from, to, None))?;
+    pipe_with(read, write, ctx, allow_file_changed, |from, to| retar(from, to, None))?;
     let done = cli()?.args(["--context", kiri, "run", "--rm", "--network", "none", "--label", HELPER, "-v", &dst_mount, "--pull", "never", "--entrypoint", "rm", img, "-rf", "--", &format!("/to/{UNFINISHED}")]).stdout(Stdio::null()).stderr(Stdio::piped()).output()?;
     if !done.status.success() {
         return Err(io::Error::other(format!("kiri: {}", String::from_utf8_lossy(&done.stderr).trim())));
@@ -663,7 +835,7 @@ pub fn container_with(source: &str, name: &str, force: bool, joining: &[&str]) -
     let info = json_lines(ctx, &["inspect", "--type", "container", "--format", "{{json .}}", name])?.into_iter().next().ok_or_else(|| io::Error::other(format!("{name}: not found in {ctx}")))?;
     let image = info["Config"]["Image"].as_str().unwrap_or("").to_owned();
     if !has(kiri, "image", &image) {
-        self::image(source, &image)?;
+        self::image(source, &image).map_err(|e| io::Error::other(format!("image {image}: {e}")))?;
     }
     // Else create would make them in Kiri, empty.
     for v in volumes_of(&info) {
@@ -699,9 +871,618 @@ pub fn container_with(source: &str, name: &str, force: bool, joining: &[&str]) -
     }
     let r = client::request("POST", &format!("/containers/create?name={name}"), Some(&create_body(&info, &mode, networks.into())))?;
     if !r.ok() {
-        return Err(io::Error::other(r.error()));
+        return Err(io::Error::other(create_error(r.status, &r.error())));
+    }
+    if let Err(e) = writable_layer(ctx, &info, name) {
+        // Without the files it wrote, the container is not the one it was:
+        // it goes again, and the reason is said. Its volumes stay.
+        let _ = client::request("DELETE", &format!("/containers/{name}?force=1"), None);
+        return Err(io::Error::other(format!("its writable layer: {e}")));
     }
     Ok(())
+}
+
+/// The engine's own files, which each engine makes and mounts over the
+/// container's for itself: never carried over.
+const ENGINE_FILES: [&str; 4] = ["/etc/hosts", "/etc/hostname", "/etc/resolv.conf", "/.dockerenv"];
+
+/// The kernel's filesystems and the engine's `/dev`, mounted in every
+/// container: nothing at or under them is carried over.
+const KERNEL_TREES: [&str; 3] = ["/proc", "/sys", "/dev"];
+
+/// How many `docker cp` run at once to read the paths a layer changed.
+const READERS: usize = 8;
+
+/// A file up to this size is read ahead, in parallel, while the paths
+/// before it are written; a bigger one is read when its turn comes.
+const READ_AHEAD_FILE: u64 = 1 << 20;
+
+/// What the files read ahead may hold at once, all together.
+const READ_AHEAD_TOTAL: u64 = 64 << 20;
+
+/// The container's writable layer on the source (#410): the files it wrote
+/// outside its volumes, its changes to the image's files and what it
+/// deleted of them, as `docker diff` lists them, become the writable layer
+/// of the container just made as `name` in Kiri, before it first runs.
+/// Nothing is made on the source: each path is read with `docker cp`, only
+/// what changed, never the image's unchanged files, and nothing at or under
+/// the container's mounts (volumes are copied as volumes, binds stay where
+/// they are). A container that changed nothing costs one `docker diff`.
+fn writable_layer(ctx: &str, info: &Value, name: &str) -> io::Result<()> {
+    let id = info["Id"].as_str().filter(|id| !id.is_empty()).ok_or_else(|| io::Error::other("the source gave no container id"))?;
+    let out = cli()?.args(["--context", ctx, "container", "diff", id]).stdin(Stdio::null()).stderr(Stdio::piped()).output()?;
+    if !out.status.success() {
+        return Err(io::Error::other(format!("{ctx}: docker diff: {}", String::from_utf8_lossy(&out.stderr).trim())));
+    }
+    let plan = plan_layer(&parse_diff(&String::from_utf8_lossy(&out.stdout)), &mount_points(info));
+    if plan.is_empty() {
+        return Ok(());
+    }
+    let r = client::post_stream(&format!("/kiri/containers/{name}/upper"), "application/x-tar", |w| write_layer(ctx, id, &plan, w))?;
+    if !r.ok() {
+        return Err(io::Error::other(create_error(r.status, &r.error())));
+    }
+    Ok(())
+}
+
+/// `docker diff`'s lines as (kind, path): `A` added, `C` changed, `D`
+/// deleted. A line that is none of these, or names a path that is not
+/// absolute and plain (no `.`, `..` or empty steps), is left out.
+fn parse_diff(text: &str) -> Vec<(char, String)> {
+    text.lines()
+        .filter_map(|l| {
+            let (kind, path) = l.strip_suffix('\r').unwrap_or(l).split_once(' ')?;
+            let kind = match kind {
+                "A" => 'A',
+                "C" => 'C',
+                "D" => 'D',
+                _ => return None,
+            };
+            let plain = path.len() > 1 && path.starts_with('/') && path[1..].split('/').all(|c| !matches!(c, "" | "." | ".."));
+            plain.then(|| (kind, path.to_owned()))
+        })
+        .collect()
+}
+
+/// Where the container has something mounted on the source: volumes, binds
+/// and tmpfs, as absolute paths without a trailing `/`.
+fn mount_points(info: &Value) -> Vec<String> {
+    let hc = &info["HostConfig"];
+    let mut found: Vec<&str> = info["Mounts"].as_array().into_iter().flatten().filter_map(|m| m["Destination"].as_str()).collect();
+    found.extend(hc["Mounts"].as_array().into_iter().flatten().filter_map(|m| m["Target"].as_str()));
+    found.extend(hc["Tmpfs"].as_object().into_iter().flatten().map(|(k, _)| k.as_str()));
+    let mut points: Vec<String> = Vec::new();
+    for p in found {
+        let clean = format!("/{}", p.split('/').filter(|c| !c.is_empty() && *c != ".").collect::<Vec<_>>().join("/"));
+        if clean != "/" && !points.contains(&clean) {
+            points.push(clean);
+        }
+    }
+    points
+}
+
+/// Whether `path` is `top` or under it.
+fn at_or_under(path: &str, top: &str) -> bool {
+    path == top || below(path, top)
+}
+
+/// Whether `path` is under `top` (not `top` itself).
+fn below(path: &str, top: &str) -> bool {
+    path.strip_prefix(top).is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Paths in the order a layer lists them: each directory right before
+/// what is under it.
+fn path_order(a: &str, b: &str) -> std::cmp::Ordering {
+    a.split('/').cmp(b.split('/'))
+}
+
+/// What of a container's writable layer is carried over, from what `docker
+/// diff` lists. `docker diff` names every path the layer holds (an added
+/// directory's contents too) and the directories they are in, so each is
+/// read on its own; only a new directory with nothing mounted under it is
+/// read whole, in one go.
+#[derive(Debug, Default, PartialEq)]
+struct LayerPlan {
+    /// Deleted on the source: a whiteout each, unless the path is there
+    /// again (a directory deleted and made again, which turns opaque).
+    deleted: Vec<String>,
+    /// Carried over by their own entry: a file whole, a directory with its
+    /// mode, owner and time and none of what is in it, which is listed (or
+    /// unchanged in the image) on its own. `/etc` changed because a file was
+    /// added to it brings that file and `/etc`'s own entry, not all of `/etc`.
+    entries: Vec<String>,
+    /// New directories, not in the image, carried over whole.
+    trees: Vec<String>,
+}
+
+impl LayerPlan {
+    fn is_empty(&self) -> bool {
+        self.deleted.is_empty() && self.entries.is_empty() && self.trees.is_empty()
+    }
+}
+
+/// The plan for `changes` (`docker diff`'s lines) of a container with
+/// `mounts`: nothing at or under a mount, the engine's own files or the
+/// kernel's filesystems; a directory listed only for those is left out;
+/// every directory a path is in comes too, so the layer keeps its mode
+/// and owner.
+fn plan_layer(changes: &[(char, String)], mounts: &[String]) -> LayerPlan {
+    let left_out = |p: &str| ENGINE_FILES.contains(&p) || KERNEL_TREES.iter().copied().chain(mounts.iter().map(String::as_str)).any(|t| at_or_under(p, t));
+    let mut sorted: Vec<&(char, String)> = changes.iter().collect();
+    sorted.sort_by(|a, b| path_order(&a.1, &b.1));
+    sorted.dedup_by(|a, b| a.1 == b.1);
+    let mut plan = LayerPlan::default();
+    let mut i = 0;
+    while i < sorted.len() {
+        let (kind, path) = (sorted[i].0, sorted[i].1.as_str());
+        let end = sorted[i + 1..].iter().position(|(_, p)| !below(p, path)).map_or(sorted.len(), |n| i + 1 + n);
+        let inside = &sorted[i + 1..end];
+        i += 1;
+        if left_out(path) {
+            continue;
+        }
+        match kind {
+            'D' => plan.deleted.push(path.to_owned()),
+            'A' if !inside.is_empty() && inside.iter().all(|(k, p)| *k == 'A' && !left_out(p)) => {
+                plan.trees.push(path.to_owned());
+                i = end;
+            }
+            'C' if !inside.is_empty() && inside.iter().all(|(_, p)| left_out(p)) => {}
+            _ => plan.entries.push(path.to_owned()),
+        }
+    }
+    let mut have: std::collections::HashSet<String> = plan.deleted.iter().chain(&plan.entries).chain(&plan.trees).cloned().collect();
+    let mut parents = Vec::new();
+    for p in plan.deleted.iter().chain(&plan.entries).chain(&plan.trees) {
+        let mut at = p.as_str();
+        while let Some((parent, _)) = at.rsplit_once('/').filter(|(parent, _)| !parent.is_empty()) {
+            if have.insert(parent.to_owned()) {
+                parents.push(parent.to_owned());
+            }
+            at = parent;
+        }
+    }
+    plan.entries.extend(parents);
+    plan.entries.sort_by(|a, b| path_order(a, b));
+    plan
+}
+
+/// One path the layer brings, read on its own ahead of its turn.
+enum Read1 {
+    /// Not there (gone since `docker diff`), or nothing a tar can hold (a socket).
+    Missing,
+    /// A directory's own entry.
+    Dir(Vec<u8>),
+    /// Anything else, whole.
+    Whole(Vec<u8>),
+    /// A file too big to read ahead: read when its turn comes.
+    Later,
+}
+
+/// Writes the layer `plan` names as an OCI layer tar (whiteouts as `.wh.`
+/// files, opaque directories with `.wh..wh..opq`), each path read from the
+/// source container `id` with `docker cp`. What the writer refuses keeps
+/// its error kind: `client::post_stream` then reads the daemon's reason.
+fn write_layer(ctx: &str, id: &str, plan: &LayerPlan, out: &mut dyn Write) -> io::Result<()> {
+    let ahead: Vec<&str> = plan.entries.iter().chain(&plan.deleted).map(String::as_str).collect();
+    let mut read = read_ahead(ctx, id, &ahead)?.into_iter();
+    let mut got: std::collections::HashMap<&str, Read1> = ahead.iter().map(|p| (*p, read.next().unwrap_or(Read1::Later))).collect();
+    let mut steps: Vec<(&str, u8)> = plan.entries.iter().map(|p| (p.as_str(), b'e')).collect();
+    steps.extend(plan.deleted.iter().map(|p| (p.as_str(), b'd')));
+    steps.extend(plan.trees.iter().map(|p| (p.as_str(), b't')));
+    steps.sort_by(|a, b| path_order(a.0, b.0));
+    for (path, step) in steps {
+        if step == b't' {
+            read_paths(ctx, id, path, out, true)?;
+            continue;
+        }
+        match (got.remove(path).unwrap_or(Read1::Later), step) {
+            (Read1::Missing, b'd') => write_marker(out, &whiteout_name(path))?,
+            (Read1::Missing, _) => {}
+            // Deleted, and a directory there again: what the image had in it is gone.
+            (Read1::Dir(bytes), b'd') => {
+                out.write_all(&bytes)?;
+                write_marker(out, &format!("{}/.wh..wh..opq", &path[1..]))?;
+            }
+            (Read1::Dir(bytes) | Read1::Whole(bytes), _) => out.write_all(&bytes)?,
+            (Read1::Later, _) => read_paths(ctx, id, path, out, false)?,
+        }
+    }
+    out.write_all(&[0u8; 1024])
+}
+
+/// The name of the whiteout that deletes `path`: `.wh.` and its name, in
+/// its directory.
+fn whiteout_name(path: &str) -> String {
+    let (dir, base) = path.rsplit_once('/').unwrap_or(("", path));
+    format!("{}.wh.{base}", if dir.is_empty() { String::new() } else { format!("{}/", &dir[1..]) })
+}
+
+/// Reads `paths` from the source container, [`READERS`] at a time: each
+/// one's entry, in the order given, ready to write.
+fn read_ahead(ctx: &str, id: &str, paths: &[&str]) -> io::Result<Vec<Read1>> {
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    let next = AtomicUsize::new(0);
+    let held = AtomicU64::new(0);
+    let failed = AtomicBool::new(false);
+    let slots: Vec<std::sync::Mutex<Option<io::Result<Read1>>>> = paths.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    std::thread::scope(|s| {
+        for _ in 0..READERS.min(paths.len()) {
+            s.spawn(|| {
+                while !failed.load(Ordering::Relaxed) {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(path) = paths.get(i) else { break };
+                    let r = read_one(ctx, id, path, &held);
+                    failed.fetch_or(r.is_err(), Ordering::Relaxed);
+                    *slots[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+                }
+            });
+        }
+    });
+    slots.into_iter().map(|s| s.into_inner().unwrap_or_else(|e| e.into_inner()).unwrap_or(Ok(Read1::Later))).collect()
+}
+
+/// One path's own entry, read ahead: a directory's without what is in it,
+/// a small file's whole; a big one is left for later, so what is read
+/// ahead stays under [`READ_AHEAD_TOTAL`] (`held`).
+fn read_one(ctx: &str, id: &str, path: &str, held: &std::sync::atomic::AtomicU64) -> io::Result<Read1> {
+    use std::sync::atomic::Ordering;
+    let mut cp = Cp::start(ctx, id, path)?;
+    let entry = match read_entry(&mut cp.out) {
+        Ok(Some(e)) => e,
+        Ok(None) => return cp.finish().map(|_| Read1::Missing),
+        Err(e) => return cp.failed(e).map(|()| Read1::Missing),
+    };
+    let mut bytes = Vec::new();
+    write_renamed(&mut bytes, &entry, path)?;
+    if entry.header[156] == b'5' {
+        cp.stop();
+        return Ok(Read1::Dir(bytes));
+    }
+    let padded = entry.size.div_ceil(512) * 512;
+    if entry.size > READ_AHEAD_FILE || held.fetch_add(padded, Ordering::Relaxed) + padded > READ_AHEAD_TOTAL {
+        cp.stop();
+        return Ok(Read1::Later);
+    }
+    if let Err(e) = copy_body(&mut cp.out, &mut bytes, padded) {
+        return cp.failed(e).map(|()| Read1::Missing);
+    }
+    cp.stop();
+    Ok(Read1::Whole(bytes))
+}
+
+/// Writes `path` read from the source container now: its own entry (a
+/// directory's without what is in it), or with `whole` everything under
+/// it. Gone since `docker diff` (a running container), it is left out.
+fn read_paths(ctx: &str, id: &str, path: &str, out: &mut dyn Write, whole: bool) -> io::Result<()> {
+    let mut cp = Cp::start(ctx, id, path)?;
+    loop {
+        let entry = match read_entry(&mut cp.out) {
+            Ok(Some(e)) => e,
+            Ok(None) => return cp.finish().map(|_| ()),
+            Err(e) => return cp.failed(e),
+        };
+        write_renamed(out, &entry, path)?;
+        if !whole && entry.header[156] == b'5' {
+            cp.stop();
+            return Ok(());
+        }
+        let padded = entry.size.div_ceil(512) * 512;
+        let mut body = (&mut cp.out).take(padded);
+        let copied = io::copy(&mut body, out)?;
+        if copied != padded {
+            return cp.failed(io::Error::new(io::ErrorKind::UnexpectedEof, "cut off inside a file's body"));
+        }
+        if !whole {
+            cp.stop();
+            return Ok(());
+        }
+    }
+}
+
+/// `docker cp` of one path out of the source container, as a tar stream.
+struct Cp {
+    child: std::process::Child,
+    out: std::process::ChildStdout,
+    said: Option<std::thread::JoinHandle<String>>,
+    path: String,
+}
+
+impl Cp {
+    fn start(ctx: &str, id: &str, path: &str) -> io::Result<Cp> {
+        let mut child = cli()?.args(["--context", ctx, "cp", &format!("{id}:{path}"), "-"]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+        let out = child.stdout.take().ok_or_else(|| io::Error::other("no output from docker"))?;
+        // Read meanwhile: a full pipe would stop it.
+        let said = child.stderr.take().map(|mut e| {
+            std::thread::spawn(move || {
+                let mut text = String::new();
+                let _ = e.read_to_string(&mut text);
+                text.trim().to_owned()
+            })
+        });
+        Ok(Cp { child, out, said, path: path.to_owned() })
+    }
+
+    /// Stops it: all that was wanted of it is read.
+    fn stop(self) {
+        drop(self);
+    }
+
+    /// Waits for it to end. `Ok(false)` when the path is not there.
+    fn finish(mut self) -> io::Result<bool> {
+        let _ = io::copy(&mut self.out, &mut io::sink());
+        let status = self.child.wait()?;
+        let said = self.said.take().and_then(|t| t.join().ok()).unwrap_or_default();
+        if status.success() {
+            return Ok(true);
+        }
+        if gone(&said) {
+            return Ok(false);
+        }
+        Err(io::Error::other(format!("docker cp {}: {}", self.path, if said.is_empty() { "failed" } else { &said })))
+    }
+
+    /// After reading its output failed with `e`: `Ok` when the path is
+    /// simply not there, else what docker said, or `e`.
+    fn failed(mut self, e: io::Error) -> io::Result<()> {
+        self.end();
+        let said = self.said.take().and_then(|t| t.join().ok()).unwrap_or_default();
+        if gone(&said) {
+            return Ok(());
+        }
+        let why = if said.is_empty() { e.to_string() } else { said };
+        Err(io::Error::new(if e.kind() == io::ErrorKind::BrokenPipe { io::ErrorKind::Other } else { e.kind() }, format!("docker cp {}: {why}", self.path)))
+    }
+}
+
+impl Cp {
+    fn end(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// One stopped early, or left when writing failed, ends with it.
+impl Drop for Cp {
+    fn drop(&mut self) {
+        self.end();
+    }
+}
+
+/// Whether `docker cp` said the path is not there.
+fn gone(said: &str) -> bool {
+    let said = said.to_ascii_lowercase();
+    said.contains("could not find the file") || said.contains("no such container:path")
+}
+
+/// A tar entry as read: its header, its pax records (`path` and
+/// `linkpath` taken out into `name` and `link`), and its body's size.
+struct TarEntry {
+    header: [u8; 512],
+    pax: Vec<(String, String)>,
+    name: String,
+    link: String,
+    size: u64,
+}
+
+/// The next entry's headers in a tar stream, its body still to read;
+/// `None` at the archive's end. Pax and GNU long-name headers are folded
+/// into the entry they come before.
+fn read_entry(r: &mut dyn Read) -> io::Result<Option<TarEntry>> {
+    let bad = |what: &str| io::Error::new(io::ErrorKind::InvalidData, format!("tar stream: {what}"));
+    let text = |b: &[u8]| String::from_utf8_lossy(b.split(|c| *c == 0).next().unwrap_or_default()).into_owned();
+    let mut pax: Vec<(String, String)> = Vec::new();
+    let (mut long_name, mut long_link) = (None, None);
+    loop {
+        let mut h = [0u8; 512];
+        r.read_exact(&mut h).map_err(|e| if e.kind() == io::ErrorKind::UnexpectedEof { bad("cut off before the archive's end") } else { e })?;
+        if h.iter().all(|b| *b == 0) {
+            return Ok(None);
+        }
+        let size = get_number(&h[124..136]).ok_or_else(|| bad("a damaged header"))?;
+        if matches!(h[156], b'x' | b'g' | b'L' | b'K') {
+            if size > 16 << 20 {
+                return Err(bad("a header too large"));
+            }
+            let mut data = vec![0u8; (size.div_ceil(512) * 512) as usize];
+            r.read_exact(&mut data).map_err(|e| if e.kind() == io::ErrorKind::UnexpectedEof { bad("cut off inside a header") } else { e })?;
+            data.truncate(size as usize);
+            match h[156] {
+                b'x' => pax.extend(pax_records(&data)),
+                b'L' => long_name = Some(text(&data)),
+                b'K' => long_link = Some(text(&data)),
+                // A global header says nothing about this entry.
+                _ => {}
+            }
+            continue;
+        }
+        let posix = &h[257..263] == b"ustar\0";
+        let mut name = long_name.unwrap_or_else(|| match text(&h[345..500]) {
+            prefix if posix && !prefix.is_empty() => format!("{prefix}/{}", text(&h[..100])),
+            _ => text(&h[..100]),
+        });
+        let mut link = long_link.unwrap_or_else(|| text(&h[157..257]));
+        let mut size = size;
+        pax.retain(|(k, v)| match k.as_str() {
+            "path" => {
+                name.clone_from(v);
+                false
+            }
+            "linkpath" => {
+                link.clone_from(v);
+                false
+            }
+            "size" => {
+                size = v.parse().unwrap_or(size);
+                true
+            }
+            _ => true,
+        });
+        return Ok(Some(TarEntry { header: h, pax, name, link, size }));
+    }
+}
+
+/// Writes `e`, which `docker cp` of `path` named from `path`'s last step
+/// (`hosts2` for `/etc/hosts2`), under its path in the layer instead
+/// (`etc/hosts2`); a hard link's target likewise. Anything else under
+/// that name is not what was asked for.
+fn write_renamed(out: &mut dyn Write, e: &TarEntry, path: &str) -> io::Result<()> {
+    let base = path.rsplit('/').next().unwrap_or_default();
+    let rebase = |name: &str| -> Option<String> {
+        let rest = name.trim_start_matches("./").trim_start_matches('/').strip_prefix(base)?;
+        (rest.is_empty() || rest.starts_with('/')).then(|| format!("{}{rest}", &path[1..]))
+    };
+    let name = rebase(&e.name).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("docker cp {path}: an entry named {:?}", e.name)))?;
+    let link = if e.header[156] == b'1' { rebase(&e.link).unwrap_or_else(|| e.link.clone()) } else { e.link.clone() };
+    write_entry(out, e, &name, &link)
+}
+
+/// Writes `e`'s headers as `name` (and `link`): in the header where they
+/// fit, else in a pax header before it, which also keeps the records it
+/// came with, less overlayfs's own attributes. Size, owner and group a pax
+/// record gives go in the header too, as [`retar`] puts them.
+fn write_entry(out: &mut dyn Write, e: &TarEntry, name: &str, link: &str) -> io::Result<()> {
+    let mut pax: Vec<(String, String)> = e.pax.iter().filter(|(k, _)| !k.starts_with("SCHILY.xattr.trusted.overlay.")).cloned().collect();
+    if name.len() > 100 {
+        pax.push(("path".into(), name.into()));
+    }
+    if link.len() > 100 {
+        pax.push(("linkpath".into(), link.into()));
+    }
+    let mut h = e.header;
+    put_text(&mut h[..100], name);
+    put_text(&mut h[157..257], link);
+    if &h[257..263] == b"ustar\0" {
+        h[345..500].fill(0);
+    }
+    for (key, at) in [("size", 124..136), ("uid", 108..116), ("gid", 116..124)] {
+        if let Some(v) = pax.iter().find(|(k, _)| k == key).and_then(|(_, v)| v.parse::<u64>().ok()) {
+            put_number(&mut h[at], v);
+        }
+    }
+    put_checksum(&mut h);
+    if !pax.is_empty() {
+        let mut data = Vec::new();
+        for (k, v) in &pax {
+            let rest = k.len() + v.len() + 3;
+            let mut len = rest + 1;
+            while rest + len.to_string().len() != len {
+                len = rest + len.to_string().len();
+            }
+            data.extend_from_slice(format!("{len} {k}={v}\n").as_bytes());
+        }
+        let mut x = plain_header(b'x', "././@PaxHeader", data.len() as u64, 0o644);
+        put_checksum(&mut x);
+        out.write_all(&x)?;
+        data.resize(data.len().div_ceil(512) * 512, 0);
+        out.write_all(&data)?;
+    }
+    out.write_all(&h)
+}
+
+/// An empty file named `name`, owned by root: a whiteout or opaque mark.
+fn write_marker(out: &mut dyn Write, name: &str) -> io::Result<()> {
+    let e = TarEntry { header: plain_header(b'0', "", 0, 0o644), pax: Vec::new(), name: name.to_owned(), link: String::new(), size: 0 };
+    write_entry(out, &e, name, "")
+}
+
+/// A ustar header of kind `kind`, owned by root, with a time of 0.
+fn plain_header(kind: u8, name: &str, size: u64, mode: u32) -> [u8; 512] {
+    let mut h = [0u8; 512];
+    put_text(&mut h[..100], name);
+    put_number(&mut h[100..108], u64::from(mode));
+    put_number(&mut h[108..116], 0);
+    put_number(&mut h[116..124], 0);
+    put_number(&mut h[124..136], size);
+    put_number(&mut h[136..148], 0);
+    h[156] = kind;
+    h[257..263].copy_from_slice(b"ustar\0");
+    h[263..265].copy_from_slice(b"00");
+    h
+}
+
+/// A text field: as much of `s` as fits, the rest NUL.
+fn put_text(field: &mut [u8], s: &str) {
+    field.fill(0);
+    let n = s.len().min(field.len());
+    field[..n].copy_from_slice(&s.as_bytes()[..n]);
+}
+
+fn put_checksum(h: &mut [u8; 512]) {
+    h[148..156].fill(b' ');
+    let sum: u32 = h.iter().map(|b| u32::from(*b)).sum();
+    h[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+}
+
+/// An entry's body, padded to whole blocks, from `from` to `to`.
+fn copy_body(from: &mut dyn Read, to: &mut Vec<u8>, padded: u64) -> io::Result<()> {
+    if (&mut *from).take(padded).read_to_end(to)? as u64 != padded {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "cut off inside a file's body"));
+    }
+    Ok(())
+}
+
+/// Non-empty reason for a failed `/containers/create` call, falling back to
+/// the HTTP status if the daemon returned an empty body (#411).
+fn create_error(status: u16, msg: &str) -> String {
+    let trimmed = msg.trim();
+    if trimmed.is_empty() { format!("HTTP {status}") } else { trimmed.to_owned() }
+}
+
+/// Translates Docker Desktop's VM-internal host-mount paths to host paths Kiri
+/// can bind directly (#411):
+/// - macOS Docker Desktop: `/host_mnt/<path>` -> `/<path>`
+/// - Windows Docker Desktop: `/run/desktop/mnt/host/<drive>/<path>` and
+///   `/host_mnt/<drive>/<path>` -> `<DRIVE>:/<path>`
+///
+/// Bare prefixes (`/host_mnt`, `/host_mnt/`, `/run/desktop/mnt/host/`),
+/// look-alike prefixes (`/host_mnt_other/...`), and paths containing `..`
+/// segments stay unchanged so normalization never collapses to `/` or
+/// traverses outside the intended path.
+fn translate_bind_source_for(src: &str, windows: bool) -> String {
+    let has_dotdot = |p: &str| p.split('/').any(|s| s == "..");
+    let drive_path = |rest: &str| -> Option<String> {
+        let trimmed = rest.trim_start_matches('/');
+        if trimmed.is_empty() || has_dotdot(trimmed) {
+            return None;
+        }
+        let (drive, tail) = trimmed.split_once('/').unwrap_or((trimmed, ""));
+        if drive.len() != 1 || !drive.as_bytes()[0].is_ascii_alphabetic() {
+            return None;
+        }
+        let tail = tail.trim_start_matches('/');
+        if tail.is_empty() { Some(format!("{}:/", drive.to_ascii_uppercase())) } else { Some(format!("{}:/{tail}", drive.to_ascii_uppercase())) }
+    };
+    if windows {
+        if let Some(rest) = src.strip_prefix("/run/desktop/mnt/host/") {
+            return drive_path(rest).unwrap_or_else(|| src.to_owned());
+        }
+        if let Some(rest) = src.strip_prefix("/host_mnt/") {
+            return drive_path(rest).unwrap_or_else(|| src.to_owned());
+        }
+        return src.to_owned();
+    }
+    if let Some(rest) = src.strip_prefix("/host_mnt/") {
+        let trimmed = rest.trim_start_matches('/');
+        if !has_dotdot(trimmed) && trimmed.split('/').any(|s| !s.is_empty() && s != ".") {
+            return format!("/{trimmed}");
+        }
+    }
+    src.to_owned()
+}
+
+/// Translates the source side of a `HostConfig.Binds` entry (`SRC:DST[:OPTS]`),
+/// preserving the destination and any mount options (`:ro`, `:delegated`, etc.).
+fn translate_bind_spec_for(spec: &str, windows: bool) -> String {
+    let Some((src, rest)) = spec.split_once(':') else {
+        return spec.to_owned();
+    };
+    if !rest.starts_with('/') {
+        return spec.to_owned();
+    }
+    let translated = translate_bind_source_for(src, windows);
+    if translated == src { spec.to_owned() } else { format!("{translated}:{rest}") }
 }
 
 /// The volumes a container has on the source, named and anonymous.
@@ -723,6 +1504,10 @@ fn volumes_of(info: &Value) -> Vec<String> {
 /// new empty ones. Beside `container:` mode, what Docker and Kiri refuse
 /// there is left out: the source fills some of it in itself (#375).
 fn create_body(info: &Value, mode: &str, networks: Value) -> Value {
+    create_body_for(info, mode, networks, cfg!(windows))
+}
+
+fn create_body_for(info: &Value, mode: &str, networks: Value, windows: bool) -> Value {
     let (cfg, hc) = (&info["Config"], &info["HostConfig"]);
     let anon: Vec<(&str, &str, bool)> = info["Mounts"]
         .as_array()
@@ -732,12 +1517,29 @@ fn create_body(info: &Value, mode: &str, networks: Value) -> Value {
         .filter_map(|m| Some((m["Name"].as_str().filter(|n| anonymous(n))?, m["Destination"].as_str()?, m["RW"] != false)))
         .collect();
     let mut mounts = hc["Mounts"].clone();
-    for m in mounts.as_array_mut().into_iter().flatten().filter(|m| m["Type"] == "volume" && m["Source"].as_str().unwrap_or("").is_empty()) {
-        if let Some((n, _, _)) = anon.iter().find(|(_, d, _)| m["Target"].as_str() == Some(d)) {
-            m["Source"] = (*n).into();
+    for m in mounts.as_array_mut().into_iter().flatten() {
+        if m["Type"] == "volume" && m["Source"].as_str().unwrap_or("").is_empty() {
+            if let Some((n, _, _)) = anon.iter().find(|(_, d, _)| m["Target"].as_str() == Some(d)) {
+                m["Source"] = (*n).into();
+            }
+        } else if m["Type"].as_str().unwrap_or("bind") == "bind"
+            && let Some(src) = m["Source"].as_str()
+        {
+            let translated = translate_bind_source_for(src, windows);
+            if translated != src {
+                m["Source"] = translated.into();
+            }
         }
     }
     let mut binds = hc["Binds"].clone();
+    for b in binds.as_array_mut().into_iter().flatten() {
+        if let Some(spec) = b.as_str() {
+            let translated = translate_bind_spec_for(spec, windows);
+            if translated != spec {
+                *b = translated.into();
+            }
+        }
+    }
     for (n, d, rw) in &anon {
         if !mounts.as_array().into_iter().flatten().any(|m| m["Target"].as_str() == Some(d)) {
             let bind = format!("{n}:{d}{}", if *rw { "" } else { ":ro" });
@@ -879,12 +1681,14 @@ pub fn run(args: &[String]) -> io::Result<()> {
         }
         return Ok(());
     }
-    let mut failed = 0;
-    let mut step = |what: &str, name: &str, r: io::Result<()>| match r {
+    let mut failures: Vec<(&str, String, String)> = Vec::new();
+    let mut step = |what: &'static str, name: &str, r: io::Result<()>| match r {
         Ok(()) => println!("{what} {name}: done"),
         Err(e) => {
-            failed += 1;
-            println!("{what} {name}: {e}");
+            let reason = e.to_string();
+            let why = if reason.trim().is_empty() { "unknown error" } else { reason.trim() };
+            println!("{what} {name}: skipped ({why})");
+            failures.push((what, name.to_owned(), why.to_owned()));
         }
     };
     for v in list("images").iter().filter(|v| v["have"] != true) {
@@ -895,14 +1699,41 @@ pub fn run(args: &[String]) -> io::Result<()> {
         let n = v["name"].as_str().unwrap_or("");
         step("volume", n, volume_with(source, n, force));
     }
-    for v in list("containers").iter().filter(|v| v["have"] != true) {
+    for v in list("containers") {
         let n = v["name"].as_str().unwrap_or("");
-        // Already brought as the one another joins the network of.
-        if !has(crate::flavor::CONTEXT.get(), "container", n) {
-            step("container", n, container_with(source, n, force, &[]));
+        let already_had = v["have"] == true;
+        let already_imported = !already_had && has(crate::flavor::CONTEXT.get(), "container", n);
+        if let Some(why) = container_skip_reason(already_had, already_imported) {
+            println!("container {n}: skipped ({why})");
+            continue;
         }
+        step("container", n, container_with(source, n, force, &[]));
     }
-    if failed > 0 { Err(io::Error::other(format!("{failed} items could not be imported"))) } else { Ok(()) }
+    if !failures.is_empty() { Err(io::Error::other(format_failures(&failures))) } else { Ok(()) }
+}
+
+/// Why a container in `kiri import` is skipped without calling `container_with` (#411).
+fn container_skip_reason(already_had: bool, already_imported: bool) -> Option<&'static str> {
+    if already_had {
+        Some("already in Kiri")
+    } else if already_imported {
+        Some("already imported as a network target")
+    } else {
+        None
+    }
+}
+
+/// Summary returned when one or more items could not be imported, naming each
+/// item and its reason so nothing is skipped silently (#411).
+fn format_failures(failures: &[(&str, String, String)]) -> String {
+    let n = failures.len();
+    let items = if n == 1 { "item" } else { "items" };
+    let mut out = format!("{n} {items} could not be imported:");
+    for (kind, name, reason) in failures {
+        let why = if reason.trim().is_empty() { "unknown error" } else { reason.trim() };
+        out.push_str(&format!("\n  {kind} {name}: {why}"));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -911,6 +1742,132 @@ mod tests {
     fn anonymous_volumes() {
         assert!(super::anonymous(&"a1".repeat(32)));
         assert!(!super::anonymous("pgdata"));
+    }
+
+    /// #410: what of a container's writable layer `kiri import` reads. `/etc`
+    /// changed because a file was added to it brings that file and `/etc`'s
+    /// own entry, never the rest of `/etc`; a new directory comes whole in
+    /// one read, unless something is mounted under it; nothing at or under a
+    /// mount, the engine's own files or the kernel's filesystems; every
+    /// directory a path is in comes too.
+    #[test]
+    fn plans_only_what_the_writable_layer_changed() {
+        let diff = "C /etc\nA /etc/hosts2\nC /etc/hosts\nA /app\nA /app/x\nA /app/sub\nA /app/sub/y\nA /srv\nA /srv/cache\nA /srv/keep\nA /data\n\
+                    C /usr\nC /usr/share\nD /usr/share/doc\nC /opt\nD /opt/again\nA /opt/again/new\nA /var/lib/x\nC /proc\nA /dev/shm/x\n\
+                    C /run\nA /run/tmp\nA /.dockerenv\n";
+        let mounts = ["/data".to_owned(), "/srv/cache".to_owned(), "/run/tmp".to_owned()];
+        let plan = super::plan_layer(&super::parse_diff(diff), &mounts);
+        let v = |s: &[&str]| s.iter().map(|p| (*p).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            plan,
+            super::LayerPlan {
+                deleted: v(&["/opt/again", "/usr/share/doc"]),
+                entries: v(&["/etc", "/etc/hosts2", "/opt", "/opt/again/new", "/srv", "/srv/keep", "/usr", "/usr/share", "/var", "/var/lib", "/var/lib/x"]),
+                trees: v(&["/app"]),
+            }
+        );
+        // Nothing changed, or only what each engine makes for itself: one
+        // `docker diff`, and nothing sent.
+        assert!(super::plan_layer(&[], &mounts).is_empty());
+        assert!(super::plan_layer(&super::parse_diff("C /etc\nA /etc/hostname\nC /etc/resolv.conf\nA /data\n"), &mounts).is_empty());
+        // A changed directory alone (its mode, say) is its own entry.
+        assert_eq!(super::plan_layer(&super::parse_diff("C /tmp\n"), &[]).entries, v(&["/tmp"]));
+    }
+
+    #[test]
+    fn reads_docker_diff_lines() {
+        let got = super::parse_diff("C /etc\r\nA /etc/a b\nX /x\nA relative\nA /a/../b\nA /a//b\nA /\nD /gone\n\n");
+        assert_eq!(got, [('C', "/etc".to_owned()), ('A', "/etc/a b".to_owned()), ('D', "/gone".to_owned())]);
+    }
+
+    #[test]
+    fn finds_where_a_container_has_mounts() {
+        let info = serde_json::json!({
+            "Mounts": [{"Type": "volume", "Destination": "/data/"}, {"Type": "bind", "Destination": "/src"}],
+            "HostConfig": {"Mounts": [{"Type": "tmpfs", "Target": "/cache"}, {"Target": "/src"}], "Tmpfs": {"/run/tmp": "size=1m"}},
+        });
+        assert_eq!(super::mount_points(&info), ["/data", "/src", "/cache", "/run/tmp"]);
+    }
+
+    /// `docker cp ctr:/srv/app -` names its entries from `app`: each is
+    /// written under its path in the layer, a hard link's target too, a
+    /// symlink's target as it is; long names go in pax; owners and
+    /// attributes stay, but overlayfs's own; a stream cut short is an error.
+    #[test]
+    fn writes_what_docker_cp_read_under_its_path_in_the_layer() {
+        use std::io::Read;
+        let entry = |kind: u8, name: &str, link: &str, size: u64, pax: &[(&str, &str)]| {
+            let mut header = super::plain_header(kind, "", size, if kind == b'5' { 0o750 } else { 0o640 });
+            super::put_number(&mut header[108..116], 1000);
+            super::put_number(&mut header[116..124], 1001);
+            let pax = pax.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
+            super::TarEntry { header, pax, name: name.to_owned(), link: link.to_owned(), size }
+        };
+        let long = format!("app/{}", "n".repeat(120));
+        let mut src = Vec::new();
+        for (e, body) in [
+            (entry(b'5', "app/", "", 0, &[]), &b""[..]),
+            (entry(b'0', "app/f", "", 5, &[("SCHILY.xattr.trusted.overlay.redirect", "/x"), ("SCHILY.xattr.user.k", "v")]), b"hello"),
+            (entry(b'2', "app/l", "f", 0, &[]), b""),
+            (entry(b'1', "app/h", "app/f", 0, &[]), b""),
+            (entry(b'0', &long, "", 0, &[]), b""),
+        ] {
+            super::write_entry(&mut src, &e, &e.name.clone(), &e.link.clone()).unwrap();
+            src.extend_from_slice(body);
+            src.resize(src.len().div_ceil(512) * 512, 0);
+        }
+        src.extend_from_slice(&[0u8; 1024]);
+
+        let mut out = Vec::new();
+        let mut r = &src[..];
+        while let Some(e) = super::read_entry(&mut r).unwrap() {
+            super::write_renamed(&mut out, &e, "/srv/app").unwrap();
+            let padded = e.size.div_ceil(512) * 512;
+            std::io::copy(&mut (&mut r).take(padded), &mut out).unwrap();
+        }
+        out.extend_from_slice(&[0u8; 1024]);
+
+        let mut r = &out[..];
+        let mut got = Vec::new();
+        for block in out.chunks(512).filter(|b| b.iter().any(|c| *c != 0) && (b[257..263] == *b"ustar\0")) {
+            let mut h: [u8; 512] = block.try_into().unwrap();
+            let sum = h[148..156].to_vec();
+            super::put_checksum(&mut h);
+            assert_eq!(sum, h[148..156], "a valid checksum");
+        }
+        while let Some(e) = super::read_entry(&mut r).unwrap() {
+            let mut body = vec![0u8; (e.size.div_ceil(512) * 512) as usize];
+            r.read_exact(&mut body).unwrap();
+            body.truncate(e.size as usize);
+            let owner = (super::get_number(&e.header[108..116]), super::get_number(&e.header[116..124]));
+            got.push((e.name.clone(), e.link.clone(), e.pax.clone(), String::from_utf8(body).unwrap(), owner));
+        }
+        let none: Vec<(String, String)> = Vec::new();
+        let owner = (Some(1000), Some(1001));
+        assert_eq!(got[0], ("srv/app/".to_owned(), String::new(), none.clone(), String::new(), owner));
+        assert_eq!(got[1], ("srv/app/f".to_owned(), String::new(), vec![("SCHILY.xattr.user.k".to_owned(), "v".to_owned())], "hello".to_owned(), owner));
+        assert_eq!(got[2], ("srv/app/l".to_owned(), "f".to_owned(), none.clone(), String::new(), owner));
+        assert_eq!(got[3], ("srv/app/h".to_owned(), "srv/app/f".to_owned(), none.clone(), String::new(), owner));
+        assert_eq!(got[4].0, format!("srv/{long}"));
+        assert_eq!(got.len(), 5);
+
+        // Only what was asked for: an entry by another name is an error.
+        let mut sink = Vec::new();
+        assert!(super::write_renamed(&mut sink, &entry(b'0', "apples", "", 0, &[]), "/srv/app").is_err());
+        assert!(super::write_renamed(&mut sink, &entry(b'0', "app", "", 0, &[]), "/srv/app").is_ok());
+        // Cut short, inside a header or before the archive's end.
+        assert!(super::read_entry(&mut &src[..300]).is_err());
+        assert!(super::read_entry(&mut &src[..0]).is_err());
+    }
+
+    #[test]
+    fn names_whiteouts_beside_what_they_delete() {
+        assert_eq!(super::whiteout_name("/etc/gone"), "etc/.wh.gone");
+        assert_eq!(super::whiteout_name("/gone"), ".wh.gone");
+        let mut out = Vec::new();
+        super::write_marker(&mut out, &format!("d/{}/.wh..wh..opq", "x".repeat(100))).unwrap();
+        let e = super::read_entry(&mut &out[..]).unwrap().unwrap();
+        assert_eq!((e.name, e.size, e.header[156]), (format!("d/{}/.wh..wh..opq", "x".repeat(100)), 0, b'0'));
     }
 
     // #266: a fresh machine with neither engine gets a plain answer, not
@@ -974,12 +1931,14 @@ mod tests {
         assert_eq!(parse(&["podman"]).unwrap(), (Some("podman"), Ask::Everything, false));
     }
 
-    // Kiri's half of a volume copy runs only an image the engine pulled
-    // from an official repository, as its repo digests show: never one
-    // that only has a name like one, wherever it came from.
+    // Volume helpers run only an image the engine pulled from an official
+    // repository, as its repo digests show: never one that only has a name
+    // like one, wherever it came from (#506). GNU tar helpers (debian, ubuntu)
+    // are preferred over alpine/busybox (#485); alpine/busybox remain a
+    // fallback for inspection or offline use (#376).
     #[test]
     fn only_an_official_image_helps() {
-        use super::{official, pick_helper};
+        use super::{official, pick_gnu_helper, pick_helper};
         use serde_json::json;
         let d = format!("@sha256:{}", "ab12".repeat(16));
         for good in ["busybox", "library/alpine", "docker.io/library/debian", "mirror.gcr.io/library/ubuntu", "public.ecr.aws/docker/library/busybox"] {
@@ -988,8 +1947,10 @@ mod tests {
         let look_alikes = [
             "ghcr.io/x/library/busybox",
             "localhost:5000/library/alpine",
+            "localhost:5000/debian",
             "localhost/x/library/busybox",
             "evil/alpine",
+            "evil/debian",
             "docker.io/evil/alpine",
             "mirror.gcr.io/evil/library/alpine",
             "public.ecr.aws/x/library/alpine",
@@ -1003,26 +1964,160 @@ mod tests {
         for bad in ["busybox", "busybox:1", "busybox@sha256:abc", &format!("busybox@sha512:{}", "a".repeat(64)), &format!("busybox@sha256:{}", "A".repeat(64))] {
             assert!(!official(bad), "{bad}");
         }
-        // Kiri's image list: one record per name, each with its own digests.
+        // Image list: one record per name, each with its own digests.
         let rec = |name: &str, digests: &[String]| json!({"Id": format!("sha256:{}", "c".repeat(64)), "RepoTags": [name], "RepoDigests": digests});
         let records = [
             // Untagged: a load or build without a name.
             rec(&format!("sha256:{}", "c".repeat(64)), &[]),
             rec("localhost/imp-x/library/busybox:9", &[]),
-            // Re-tagged from the official one: no digest of its own.
+            // Re-tagged from an official image: no digest of its own.
             rec("alpine:latest", &[]),
-            // Called busybox, its digest another repository's.
+            rec("debian:trixie", &[]),
+            // Called busybox/debian, its digest another repository's.
             rec("busybox:1", &[format!("evil/tools{d}")]),
+            rec("debian:1", &[format!("evil/debian{d}")]),
             // An official digest under a name of another repository.
             rec("evil/alpine:1", &[format!("alpine{d}")]),
+            rec("evil/debian:1", &[format!("debian{d}")]),
             rec("ghcr.io/x/library/busybox:1", &[format!("ghcr.io/x/library/busybox{d}")]),
             rec("mirror.gcr.io/library/alpine:latest", &[format!("mirror.gcr.io/library/alpine{d}")]),
             rec("busybox:latest", &[format!("busybox{d}")]),
+            // Official GNU tar images: preferred over alpine/busybox.
+            rec("mirror.gcr.io/library/debian:latest", &[format!("mirror.gcr.io/library/debian{d}")]),
+            rec("ubuntu:latest", &[format!("ubuntu{d}")]),
         ];
-        assert_eq!(pick_helper(&records), Some("mirror.gcr.io/library/alpine:latest".into()));
-        assert_eq!(pick_helper(&records[..6]), None);
-        assert_eq!(pick_helper(&records[7..]), Some("busybox:latest".into()));
-        assert_eq!(pick_helper(&[json!({"RepoTags": null, "RepoDigests": [format!("busybox{d}")]})]), None);
+        assert_eq!(pick_helper(&records), Some("mirror.gcr.io/library/debian:latest".into()));
+        assert_eq!(pick_gnu_helper(&records), Some("mirror.gcr.io/library/debian:latest".into()));
+        assert_eq!(pick_helper(&records[..9]), None);
+        assert_eq!(pick_gnu_helper(&records[..11]), None);
+        // Offline fallback: alpine/busybox still work for pick_helper when no GNU tar image is present.
+        assert_eq!(pick_helper(&records[..11]), Some("mirror.gcr.io/library/alpine:latest".into()));
+        assert_eq!(pick_helper(&records[10..11]), Some("busybox:latest".into()));
+        assert_eq!(pick_gnu_helper(&records[12..]), Some("ubuntu:latest".into()));
+        assert_eq!(pick_helper(&[json!({"RepoTags": null, "RepoDigests": [format!("debian{d}")]})]), None);
+    }
+
+    // #485: both ends of a volume copy carry xattrs and numeric owners when
+    // using GNU tar helpers, pass `--entrypoint tar` on the source, and fall
+    // back to plain `tar -xpf -` when an offline helper is alpine/busybox.
+    #[test]
+    fn volume_copy_keeps_xattrs() {
+        assert!(super::gnu_tar("debian:trixie"));
+        assert!(super::gnu_tar("debian"));
+        assert!(super::gnu_tar("mirror.gcr.io/library/ubuntu:24.04"));
+        assert!(super::gnu_tar("public.ecr.aws/docker/library/debian:trixie"));
+        assert!(super::gnu_tar("localhost:5000/debian"));
+        assert!(!super::gnu_tar("alpine:latest"));
+        assert!(!super::gnu_tar("busybox:latest"));
+        assert!(!super::gnu_tar("mydebian:latest"));
+        let args = super::volume_reader_args("desktop-linux", "kiri-import-pg", "type=volume,src=pg,dst=/from,readonly,volume-nocopy", "debian:trixie");
+        let ep = args.iter().position(|a| *a == "--entrypoint").expect("missing --entrypoint");
+        assert_eq!(args.get(ep + 1), Some(&"tar"));
+        assert_eq!(args.get(ep + 2), Some(&"debian:trixie"));
+        for flag in super::STORE_XATTRS {
+            assert!(args.contains(&flag), "missing {flag}");
+        }
+        assert!(args.contains(&"--numeric-owner"));
+        assert!(args.contains(&"--network"));
+        assert!(args.contains(&"none"));
+        assert!(args.contains(&"--pull"));
+        assert!(args.contains(&"never"));
+        let gnu_script = super::restore_script(true);
+        assert!(gnu_script.contains("--numeric-owner"), "{gnu_script}");
+        assert!(gnu_script.contains("--xattrs"), "{gnu_script}");
+        assert!(gnu_script.contains("'--xattrs-include=user.*'"), "{gnu_script}");
+        assert!(gnu_script.ends_with(" -xpf -"), "{gnu_script}");
+        let fallback_script = super::restore_script(false);
+        assert!(!fallback_script.contains("--xattrs"), "{fallback_script}");
+        assert!(fallback_script.ends_with("tar -xpf -"), "{fallback_script}");
+    }
+
+    // #485: `retar` passes `SCHILY.xattr.*` pax records through byte-for-byte
+    // (including JSON, empty and binary values) while still propagating high
+    // uid/gid into the ustar header.
+    #[cfg(not(windows))]
+    #[test]
+    fn retar_preserves_xattr_pax_records() {
+        let mut b = tar::Builder::new(Vec::new());
+        let json_meta = br#"{"contentType":"image/png","cacheControl":"max-age=3600"}"#;
+        b.append_pax_extensions([
+            ("SCHILY.xattr.user.test", &b"hello-xattr"[..]),
+            ("SCHILY.xattr.user.metadata", json_meta.as_slice()),
+            ("SCHILY.xattr.user.empty", &b""[..]),
+            ("uid", &b"3000000"[..]),
+            ("gid", &b"3000001"[..]),
+        ])
+        .unwrap();
+        let mut h = tar::Header::new_ustar();
+        h.set_size(5);
+        h.set_mode(0o640);
+        h.set_uid(0);
+        h.set_gid(0);
+        h.set_cksum();
+        b.append_data(&mut h, "obj", &b"hello"[..]).unwrap();
+        // Second entry with a binary xattr value containing NUL, high bytes
+        // and a newline followed by `size=99` (must not spoof the entry size).
+        let bin_val = b"\x00\xff\nsize=99";
+        b.append_pax_extensions([("SCHILY.xattr.user.bin", bin_val.as_slice()), ("uid", &b"1234"[..])]).unwrap();
+        let mut h2 = tar::Header::new_ustar();
+        h2.set_size(2);
+        h2.set_mode(0o600);
+        h2.set_cksum();
+        b.append_data(&mut h2, "bin", &b"ok"[..]).unwrap();
+        let input = b.into_inner().unwrap();
+        let mut out = Vec::new();
+        super::retar(input.as_slice(), &mut out, None).unwrap();
+        assert_eq!(out.len(), input.len());
+        // The pax blocks pass through byte-for-byte unchanged, including binary values.
+        assert_eq!(out[..1024], input[..1024]);
+        assert!(out.windows(bin_val.len()).any(|w| w == bin_val));
+        let mut ar = tar::Archive::new(out.as_slice());
+        let mut e = ar.entries().unwrap().next().unwrap().unwrap();
+        assert_eq!(e.header().uid().unwrap(), 3_000_000);
+        assert_eq!(e.header().gid().unwrap(), 3_000_001);
+        let exts: Vec<(String, Vec<u8>)> = e
+            .pax_extensions()
+            .unwrap()
+            .unwrap()
+            .map(|r| {
+                let r = r.unwrap();
+                (r.key().unwrap().to_owned(), r.value_bytes().to_vec())
+            })
+            .collect();
+        assert!(exts.contains(&("SCHILY.xattr.user.test".into(), b"hello-xattr".to_vec())), "{exts:?}");
+        assert!(exts.contains(&("SCHILY.xattr.user.metadata".into(), json_meta.to_vec())), "{exts:?}");
+        assert!(exts.contains(&("SCHILY.xattr.user.empty".into(), Vec::new())), "{exts:?}");
+    }
+
+    // Source tar failures fail the import rather than silently importing a
+    // partial volume; only `--force` (`allow_file_changed`) tolerates GNU tar
+    // exit code 1 after a complete, valid archive.
+    #[cfg(not(windows))]
+    #[test]
+    fn pipe_propagates_reader_and_writer_errors() {
+        use std::process::Command;
+        let sh = |script: &str| {
+            let mut c = Command::new("sh");
+            c.args(["-c", script]);
+            c
+        };
+        let empty_tar = "dd if=/dev/zero bs=1024 count=1 2>/dev/null";
+        let sink = "cat >/dev/null";
+        // Clean stream, both exit 0: ok.
+        super::pipe_with(sh(empty_tar), sh(sink), "orbstack", false, |r, w| super::retar(r, w, None)).unwrap();
+        // Source exits 1 without allow_file_changed: error.
+        let err = super::pipe_with(sh(&format!("{empty_tar}; echo changed >&2; exit 1")), sh(sink), "orbstack", false, |r, w| super::retar(r, w, None)).unwrap_err();
+        assert!(err.to_string().contains("changed"), "{err}");
+        // Source exits 1 WITH allow_file_changed and complete tar: ok.
+        super::pipe_with(sh(&format!("{empty_tar}; echo changed >&2; exit 1")), sh(sink), "orbstack", true, |r, w| super::retar(r, w, None)).unwrap();
+        // Source exits 1 WITH allow_file_changed but truncated/empty output: error.
+        assert!(super::pipe_with(sh("echo boom >&2; exit 1"), sh(sink), "orbstack", true, |r, w| super::retar(r, w, None)).is_err());
+        // Source exits 2 (fatal tar error) even WITH allow_file_changed: error.
+        let err = super::pipe_with(sh(&format!("{empty_tar}; echo fatal >&2; exit 2")), sh(sink), "orbstack", true, |r, w| super::retar(r, w, None)).unwrap_err();
+        assert!(err.to_string().contains("fatal"), "{err}");
+        // Writer exits non-zero: error.
+        let err = super::pipe_with(sh(empty_tar), sh("cat >/dev/null; echo diskfull >&2; exit 1"), "orbstack", false, |r, w| super::retar(r, w, None)).unwrap_err();
+        assert!(err.to_string().contains("diskfull"), "{err}");
     }
 
     // #377: an image only pinned by digest is listed by that reference.
@@ -1313,6 +2408,177 @@ mod tests {
             seen.push((e.path().unwrap().to_string_lossy().into_owned(), e.header().uid().unwrap(), data));
         }
         assert_eq!(seen, [("odd size=5 name".to_owned(), 3_000_000, body), ("next".to_owned(), 0, b"abc".to_vec())]);
+    }
+
+    // #411: Docker Desktop's `/host_mnt/<path>` bind-mount sources map to
+    // `/<path>` on macOS in both HostConfig.Binds (keeping mount options) and
+    // HostConfig.Mounts, while non-/host_mnt binds and edge cases stay intact.
+    #[test]
+    fn translates_docker_desktop_host_mnt_binds() {
+        use serde_json::json;
+        let info = json!({
+            "Config": {"Image": "postgres:16"},
+            "HostConfig": {
+                "Binds": [
+                    "/host_mnt/Users/alice/project/docker/volumes/db/data:/var/lib/postgresql/data",
+                    "/Users/alice/project/docker/volumes/db/pooler.sql:/docker-entrypoint-initdb.d/99-pooler.sql:ro",
+                    "/host_mnt/Users/alice/app:/app:delegated",
+                    "/host_mnt/private/tmp/x:/tmp/x:rw,cached",
+                    "/host_mnt/Users/alice/cfg:/cfg:ro",
+                    "/host_mnt/Users/alice/rw:/rw:rw",
+                    "/host_mnt/Users/alice/selinux:/selinux:z",
+                    "/host_mnt/Users/alice/selinux2:/selinux2:Z",
+                    "/host_mnt/Users/alice/dir..name/file:/file",
+                    "/host_mnt//Users/alice/double:/double",
+                    "/host_mnt:/bare",
+                    "/host_mnt/:/bare-slash",
+                    "/host_mnt///:/bare-slashes",
+                    "/host_mnt/.:/bare-dot",
+                    "/host_mnt/..:/dotdot",
+                    "/host_mnt/../etc:/escape",
+                    "/host_mnt/Users/../etc:/mid-dotdot",
+                    "/host_mnt_other/Users/alice:/other",
+                    "pgdata:/pgdata"
+                ],
+                "Mounts": [
+                    {"Type": "bind", "Source": "/host_mnt/Users/alice/data", "Target": "/data", "ReadOnly": true},
+                    {"Type": "bind", "Source": "/Users/alice/plain", "Target": "/plain"},
+                    {"Type": "bind", "Source": "/host_mnt", "Target": "/m-bare"},
+                    {"Type": "bind", "Source": "/host_mnt/", "Target": "/m-slash"},
+                    {"Type": "bind", "Source": "/host_mnt/.", "Target": "/m-dot"},
+                    {"Type": "bind", "Source": "/host_mnt/..", "Target": "/m-dotdot"},
+                    {"Type": "bind", "Source": "/host_mnt_other/x", "Target": "/m-other"},
+                    {"Type": "volume", "Source": "pgvol", "Target": "/vol"}
+                ]
+            },
+            "Mounts": []
+        });
+        let body = super::create_body_for(&info, "bridge", json!({}), false);
+        assert_eq!(
+            body["HostConfig"]["Binds"],
+            json!([
+                "/Users/alice/project/docker/volumes/db/data:/var/lib/postgresql/data",
+                "/Users/alice/project/docker/volumes/db/pooler.sql:/docker-entrypoint-initdb.d/99-pooler.sql:ro",
+                "/Users/alice/app:/app:delegated",
+                "/private/tmp/x:/tmp/x:rw,cached",
+                "/Users/alice/cfg:/cfg:ro",
+                "/Users/alice/rw:/rw:rw",
+                "/Users/alice/selinux:/selinux:z",
+                "/Users/alice/selinux2:/selinux2:Z",
+                "/Users/alice/dir..name/file:/file",
+                "/Users/alice/double:/double",
+                "/host_mnt:/bare",
+                "/host_mnt/:/bare-slash",
+                "/host_mnt///:/bare-slashes",
+                "/host_mnt/.:/bare-dot",
+                "/host_mnt/..:/dotdot",
+                "/host_mnt/../etc:/escape",
+                "/host_mnt/Users/../etc:/mid-dotdot",
+                "/host_mnt_other/Users/alice:/other",
+                "pgdata:/pgdata"
+            ])
+        );
+        assert_eq!(
+            body["HostConfig"]["Mounts"],
+            json!([
+                {"Type": "bind", "Source": "/Users/alice/data", "Target": "/data", "ReadOnly": true},
+                {"Type": "bind", "Source": "/Users/alice/plain", "Target": "/plain"},
+                {"Type": "bind", "Source": "/host_mnt", "Target": "/m-bare"},
+                {"Type": "bind", "Source": "/host_mnt/", "Target": "/m-slash"},
+                {"Type": "bind", "Source": "/host_mnt/.", "Target": "/m-dot"},
+                {"Type": "bind", "Source": "/host_mnt/..", "Target": "/m-dotdot"},
+                {"Type": "bind", "Source": "/host_mnt_other/x", "Target": "/m-other"},
+                {"Type": "volume", "Source": "pgvol", "Target": "/vol"}
+            ])
+        );
+    }
+
+    // #411: Windows Docker Desktop bind sources under `/run/desktop/mnt/host/<drive>/...`
+    // and `/host_mnt/<drive>/...` translate to `<DRIVE>:/...` so Kiri's WSL bind
+    // parser maps them to the active automount root; `/mnt/wsl/...`, look-alikes,
+    // non-drive prefixes and `..` traversals stay unchanged.
+    #[test]
+    fn translates_windows_docker_desktop_binds() {
+        use serde_json::json;
+        let info = json!({
+            "Config": {"Image": "alpine"},
+            "HostConfig": {
+                "Binds": [
+                    "/run/desktop/mnt/host/c/Users/alice/app:/app:ro",
+                    "/run/desktop/mnt/host/d/work/db:/data:delegated",
+                    "/run/desktop/mnt/host/c:/drive-root",
+                    "/host_mnt/c/Users/alice/legacy:/legacy:rw",
+                    "C:\\Users\\alice\\native:/native",
+                    "/mnt/wsl/shared:/shared",
+                    "/run/desktop/mnt/host:/bare",
+                    "/run/desktop/mnt/host/:/bare-slash",
+                    "/run/desktop/mnt/host/..:/dotdot",
+                    "/run/desktop/mnt/host/c/../d/secret:/escape",
+                    "/run/desktop/mnt/host/wsl/foo:/not-drive",
+                    "/run/desktop/mnt/host_other/c/foo:/lookalike",
+                    "/host_mnt/Users/alice:/non-drive-host-mnt",
+                    "/host_mnt_other/c/foo:/host-mnt-lookalike"
+                ],
+                "Mounts": [
+                    {"Type": "bind", "Source": "/run/desktop/mnt/host/c/Users/alice/cfg", "Target": "/cfg", "ReadOnly": true},
+                    {"Type": "bind", "Source": "/host_mnt/e/files", "Target": "/files"},
+                    {"Type": "bind", "Source": "/run/desktop/mnt/host/c/../x", "Target": "/bad"},
+                    {"Type": "bind", "Source": "/mnt/wsl/shared", "Target": "/shared2"}
+                ]
+            },
+            "Mounts": []
+        });
+        let body = super::create_body_for(&info, "bridge", json!({}), true);
+        assert_eq!(
+            body["HostConfig"]["Binds"],
+            json!([
+                "C:/Users/alice/app:/app:ro",
+                "D:/work/db:/data:delegated",
+                "C:/:/drive-root",
+                "C:/Users/alice/legacy:/legacy:rw",
+                "C:\\Users\\alice\\native:/native",
+                "/mnt/wsl/shared:/shared",
+                "/run/desktop/mnt/host:/bare",
+                "/run/desktop/mnt/host/:/bare-slash",
+                "/run/desktop/mnt/host/..:/dotdot",
+                "/run/desktop/mnt/host/c/../d/secret:/escape",
+                "/run/desktop/mnt/host/wsl/foo:/not-drive",
+                "/run/desktop/mnt/host_other/c/foo:/lookalike",
+                "/host_mnt/Users/alice:/non-drive-host-mnt",
+                "/host_mnt_other/c/foo:/host-mnt-lookalike"
+            ])
+        );
+        assert_eq!(
+            body["HostConfig"]["Mounts"],
+            json!([
+                {"Type": "bind", "Source": "C:/Users/alice/cfg", "Target": "/cfg", "ReadOnly": true},
+                {"Type": "bind", "Source": "E:/files", "Target": "/files"},
+                {"Type": "bind", "Source": "/run/desktop/mnt/host/c/../x", "Target": "/bad"},
+                {"Type": "bind", "Source": "/mnt/wsl/shared", "Target": "/shared2"}
+            ])
+        );
+    }
+
+    // #411: every container not imported has an explicit reason (never dropped
+    // silently or left with a blank error).
+    #[test]
+    fn reports_skip_and_failure_reasons() {
+        assert_eq!(super::container_skip_reason(true, false), Some("already in Kiri"));
+        assert_eq!(super::container_skip_reason(false, true), Some("already imported as a network target"));
+        assert_eq!(super::container_skip_reason(false, false), None);
+        assert_eq!(super::create_error(400, "bind source path does not exist"), "bind source path does not exist");
+        assert_eq!(super::create_error(500, "   "), "HTTP 500");
+        assert_eq!(
+            super::format_failures(&[("container", "db".into(), "bind source path does not exist".into())]),
+            "1 item could not be imported:\n  container db: bind source path does not exist"
+        );
+        assert_eq!(
+            super::format_failures(&[
+                ("container", "db".into(), "missing bind".into()),
+                ("container", "web".into(), "".into()),
+            ]),
+            "2 items could not be imported:\n  container db: missing bind\n  container web: unknown error"
+        );
     }
 
 }

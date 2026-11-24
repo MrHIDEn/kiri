@@ -1148,6 +1148,7 @@ mod tests {
             created: String::new(),
             pulled_at: 0,
             config: kiri_image::RunConfig::default(),
+            mirror: None,
         };
         let linux_spec: super::super::engine::Spec = serde_json::from_value(serde_json::json!({
             "image": linux.name, "image_id": linux.digest, "entrypoint": ["/bin/true"], "cmd": [],

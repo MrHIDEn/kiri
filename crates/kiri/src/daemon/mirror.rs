@@ -4,7 +4,10 @@
 //! A read-only registry API on 127.0.0.1, which containers reach at
 //! host.docker.internal. buildkitd.toml names it as a mirror of every
 //! registry Kiri has images from; a mirror that answers 404 is skipped, so
-//! anything not here comes from the registry itself. Paths carry a secret
+//! anything not here comes from the registry itself. A tag a registry
+//! published is not answered here even when Kiri holds it: the registry,
+//! not this machine, knows which platforms it has (see `lookup`).
+//! Paths carry a secret
 //! (`/v2/<token>/<registry>/<repo>/…`), so other local users can't read
 //! images through it. Manifests are made from the store's records (layers,
 //! config), the same bytes for the same image every time.
@@ -142,25 +145,214 @@ pub fn host_addr(engine: &Engine) -> String {
     mirror_host(&engine.lock_net())
 }
 
-pub fn config(engine: &Engine) -> String {
-    let Some(port) = LISTENING.get().copied().flatten() else { return String::new() };
-    let host = format!("{}:{port}", mirror_host(&engine.lock_net()));
-    let mut registries = vec!["docker.io".to_owned()];
+/// One `[registry."host"]` table of buildkitd.toml. `http` unset leaves
+/// BuildKit's default (plain HTTP for `localhost`, HTTPS for the rest).
+#[derive(Default, Debug, PartialEq)]
+struct Table {
+    mirrors: Vec<String>,
+    http: Option<bool>,
+    insecure: bool,
+}
+
+/// The table for `registry`, made if it isn't there yet: BuildKit refuses a
+/// buildkitd.toml that names one twice, and Kiri's own mirror, daemon.json's
+/// mirrors and its insecure hosts may all cover the same one.
+fn table<'a>(tables: &'a mut Vec<(String, Table)>, registry: &str) -> &'a mut Table {
+    let i = match tables.iter().position(|(r, _)| r == registry) {
+        Some(i) => i,
+        None => {
+            tables.push((registry.to_owned(), Table::default()));
+            tables.len() - 1
+        }
+    };
+    &mut tables[i].1
+}
+
+/// Adds `mirror` to `registry`'s list, in order, once.
+fn add_mirror(tables: &mut Vec<(String, Table)>, registry: &str, mirror: String) {
+    let t = table(tables, registry);
+    if !t.mirrors.contains(&mirror) {
+        t.mirrors.push(mirror);
+    }
+}
+
+/// The registries buildkitd.toml has tables for: Docker Hub, and each one
+/// an image in the store came from (not this machine's), or came from
+/// since the engine started, so removing a registry's last image leaves
+/// builds from it as they were.
+pub fn registry_names(engine: &Engine) -> Vec<String> {
+    let mut names = Vec::new();
     for i in engine.store.images().unwrap_or_default() {
         if let Ok(r) = Reference::parse(&i.name)
-            && !registries.contains(&r.registry)
+            && !names.contains(&r.registry)
             && !kiri_image::reference::is_local(&r.registry)
         {
-            registries.push(r.registry);
+            names.push(r.registry);
         }
     }
-    let token = token();
-    let mut out = String::new();
-    for r in registries {
-        out.push_str(&format!("[registry.\"{r}\"]\n  mirrors = [\"{host}/{token}/{r}\"]\n"));
+    remembered(names)
+}
+
+/// Registries the store's images have named since the engine started: a
+/// few dozen at most, bounded all the same.
+static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+const MAX_SEEN: usize = 256;
+
+/// `now` (the store's registries) with those [`SEEN`] before, Docker Hub
+/// first; `now` is remembered too.
+fn remembered(now: Vec<String>) -> Vec<String> {
+    remembered_in(&mut SEEN.lock().unwrap_or_else(|e| e.into_inner()), now)
+}
+
+/// [`remembered`] with `seen` as the memory. Every registry in `now` is
+/// always in the answer; past [`MAX_SEEN`] the oldest of those no longer
+/// in the store are forgotten. Docker Hub is always there, and takes no
+/// place in the memory.
+fn remembered_in(seen: &mut Vec<String>, now: Vec<String>) -> Vec<String> {
+    for r in &now {
+        if r != "docker.io" && !seen.contains(r) {
+            seen.push(r.clone());
+        }
     }
-    out.push_str(&format!("[registry.\"{host}\"]\n  http = true\n"));
+    while seen.len() > MAX_SEEN {
+        let Some(i) = seen.iter().position(|r| !now.contains(r)) else { break };
+        seen.remove(i);
+    }
+    let mut names = vec!["docker.io".to_owned()];
+    names.extend(seen.iter().cloned());
+    names
+}
+
+/// Those of `names` reached without verified TLS by `c`: what buildkitd.toml
+/// marks `http` and `insecure` beyond the hosts `c` names itself (a network
+/// entry covers a registry only once an image from it has been pulled).
+pub fn unverified(c: &kiri_image::RegistryConfig, names: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = names.iter().filter(|n| c.is_unverified(n)).cloned().collect();
+    out.sort();
+    out.dedup();
     out
+}
+
+/// A TOML basic string. A name or a mirror goes into buildkitd.toml, and one
+/// with a quote, a backslash or a control character in it would close or
+/// break the string: buildkitd would refuse the whole file, so every build
+/// would fail, and the image that carried the name is recorded, so it would
+/// keep failing.
+fn quoted(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn format_tables(tables: &[(String, Table)]) -> String {
+    let mut out = String::new();
+    for (registry, t) in tables {
+        out.push_str(&format!("[registry.{}]\n", quoted(registry)));
+        if !t.mirrors.is_empty() {
+            let list = t.mirrors.iter().map(|m| quoted(m)).collect::<Vec<_>>().join(", ");
+            out.push_str(&format!("  mirrors = [{list}]\n"));
+        }
+        if let Some(http) = t.http {
+            out.push_str(&format!("  http = {http}\n"));
+        }
+        if t.insecure {
+            out.push_str("  insecure = true\n");
+        }
+    }
+    out
+}
+
+/// buildkitd.toml's registry tables, for `c` (daemon.json's settings) and
+/// `names` ([`registry_names`]), with `host_net` selecting `127.0.0.1` on
+/// Linux when the builder runs in the host network namespace (`--driver-opt
+/// network=host`), where the loopback listener is always up even before `kiri0`
+/// exists.
+pub fn config_for(engine: &Engine, c: &kiri_image::RegistryConfig, names: &[String], host_net: bool) -> String {
+    let mut tables: Vec<(String, Table)> = Vec::new();
+    if let Some(port) = LISTENING.get().copied().flatten() {
+        let addr = if cfg!(target_os = "linux") && host_net { "127.0.0.1".to_owned() } else { mirror_host(&engine.lock_net()) };
+        let host = format!("{addr}:{port}");
+        let token = token();
+        for name in names {
+            add_mirror(&mut tables, name, format!("{host}/{token}/{name}"));
+        }
+        table(&mut tables, &host).http = Some(true);
+    }
+    registries(&mut tables, c, names);
+    format_tables(&tables)
+}
+
+/// daemon.json's part of buildkitd.toml, so a build reaches each registry
+/// the way a pull does. Its Docker Hub mirrors (the usable ones:
+/// `RegistryConfig::mirror_allowed`) come after Kiri's own mirror, which
+/// serves images built or loaded here and answers 404 for everything else.
+///
+/// BuildKit (util/resolver) reads `http` and `insecure` together: both set
+/// is HTTPS without a certificate check, falling back to plain HTTP when
+/// the answer is not TLS (unlike a pull, a portless plain-HTTP registry on
+/// port 80 does not fall back when port 443 is closed), which is what a
+/// pull does for a host it probes (a listed host, a registry the store
+/// names inside a listed network);
+/// `http` alone is plain HTTP only; `insecure` alone (with `http = false`,
+/// so `localhost` is not sent plain HTTP by default) is unchecked HTTPS
+/// only. A mirror is asked over the scheme it was written with, as a pull
+/// asks it: `http://` gets `http` alone, `https://` on a host that may go
+/// unverified gets `insecure` alone, and one elsewhere keeps verified
+/// HTTPS. A host two mirrors name with different schemes is probed. Every
+/// other host keeps verified HTTPS, a plain-HTTP mirror's host included
+/// (such a mirror is used only when its host is listed). BuildKit has no
+/// network form, so a network reaches builds through the registries in
+/// `known` (the store's), and a listed host's own table.
+fn registries(tables: &mut Vec<(String, Table)>, c: &kiri_image::RegistryConfig, known: &[String]) {
+    // Each mirror host and its written scheme (`Some(http)`), `None` where
+    // two mirrors on it disagree.
+    let mut schemes: Vec<(&str, Option<bool>)> = Vec::new();
+    for mirror in c.usable_mirrors() {
+        add_mirror(tables, "docker.io", mirror.buildkit());
+        match schemes.iter_mut().find(|(h, _)| *h == mirror.host) {
+            Some((_, s)) if *s != Some(mirror.http) => *s = None,
+            Some(_) => {}
+            None => schemes.push((&mirror.host, Some(mirror.http))),
+        }
+    }
+    let probed = |t: &mut Table| {
+        t.http = Some(true);
+        t.insecure = true;
+    };
+    for (host, scheme) in &schemes {
+        match scheme {
+            Some(true) => table(tables, host).http = Some(true),
+            Some(false) if c.is_unverified(host) => {
+                let t = table(tables, host);
+                t.http = Some(false);
+                t.insecure = true;
+            }
+            Some(false) => {}
+            None if c.is_unverified(host) => probed(table(tables, host)),
+            None => {}
+        }
+    }
+    let listed = c.insecure.iter().filter_map(|e| match e {
+        kiri_image::Insecure::Host(h) => Some(h.as_str()),
+        kiri_image::Insecure::Net(..) => None,
+    });
+    for host in listed.chain(known.iter().map(String::as_str)) {
+        if c.is_unverified(host) && !schemes.iter().any(|(h, _)| *h == host) {
+            probed(table(tables, host));
+        }
+    }
 }
 
 fn serve(listener: TcpListener, engine: Weak<Engine>) {
@@ -192,9 +384,9 @@ fn answer(conn: TcpStream, engine: &Engine) -> io::Result<()> {
     if method != "GET" && method != "HEAD" {
         return head(&mut w, "405 Method Not Allowed", "", 0);
     }
-    match lookup(engine, target.split('?').next().unwrap_or_default(), &token()) {
-        Some(Found::Manifest(bytes, digest)) => {
-            head(&mut w, "200 OK", &format!("Content-Type: application/vnd.oci.image.manifest.v1+json\r\nDocker-Content-Digest: {digest}\r\n"), bytes.len() as u64)?;
+    match lookup(&engine.store, target.split('?').next().unwrap_or_default(), &token()) {
+        Some(Found::Manifest(bytes, media_type, digest)) => {
+            head(&mut w, "200 OK", &format!("Content-Type: {media_type}\r\nDocker-Content-Digest: {digest}\r\n"), bytes.len() as u64)?;
             if method == "GET" {
                 w.write_all(&bytes)?;
             }
@@ -212,10 +404,42 @@ fn answer(conn: TcpStream, engine: &Engine) -> io::Result<()> {
     w.flush()
 }
 
+const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
+const OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";
+const MAX_MANIFEST: u64 = 4 << 20;
+
 #[derive(Debug)]
 enum Found {
-    Manifest(Vec<u8>, String),
+    Manifest(Vec<u8>, String, String),
     Blob(std::path::PathBuf, String),
+}
+
+/// Content-Type for raw manifest or index JSON `bytes`.
+fn manifest_media_type(bytes: &[u8]) -> String {
+    if let Ok(v) = serde_json::from_slice::<Value>(bytes) {
+        if let Some(mt) = v["mediaType"].as_str().map(str::trim).filter(|m| !m.is_empty() && !m.contains(['\r', '\n'])) {
+            return mt.to_owned();
+        }
+        if v.get("manifests").is_some() {
+            return OCI_INDEX.to_owned();
+        }
+    }
+    OCI_MANIFEST.to_owned()
+}
+
+/// Reads a raw upstream manifest or multi-arch index blob saved during `pull`,
+/// verifying that its bytes hash to `digest`.
+fn stored_manifest(store: &kiri_image::Store, digest: &str) -> Option<(Vec<u8>, String)> {
+    let path = store.blob_path(digest).ok()?;
+    let len = std::fs::metadata(&path).ok()?.len();
+    if len > MAX_MANIFEST {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    (kiri_image::store::sha256_digest(&bytes) == digest).then(|| {
+        let media_type = manifest_media_type(&bytes);
+        (bytes, media_type)
+    })
 }
 
 /// An image's manifest as Kiri serves it, and its digest.
@@ -223,7 +447,7 @@ fn manifest(store: &kiri_image::Store, i: &Image) -> Option<(Vec<u8>, String)> {
     let config_size = std::fs::metadata(store.blob_path(&i.config_digest).ok()?).ok()?.len();
     let m = json!({
         "schemaVersion": 2,
-        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "mediaType": OCI_MANIFEST,
         "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": i.config_digest, "size": config_size},
         "layers": i.layers.iter().map(|l| json!({"mediaType": l.media_type, "digest": l.digest, "size": l.size})).collect::<Vec<Value>>(),
     });
@@ -245,28 +469,141 @@ fn parse(path: &str, token: &str) -> Option<(String, String, bool, String)> {
     (!repo.is_empty() && !reference.is_empty() && !reference.contains('/')).then(|| (registry.to_owned(), repo.to_owned(), kind, reference.to_owned()))
 }
 
-fn lookup(engine: &Engine, path: &str, token: &str) -> Option<Found> {
+/// Whether the mirror answers for `i` under its tag. It does for an image no
+/// registry has (built, loaded, committed: its digest is its config's), which
+/// is the one thing a build cannot get anywhere else. An image a registry
+/// published is left to that registry, which knows every platform of the tag;
+/// answering with the one platform Kiri pulled would hide the rest.
+fn serve_tag(i: &Image) -> bool {
+    i.repo_digest().is_none()
+}
+
+fn lookup(store: &kiri_image::Store, path: &str, token: &str) -> Option<Found> {
     let (registry, repo, is_manifest, reference) = parse(path, token)?;
-    let images = engine.store.images().ok()?;
+    let images = store.images().ok()?;
     let in_repo = |i: &&Image| Reference::parse(&i.name).is_ok_and(|n| n.registry == registry && n.repository == repo);
     if is_manifest {
         if reference.starts_with("sha256:") {
-            return images.iter().filter(in_repo).find_map(|i| manifest(&engine.store, i).filter(|(_, d)| *d == reference)).map(|(b, d)| Found::Manifest(b, d));
+            // Serve the exact raw manifest or multi-arch index bytes saved
+            // during `docker pull` when an image in this repository owns that
+            // digest, so digest-pinned builds (`FROM repo:tag@sha256:…` or
+            // `FROM repo@sha256:…`) verify cleanly from Kiri's store (#288, #330).
+            if images.iter().filter(in_repo).any(|i| i.digest == reference || i.index_digest.as_deref() == Some(reference.as_str()))
+                && let Some((b, mt)) = stored_manifest(store, &reference)
+            {
+                return Some(Found::Manifest(b, mt, reference));
+            }
+            return images.iter().filter(in_repo).find_map(|i| manifest(store, i).filter(|(_, d)| *d == reference)).map(|(b, d)| Found::Manifest(b, OCI_MANIFEST.to_owned(), d));
         }
         let wanted = Reference::parse(&format!("{registry}/{repo}:{reference}")).ok()?.short();
-        let i = images.iter().find(|i| i.name == wanted)?;
-        let (b, d) = manifest(&engine.store, i)?;
-        return Some(Found::Manifest(b, d));
+        // A tag a registry published is the registry's to answer: Kiri holds
+        // the one platform it pulled, and serving that says the tag has no
+        // other, so a build for another platform takes these binaries and
+        // fails on them (issue #57). 404 here makes the builder skip this
+        // mirror and pull the platform it asked for.
+        let i = images.iter().find(|i| i.name == wanted && serve_tag(i))?;
+        let (b, d) = manifest(store, i)?;
+        return Some(Found::Manifest(b, OCI_MANIFEST.to_owned(), d));
     }
     // Only blobs of that repository's images.
-    let owned = images.iter().filter(in_repo).any(|i| i.config_digest == reference || i.layers.iter().any(|l| l.digest == reference));
-    let path = engine.store.blob_path(&reference).ok()?;
+    let owned = images.iter().filter(in_repo).any(|i| i.referenced_digests().any(|d| d == reference));
+    let path = store.blob_path(&reference).ok()?;
     (owned && path.is_file()).then_some(Found::Blob(path, reference))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A registry the store named once keeps its builder table after its
+    /// last image is removed: the builder is not restarted without it.
+    #[test]
+    fn a_registry_seen_once_keeps_its_builder_table() {
+        let first = remembered(vec!["10.77.0.9:5000".into(), "docker.io".into()]);
+        assert_eq!(first[0], "docker.io");
+        assert_eq!(first.iter().filter(|r| *r == "docker.io").count(), 1);
+        let later = remembered(Vec::new());
+        assert!(later.contains(&"10.77.0.9:5000".to_owned()), "{later:?}");
+        let c = kiri_image::RegistryConfig { insecure: vec![kiri_image::Insecure::parse("10.0.0.0/8").unwrap()], ..Default::default() };
+        assert_eq!(unverified(&c, &["10.77.0.9:5000".into(), "10.77.0.9:5000".into()]), ["10.77.0.9:5000"]);
+    }
+
+    /// daemon.json's hosts merge into one table each, as BuildKit wants:
+    /// every host a pull reaches unverified is http and insecure in builds
+    /// too, a network covers the registries the store names inside it, and
+    /// nothing else changes.
+    /// However many registries were seen before, every one the store names
+    /// now has its table; the oldest gone from the store make room.
+    #[test]
+    fn a_full_memory_still_takes_the_stores_registries() {
+        let mut seen = Vec::new();
+        // One image at a time, each removed before the next is pulled.
+        for i in 0..MAX_SEEN + 40 {
+            remembered_in(&mut seen, vec![format!("old-{i}.lan:5000")]);
+        }
+        assert_eq!(seen.len(), MAX_SEEN);
+        let names = remembered_in(&mut seen, vec!["docker.io".into(), "new.lan:5000".into()]);
+        assert!(names.contains(&"new.lan:5000".to_owned()), "the new registry has its table");
+        assert_eq!(names.iter().filter(|n| *n == "docker.io").count(), 1);
+        assert!(seen.len() <= MAX_SEEN && !seen.contains(&"docker.io".to_owned()));
+        assert!(!seen.contains(&"old-40.lan:5000".to_owned()) && seen.contains(&format!("old-{}.lan:5000", MAX_SEEN + 39)), "the oldest went");
+    }
+
+    #[test]
+    fn daemon_json_registries_share_one_table_each() {
+        let c = kiri_image::RegistryConfig {
+            insecure: ["registry.lan:5000", "mirror.lan:5000", "10.0.0.0/8"].iter().map(|e| kiri_image::Insecure::parse(e).unwrap()).collect(),
+            mirrors: vec![kiri_image::Mirror::parse("http://mirror.lan:5000").unwrap(), kiri_image::Mirror::parse("https://m.example.com/docker.io").unwrap()],
+        };
+        let mut tables = Vec::new();
+        add_mirror(&mut tables, "docker.io", "198.19.248.254:1234/t/docker.io".into());
+        registries(&mut tables, &c, &["docker.io".into(), "10.1.2.3:5000".into(), "ghcr.io".into()]);
+        let names: Vec<&str> = tables.iter().map(|(r, _)| r.as_str()).collect();
+        assert_eq!(names, ["docker.io", "mirror.lan:5000", "registry.lan:5000", "10.1.2.3:5000"]);
+        assert_eq!(tables[0].1.mirrors, ["198.19.248.254:1234/t/docker.io", "mirror.lan:5000", "m.example.com/docker.io"]);
+        // The http:// mirror straight over plain HTTP, as a pull asks it.
+        assert_eq!(tables[1].1, Table { mirrors: vec![], http: Some(true), insecure: false });
+        for t in &tables[2..] {
+            assert_eq!(t.1, Table { mirrors: vec![], http: Some(true), insecure: true });
+        }
+        let mut none = Vec::new();
+        registries(&mut none, &kiri_image::RegistryConfig::default(), &["ghcr.io".into()]);
+        assert!(none.is_empty());
+    }
+
+    /// A mirror is reached in builds over the scheme it was written with,
+    /// as a pull reaches it: an https:// one on a listed host or on this
+    /// machine is unchecked HTTPS with no fall back to plain HTTP, an
+    /// http:// one plain HTTP with no TLS first, an https:// one elsewhere
+    /// verified HTTPS. A listed host with no scheme is probed (both set).
+    #[test]
+    fn a_build_reaches_a_mirror_over_its_written_scheme() {
+        let c = kiri_image::RegistryConfig {
+            insecure: ["tls.lan:5000", "plain.lan:5000", "both.lan:5000", "reg.lan:5000"].iter().map(|e| kiri_image::Insecure::parse(e).unwrap()).collect(),
+            mirrors: ["https://tls.lan:5000", "http://plain.lan:5000", "https://127.0.0.1:5000", "https://m.example.com", "https://both.lan:5000/a", "http://both.lan:5000/b"].iter().map(|m| kiri_image::Mirror::parse(m).unwrap()).collect(),
+        };
+        let mut tables = Vec::new();
+        registries(&mut tables, &c, &[]);
+        let get = |h: &str| tables.iter().find(|(r, _)| r == h).map(|(_, t)| (t.http, t.insecure));
+        assert_eq!(get("tls.lan:5000"), Some((Some(false), true)));
+        assert_eq!(get("127.0.0.1:5000"), Some((Some(false), true)));
+        assert_eq!(get("plain.lan:5000"), Some((Some(true), false)));
+        assert_eq!(get("both.lan:5000"), Some((Some(true), true)));
+        assert_eq!(get("reg.lan:5000"), Some((Some(true), true)));
+        assert_eq!(get("m.example.com"), None);
+    }
+
+    /// A plain-HTTP mirror on a host nobody listed: a pull does not use it,
+    /// and neither does a build, and its host stays verified HTTPS for
+    /// everything else (`FROM mirror.lan:5000/x`, a push).
+    #[test]
+    fn a_build_and_a_pull_agree_on_a_plain_http_mirror() {
+        let c = kiri_image::RegistryConfig { mirrors: vec![kiri_image::Mirror::parse("http://mirror.lan:5000").unwrap()], ..Default::default() };
+        let mut tables = Vec::new();
+        registries(&mut tables, &c, &[]);
+        assert!(tables.is_empty(), "{tables:?}");
+        assert_eq!(c.usable_mirrors().count(), 0);
+    }
 
     #[test]
     fn parses_mirror_paths() {
@@ -289,6 +626,151 @@ mod tests {
     }
 
     #[test]
+    fn a_tag_a_registry_published_is_left_to_it() {
+        // Pulled: its digest is its manifest's, so a registry has it.
+        let pulled = Image { name: "alpine:3.20".into(), digest: "sha256:manifest".into(), ..made_here() };
+        assert!(!serve_tag(&pulled));
+        // Pulled through a configured Docker Hub mirror (#119) or from a multi-arch index.
+        let mirrored = Image { mirror: Some("mirror.lan:5000".into()), index_digest: Some("sha256:index".into()), ..pulled.clone() };
+        assert!(!serve_tag(&mirrored));
+        // Another tag in the same repository still carries that repository's digest.
+        assert!(!serve_tag(&pulled.tagged("alpine:latest".into())));
+        // Built, loaded or committed here: nothing else can serve it, platform or not.
+        assert!(serve_tag(&made_here()));
+        // Tagged into another repository (docker tag alpine:3.20 mybase:dev):
+        // that name is not in any registry, so the mirror answers for it.
+        assert!(serve_tag(&pulled.tagged("mybase:dev".into())));
+    }
+
+    #[test]
+    fn lookup_skips_published_tags_but_serves_local_tags_digests_and_blobs() {
+        let dir = std::env::temp_dir().join(format!("kiri-mirror-lookup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = kiri_image::Store::open(&dir).unwrap();
+        let write_blob = |bytes: &[u8]| {
+            let mut w = store.ingest().unwrap();
+            w.write_all(bytes).unwrap();
+            w.finish().unwrap()
+        };
+        let cfg = json!({"architecture": "amd64", "os": "linux", "config": {}});
+        let (cfg_digest, _) = write_blob(&serde_json::to_vec(&cfg).unwrap());
+        let (layer_digest, layer_size) = write_blob(b"layer-bytes");
+        let layers = vec![kiri_image::Layer { digest: layer_digest.clone(), size: layer_size, media_type: "application/vnd.oci.image.layer.v1.tar+gzip".into() }];
+
+        // 1. Registry-pulled image (also when pulled via a #119 mirror): tag
+        // lookup returns None (404) so BuildKit falls through to the configured
+        // mirror or upstream registry, while digest and blob lookups still hit
+        // the local store so cached layers are not re-downloaded.
+        let pulled = Image {
+            name: "alpine:3.20".into(),
+            digest: format!("sha256:{}", "a".repeat(64)),
+            index_digest: Some(format!("sha256:{}", "b".repeat(64))),
+            mirror: Some("mirror.lan:5000".into()),
+            ..kiri_image::archive::from_config("alpine:3.20".into(), &cfg_digest, &cfg, layers.clone())
+        };
+        let (_, pulled_manifest_digest) = manifest(&store, &pulled).unwrap();
+        store.put_image(pulled.clone()).unwrap();
+
+        assert!(lookup(&store, "/v2/tok/docker.io/library/alpine/manifests/3.20", "tok").is_none());
+        assert!(matches!(
+            lookup(&store, &format!("/v2/tok/docker.io/library/alpine/manifests/{pulled_manifest_digest}"), "tok"),
+            Some(Found::Manifest(_, _, d)) if d == pulled_manifest_digest
+        ));
+        assert!(matches!(
+            lookup(&store, &format!("/v2/tok/docker.io/library/alpine/blobs/{layer_digest}"), "tok"),
+            Some(Found::Blob(_, d)) if d == layer_digest
+        ));
+        assert!(matches!(
+            lookup(&store, &format!("/v2/tok/docker.io/library/alpine/blobs/{cfg_digest}"), "tok"),
+            Some(Found::Blob(_, d)) if d == cfg_digest
+        ));
+        // Another repository cannot read alpine's blobs.
+        assert!(lookup(&store, &format!("/v2/tok/docker.io/library/other/blobs/{layer_digest}"), "tok").is_none());
+
+        // 2. Retagged into a local repository (`docker tag alpine:3.20 mybase:dev`):
+        // served by tag and by blob under the new repository.
+        store.put_image(pulled.tagged("mybase:dev".into())).unwrap();
+        assert!(matches!(
+            lookup(&store, "/v2/tok/docker.io/library/mybase/manifests/dev", "tok"),
+            Some(Found::Manifest(_, _, d)) if d == pulled_manifest_digest
+        ));
+        assert!(matches!(
+            lookup(&store, &format!("/v2/tok/docker.io/library/mybase/blobs/{layer_digest}"), "tok"),
+            Some(Found::Blob(_, d)) if d == layer_digest
+        ));
+
+        // 3. Built, loaded or committed here: served by tag until pushed to a registry.
+        let local = kiri_image::archive::from_config("localhost:5000/myapp:dev".into(), &cfg_digest, &cfg, layers.clone());
+        store.put_image(local).unwrap();
+        assert!(matches!(lookup(&store, "/v2/tok/localhost:5000/myapp/manifests/dev", "tok"), Some(Found::Manifest(..))));
+        store.set_pushed("localhost:5000/myapp:dev", &cfg_digest, &format!("sha256:{}", "c".repeat(64))).unwrap();
+        assert!(lookup(&store, "/v2/tok/localhost:5000/myapp/manifests/dev", "tok").is_none());
+
+        // 4. Digest-pinned multi-arch pull (`docker pull oven/bun:1-alpine@sha256:<index>`):
+        // raw index and platform manifest bytes are served verbatim with their
+        // upstream Content-Type so BuildKit's SHA-256 verification succeeds (#288, #330).
+        let raw_manifest = format!(
+            "{{\n  \"schemaVersion\": 2,\n  \"mediaType\": \"application/vnd.docker.distribution.manifest.v2+json\",\n  \"config\": {{\"mediaType\": \"application/vnd.docker.container.image.v1+json\", \"size\": 42, \"digest\": \"{cfg_digest}\"}},\n  \"layers\": [{{\"mediaType\": \"application/vnd.docker.image.rootfs.diff.tar.gzip\", \"size\": {layer_size}, \"digest\": \"{layer_digest}\"}}]\n}}"
+        );
+        let (raw_man_digest, _) = write_blob(raw_manifest.as_bytes());
+        let raw_index = format!(
+            "{{\n  \"schemaVersion\": 2,\n  \"mediaType\": \"application/vnd.oci.image.index.v1+json\",\n  \"manifests\": [\n    {{\"mediaType\": \"application/vnd.docker.distribution.manifest.v2+json\", \"size\": {}, \"digest\": \"{raw_man_digest}\", \"platform\": {{\"architecture\": \"amd64\", \"os\": \"linux\"}}}},\n    {{\"mediaType\": \"application/vnd.docker.distribution.manifest.v2+json\", \"size\": 999, \"digest\": \"sha256:{}\", \"platform\": {{\"architecture\": \"arm64\", \"os\": \"linux\"}}}}\n  ]\n}}",
+            raw_manifest.len(),
+            "e".repeat(64)
+        );
+        let (raw_idx_digest, _) = write_blob(raw_index.as_bytes());
+        let pinned = Image {
+            name: format!("oven/bun@{raw_idx_digest}"),
+            digest: raw_man_digest.clone(),
+            index_digest: Some(raw_idx_digest.clone()),
+            ..kiri_image::archive::from_config(format!("oven/bun@{raw_idx_digest}"), &cfg_digest, &cfg, layers)
+        };
+        store.put_image(pinned).unwrap();
+        match lookup(&store, &format!("/v2/tok/docker.io/oven/bun/manifests/{raw_idx_digest}"), "tok") {
+            Some(Found::Manifest(b, mt, d)) => {
+                assert_eq!(b, raw_index.as_bytes(), "exact upstream index bytes");
+                assert_eq!(kiri_image::store::sha256_digest(&b), raw_idx_digest);
+                assert_eq!(mt, "application/vnd.oci.image.index.v1+json");
+                assert_eq!(d, raw_idx_digest);
+            }
+            other => panic!("expected raw index manifest, got {other:?}"),
+        }
+        match lookup(&store, &format!("/v2/tok/docker.io/oven/bun/manifests/{raw_man_digest}"), "tok") {
+            Some(Found::Manifest(b, mt, d)) => {
+                assert_eq!(b, raw_manifest.as_bytes(), "exact upstream platform manifest bytes");
+                assert_eq!(kiri_image::store::sha256_digest(&b), raw_man_digest);
+                assert_eq!(mt, "application/vnd.docker.distribution.manifest.v2+json");
+                assert_eq!(d, raw_man_digest);
+            }
+            other => panic!("expected raw platform manifest, got {other:?}"),
+        }
+        // Unpulled platform digest returns None (404) so BuildKit falls back to the registry.
+        assert!(lookup(&store, &format!("/v2/tok/docker.io/oven/bun/manifests/sha256:{}", "e".repeat(64)), "tok").is_none());
+        // Cross-repo isolation holds for raw manifests too.
+        assert!(lookup(&store, &format!("/v2/tok/docker.io/library/other/manifests/{raw_idx_digest}"), "tok").is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An image built here: no registry has it.
+    fn made_here() -> Image {
+        let config_digest = "sha256:config".to_owned();
+        Image {
+            name: "myapp:dev".into(),
+            digest: config_digest.clone(),
+            index_digest: None,
+            config_digest,
+            layers: Vec::new(),
+            size: 0,
+            platform: "linux/amd64".into(),
+            created: String::new(),
+            pulled_at: 0,
+            config: kiri_image::RunConfig::default(),
+            mirror: None,
+        }
+    }
+
+    #[test]
     fn token_file_is_private_from_the_start() {
         use std::os::unix::fs::PermissionsExt;
         let p = std::env::temp_dir().join(format!("kiri-mirror-token-{}", std::process::id()));
@@ -299,5 +781,29 @@ mod tests {
         assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "0123456789abcdef0123456789abcdef");
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// A registry name from an image reaches buildkitd.toml. A quote, a
+    /// backslash or a newline in it must not close the string or inject a
+    /// table: buildkitd refuses the whole file, and every build fails until
+    /// the image is removed (#746).
+    #[test]
+    fn names_are_quoted_for_toml() {
+        assert_eq!(super::quoted("registry.corp"), "\"registry.corp\"");
+        assert_eq!(super::quoted("evil\".com"), "\"evil\\\".com\"");
+        assert_eq!(super::quoted("a\\b"), "\"a\\\\b\"");
+        assert_eq!(super::quoted("a\nb\rc\td"), "\"a\\nb\\rc\\td\"");
+        assert_eq!(super::quoted("a\u{7}b\u{7f}c"), "\"a\\u0007b\\u007Fc\"");
+        let mut tables = Vec::new();
+        add_mirror(&mut tables, "evil\"].com\n[worker.oci]", "127.0.0.1:47391/tok/evil\"].com\n[worker.oci]".into());
+        let toml = super::format_tables(&tables);
+        assert_eq!(
+            toml,
+            "[registry.\"evil\\\"].com\\n[worker.oci]\"]\n  mirrors = [\"127.0.0.1:47391/tok/evil\\\"].com\\n[worker.oci]\"]\n"
+        );
+        // A name that could have carried one is not a reference any more.
+        for bad in ["evil\".com/x:1", "evil\\com/x:1", "host/x:ta\"g", "host/x?y:1", "h#x/y:1"] {
+            assert!(kiri_image::Reference::parse(bad).is_err(), "{bad:?}");
+        }
     }
 }
