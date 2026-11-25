@@ -13,6 +13,60 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #473 Mac: bind unprivileged low ports (`<1024`) on loopback and allow disabling `VZNATNetworkDeviceAttachment` (`kiri vm set --shared-nat off`) for Cloudflare WARP and strict TLS firewalls (unreleased)
+- Fixes: #473 Port forwarding for ports `<1024` fails without root on macOS even when binding `127.0.0.1`, #383 Cloudflare WARP breaks container networking on macOS (`InternetSharing` conflict), #350 TLS 1.3 handshake hangs when corporate firewall drops non-DF packets from macOS `InternetSharing` NAT
+- Caused: none known
+- Caused by: -
+- Check: `crates/kiri/src/vm_cli.rs`, `crates/kiri/src/daemon/ports.rs`
+
+### #382, #415 Guest kernel: persist explicit `chown` ownership on virtiofs inodes and enable close-to-open page/dir caching with 1 MiB read-ahead (unreleased)
+- Fixes: #382 `chown` on macOS bind mounts returns 0 without updating file owner, breaking subsequent `chmod` (`initdb`, PostgreSQL, npm) as that user; #415 Slow small-file read throughput on macOS virtiofs bind mounts
+- Caused: none known
+- Caused by: -
+- Check: `bind-chown-chmod`
+
+### #864 Images: free unreferenced blobs on tag overwrite with race-free blob pinning (unreleased)
+- Fixes: #864 An image replaced under its name disappears, but its blobs stay on the Mac and nothing can remove them
+- Caused: none known
+- Caused by: #877 (`Store::pin` updated `PINNED` without `BLOB_LOCK`, allowing `remove_unpinned` past its check to race with `archive::load`'s fast path)
+- Check: `crates/kiri-image/src/store.rs`, `crates/kiri-image/src/archive.rs`
+
+### #734 Builder: load images built by containerized Docker CLIs into Kiri's store (unreleased)
+- Fixes: #734 `docker build` from a `docker` CLI inside a container leaves the image out of Kiri's store
+- Caused: none known
+- Caused by: -
+- Check: `crates/kiri/src/daemon/grpc.rs`
+
+### #763 macOS: discover GPG `S.gpg-agent.ssh` and translate host SSH agent socket bind mounts (unreleased)
+- Fixes: #763 support mac GPG `SSH_AUTH_SOCK`
+- Caused: none known
+- Caused by: -
+- Check: `mac-gpg-ssh-agent-mount`, `crates/kiri/src/daemon/ports.rs`, `crates/kiri/src/daemon/api.rs`
+
+### #816 Kubernetes: support custom k3s version, extra `k3s server` arguments, and `~/.kiri/k8s-manifests` auto-deploy manifests in `kiri k8s` (unreleased)
+- Fixes: #816 Kiri Kubernetes - support more k3s arguments
+- Caused: none known
+- Caused by: -
+- Check: `crates/kiri/src/k8s.rs`, `crates/kiri-win/src/k8s.rs`
+
+### #556 macOS: edit shell profiles only once on initial setup, skip profiles that already reference `.kiri/bin`, and support `kiri setup --no-profiles` (unreleased)
+- Fixes: #556 macOS: shell profile lines come back on every launch, with no way to opt out
+- Caused: none known
+- Caused by: -
+- Check: `crates/kiri/src/setup.rs`
+
+### #303 TLS: trust the system certificate store across macOS, Linux and Windows, respecting distrusted roots and `KIRI_TLS_ROOTS=webpki` (unreleased)
+- Fixes: #303 Trust system certificate store (corporate / private CA roots) for image pulls, logins, updates, tool downloads and Share
+- Caused: none known
+- Caused by: -
+- Check: `tls-company-root-pull`, `tls-company-root-login`, `tls-unknown-root-refused`, `crates/kiri-image/src/roots.rs`, `crates/kiri/src/daemon/hostroots.rs`
+
+### #768 Storage & WSL: detect read-only / `emergency_ro` storage filesystems and report actionable recovery steps (unreleased)
+- Fixes: #768 Windows (WSL 2) / Linux: when `ext4.vhdx` or `/var/lib/kiri` is remounted read-only (`emergency_ro`), overlayfs mounts container rootfs read-only or daemon startup fails with opaque `EROFS` errors instead of actionable `e2fsck` / storage recovery guidance
+- Caused: none known
+- Caused by: -
+- Check: `crates/kiri/src/daemon/rofs.rs`, `crates/kiri-init/src/linux/sys.rs`, `crates/kiri-win/src/wslsync.rs`, `crates/kiri-win/src/refuse.rs`
+
 ### #783 Engine: serialize `containers.json` by reference without cloning container specs (unreleased)
 - Fixes: no issue
 - Caused: none known
@@ -57,7 +111,7 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ### #465 Images: load OCI image-layout archives and verify existing content-addressed blobs in memory (unreleased)
 - Fixes: #465 Load OCI image-layout archives (`index.json` + `blobs/sha256/...`) in `docker load`
-- Caused: none known
+- Caused: #864 (`Store::pin` in #877 did not acquire `BLOB_LOCK`, leaving a narrow window where `remove_unpinned` deleted a shared blob after `archive::load` pinned it; caught by `loads_and_removals_of_images_sharing_a_layer_do_not_race` in CI)
 - Caused by: -
 - Check: `load-oci-ref`, `load-oci-ref-runs`, `load-oci-untagged`, `load-oci-tampered`, `load-oci-native`, `load-oci-platform`, `load-oci-platform-json`, `load-oci-no-platform`, `load-oci-buildx`, `load-oci-buildx-runs`, `load-oci-buildx-multi`, `load-oci-buildx-multi-runs`
 

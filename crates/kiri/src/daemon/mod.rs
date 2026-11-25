@@ -13,10 +13,15 @@ pub mod dns;
 pub mod tls;
 pub mod proxy;
 mod domains;
-mod engine;
+pub(crate) mod engine;
 mod filters;
+mod grpc;
 mod health;
 mod hostetc;
+// A Windows host's roots, for the engine in WSL.
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod hostroots;
 mod hostopts;
 mod mirror;
 mod http;
@@ -28,6 +33,7 @@ pub(crate) mod nfs;
 mod ops;
 pub(crate) mod ports;
 mod pulls;
+pub(crate) mod rofs;
 mod seccomp;
 mod seccomp_names;
 mod storage;
@@ -213,13 +219,23 @@ pub fn run(_args: &[String]) -> io::Result<()> {
         }
     }
     let _ = BOUND_SOCKET.set(socket.clone());
+    if let Some(ref msg) = rofs::check_daemon_storage(None) {
+        diag::error!("storage filesystem is read-only", detail = msg);
+    }
+    let enrich_rofs = |e: io::Error, store_root: Option<&std::path::Path>| -> io::Error {
+        if let Some(msg) = rofs::check_daemon_storage(store_root) {
+            diag::error!("engine did not start", error = &msg);
+            return io::Error::new(e.kind(), msg);
+        }
+        e
+    };
     // On a Linux host the daemon runs as root; `KIRI_SOCKET_GROUP=kiri`
     // lets that group's users in, as the docker group does for dockerd.
     // Without an explicit group, root on Linux uses ordinary 0660 Unix
     // group access (`docker` when present), so containerized SDK clients
     // whose numeric uid has no host account can connect via socket gid.
     let access_group = std::env::var_os("KIRI_SOCKET_GROUP");
-    let listener = bind_daemon_socket(&socket, access_group.as_deref())?;
+    let listener = bind_daemon_socket(&socket, access_group.as_deref()).map_err(|e| enrich_rofs(e, None))?;
     // On a Linux host (and WSL) containers that mount the engine's socket
     // are given this one instead (binds.rs), so the API knows their
     // connections by where they arrive (caller.rs). Made as the daemon's
@@ -228,7 +244,7 @@ pub fn run(_args: &[String]) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     let for_containers = {
         let path = caller::container_socket(&socket);
-        let listener = bind_daemon_socket(&path, access_group.as_deref())?;
+        let listener = bind_daemon_socket(&path, access_group.as_deref()).map_err(|e| enrich_rofs(e, None))?;
         (listener, path)
     };
     #[cfg(target_os = "linux")]
@@ -281,8 +297,10 @@ pub fn run(_args: &[String]) -> io::Result<()> {
             None => return Err(e),
         },
     };
-    let store = kiri_image::Store::open(root)?;
-    let engine = engine::Engine::boot(store).inspect_err(|e| diag::error!("engine did not start", error = e))?;
+    let store = kiri_image::Store::open(&root).map_err(|e| enrich_rofs(e, Some(&root)))?;
+    let engine = engine::Engine::boot(store)
+        .map_err(|e| enrich_rofs(e, Some(&root)))
+        .inspect_err(|e| diag::error!("engine did not start", error = e))?;
     diag::info!("engine ready", version = env!("CARGO_PKG_VERSION"), ms = t0.elapsed().as_millis(), socket = format!("unix://{}", socket.display()));
     // Settings → Storage moved the data and started this daemon on it.
     storage::after_restart(&engine);
@@ -297,6 +315,15 @@ pub fn run(_args: &[String]) -> io::Result<()> {
     // daemon.json's insecure-registries and registry-mirrors, read again
     // whenever the file changes.
     kiri_image::set_config_source(daemon_json::current);
+    // The system's root certificates are read once, here while nothing
+    // waits for them, and not by the first pull: asking the macOS keychain
+    // about each of its certificates takes a moment (#303).
+    let _ = std::thread::Builder::new().name("kiri-tls-roots".into()).spawn(|| {
+        // In WSL, the Windows roots kiri-win sent last time (#303).
+        #[cfg(target_os = "linux")]
+        hostroots::load();
+        let _ = kiri_image::roots::trusted();
+    });
     // The managed BuildKit stops itself when builds have been idle a while.
     builder::watch(engine.clone());
     // A Kubernetes node the engine restarted gets its kubectl context.

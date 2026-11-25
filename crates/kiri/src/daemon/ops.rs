@@ -12,6 +12,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use super::api::{Next, copy_error, error, filters, guest_frame, reply};
+use super::caller::Caller;
 use super::engine::{Engine, Error, Status};
 use super::http::{self, Request};
 use super::time;
@@ -20,7 +21,7 @@ use super::time;
 const TICK_NS: u64 = 10_000_000;
 
 /// Routes the requests this module serves; `None` if it serves none.
-pub fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream) -> Option<io::Result<Next>> {
+pub fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixStream) -> Option<io::Result<Next>> {
     let p = req.path.as_str();
     let m = req.method.as_str();
     Some(match (m, p) {
@@ -41,7 +42,7 @@ pub fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream) -> Option<
                     ("POST", "rename") => reply(w, engine.rename(id, req.query("name").unwrap_or_default()).map(|()| Value::Null), 204),
                     ("POST", "update") => reply(w, update(req, engine, id), 200),
                     ("GET", "changes") => reply(w, changes(engine, id), 200),
-                    ("GET", "export") => export(engine, id, w),
+                    ("GET", "export") => export(engine, id, caller, w),
                     _ => return None,
                 });
             }
@@ -163,8 +164,8 @@ fn update(req: &Request, engine: &Engine, key: &str) -> Result<Value, Error> {
 }
 
 /// Starts a copy-service job and checks it accepted: `CopyDone` first.
-fn layer_job(engine: &Engine, key: &str, op: u8) -> Result<(kiri_vmm::VsockStream, std::fs::File), Error> {
-    let stream = engine.copy(key, op, "/", 0)?;
+fn layer_job(engine: &Engine, key: &str, op: u8, flags: u32) -> Result<(kiri_vmm::VsockStream, std::fs::File), Error> {
+    let stream = engine.copy(key, op, "/", flags)?;
     let mut f = std::fs::File::from(stream.fd.try_clone()?);
     let frame = guest_frame(&mut f)?;
     match kiri_proto::decode(&frame) {
@@ -176,7 +177,7 @@ fn layer_job(engine: &Engine, key: &str, op: u8) -> Result<(kiri_vmm::VsockStrea
 
 /// `docker diff`: Kind 0 changed, 1 added, 2 deleted.
 fn changes(engine: &Engine, key: &str) -> Result<Value, Error> {
-    let (_stream, mut f) = layer_job(engine, key, kiri_proto::copy_op::DIFF)?;
+    let (_stream, mut f) = layer_job(engine, key, kiri_proto::copy_op::DIFF, 0)?;
     let mut text = String::new();
     f.read_to_string(&mut text)?;
     let list: Vec<Value> = text
@@ -195,20 +196,15 @@ fn changes(engine: &Engine, key: &str) -> Result<Value, Error> {
     Ok(Value::Array(list))
 }
 
-fn export(engine: &Engine, key: &str, w: &mut UnixStream) -> io::Result<Next> {
-    let (stream, mut f) = match layer_job(engine, key, kiri_proto::copy_op::EXPORT) {
+fn export(engine: &Engine, key: &str, caller: &Caller, w: &mut UnixStream) -> io::Result<Next> {
+    let paced = super::api::use_paced_copy(caller);
+    let flags = if paced { kiri_proto::copy_flags::PACED } else { 0 };
+    let (stream, mut f) = match layer_job(engine, key, kiri_proto::copy_op::EXPORT, flags) {
         Ok(v) => v,
         Err(e) => return reply(w, Err(e), 200),
     };
     http::begin_stream(w, 200, "application/x-tar")?;
-    let mut buf = vec![0u8; 256 * 1024];
-    loop {
-        let n = f.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        http::chunk(w, &buf[..n])?;
-    }
+    super::api::stream_copy_out(&mut f, w, paced)?;
     http::end(w)?;
     drop(stream);
     Ok(Next::KeepAlive)
@@ -271,13 +267,19 @@ pub(super) fn apply_change(cfg: &mut Value, line: &str) -> Result<(), Error> {
 fn commit(req: &Request, engine: &Engine) -> Result<Value, Error> {
     let key = req.query("container").unwrap_or_default();
     let (id, spec, running) = engine.with(key, |c| (c.id.clone(), c.spec.clone(), c.status == Status::Running))?;
-    let base = engine
+    let (base, cfg_pin, _base_layer_pins) = engine
         .store
-        .images()?
-        .into_iter()
-        .find(|i| i.config_digest == spec.image_id)
+        .with_images(|images| {
+            let base = images.iter().find(|i| i.config_digest == spec.image_id)?.clone();
+            let cfg_pin = engine.store.pin(&base.config_digest);
+            let layer_pins: Vec<_> = base.layers.iter().map(|l| engine.store.pin(&l.digest)).collect();
+            Some((base, cfg_pin, layer_pins))
+        })?
         .ok_or_else(|| Error::NotFound(format!("the image of container {} is gone", &id[..12])))?;
     let mut cfg: Value = serde_json::from_slice(&engine.store.read_config(&base.config_digest)?).map_err(|e| Error::Io(io::Error::other(e)))?;
+    // Release the old config blob before `put_image` so committing back onto
+    // the base tag frees its unreferenced config blob.
+    drop(cfg_pin);
     // What the container ran with becomes the image's config.
     cfg["config"]["Cmd"] = json!(spec.cmd);
     cfg["config"]["Entrypoint"] = if spec.entrypoint.is_empty() { Value::Null } else { json!(spec.entrypoint) };
@@ -307,17 +309,17 @@ fn commit(req: &Request, engine: &Engine) -> Result<Value, Error> {
     if pause {
         engine.pause(&id, true)?;
     }
-    let layer = (|| -> Result<(String, u64), Error> {
-        let (_stream, mut f) = layer_job(engine, &id, kiri_proto::copy_op::COMMIT)?;
+    let layer = (|| -> Result<(String, u64, kiri_image::store::Pin), Error> {
+        let (_stream, mut f) = layer_job(engine, &id, kiri_proto::copy_op::COMMIT, 0)?;
         let mut w = engine.store.ingest()?;
         io::copy(&mut f, &mut w)?;
-        Ok(w.finish()?)
+        Ok(w.finish_pinned()?)
     })();
     if pause {
         let _ = engine.pause(&id, false);
     }
     // An uncompressed layer: its digest is its diff id.
-    let (digest, size) = layer?;
+    let (digest, size, _layer_pin) = layer?;
     if !cfg["rootfs"]["diff_ids"].is_array() {
         cfg["rootfs"] = json!({"type": "layers", "diff_ids": []});
     }
@@ -334,7 +336,7 @@ fn commit(req: &Request, engine: &Engine) -> Result<Value, Error> {
     let bytes = serde_json::to_vec(&cfg).map_err(|e| Error::Io(io::Error::other(e)))?;
     let mut w = engine.store.ingest()?;
     io::Write::write_all(&mut w, &bytes)?;
-    let (config_digest, _) = w.finish()?;
+    let (config_digest, _, _config_pin) = w.finish_pinned()?;
     let mut layers = base.layers.clone();
     layers.push(kiri_image::Layer { digest, size, media_type: "application/vnd.oci.image.layer.v1.tar".into() });
     let repo = req.query("repo").unwrap_or_default();
@@ -550,7 +552,7 @@ fn system_df(engine: &Engine) -> Result<Value, Error> {
 /// `docker history`: the config's history, newest first, with each
 /// layer-making step's size.
 fn history(engine: &Engine, name: &str) -> Result<Value, Error> {
-    let i = engine.image(name)?.ok_or_else(|| Error::NotFound(format!("No such image: {name}")))?;
+    let (i, _blob_pins) = engine.image_pinned(name)?.ok_or_else(|| Error::NotFound(format!("No such image: {name}")))?;
     let cfg: Value = serde_json::from_slice(&engine.store.read_config(&i.config_digest)?).unwrap_or(Value::Null);
     let mut layers = i.layers.iter();
     let mut rows: Vec<Value> = cfg["history"]

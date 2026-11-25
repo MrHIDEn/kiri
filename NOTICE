@@ -3751,6 +3751,8 @@ Used by:
 - bumpalo 3.20.4 (https://github.com/fitzgen/bumpalo)
 - cc 1.10.0 (https://github.com/rust-lang/cc-rs)
 - cfg-if 1.0.5 (https://github.com/rust-lang/cfg-if)
+- core-foundation-sys 0.8.7 (https://github.com/servo/core-foundation-rs)
+- core-foundation 0.10.1 (https://github.com/servo/core-foundation-rs)
 - cpp_demangle 0.5.1 (https://github.com/gimli-rs/cpp_demangle)
 - crossbeam-deque 0.8.8 (https://github.com/crossbeam-rs/crossbeam)
 - crossbeam-epoch 0.9.21 (https://github.com/crossbeam-rs/crossbeam)
@@ -3785,6 +3787,7 @@ Used by:
 - log 0.4.34 (https://github.com/rust-lang/log)
 - object 0.40.0 (https://github.com/gimli-rs/object)
 - once_cell 1.21.4 (https://github.com/matklad/once_cell)
+- openssl-probe 0.2.2 (https://github.com/rustls/openssl-probe)
 - percent-encoding 2.3.2 (https://github.com/servo/rust-url/)
 - petgraph 0.6.5 (https://github.com/petgraph/petgraph)
 - pkg-config 0.3.34 (https://github.com/rust-lang/pkg-config-rs)
@@ -3797,8 +3800,11 @@ Used by:
 - rustc_version 0.4.1 (https://github.com/djc/rustc-version-rs)
 - rustix-linux-procfs 0.1.1 (https://github.com/sunfishcode/rustix-linux-procfs)
 - rustix 1.1.5 (https://github.com/bytecodealliance/rustix)
+- rustls-native-certs 0.8.5 (https://github.com/rustls/rustls-native-certs)
 - rustls 0.23.46 (https://github.com/rustls/rustls)
 - scopeguard 1.2.0 (https://github.com/bluss/scopeguard)
+- security-framework-sys 2.17.0 (https://github.com/kornelski/rust-security-framework)
+- security-framework 3.7.0 (https://github.com/kornelski/rust-security-framework)
 - smallvec 1.16.4 (https://github.com/servo/rust-smallvec)
 - socket2 0.6.5 (https://github.com/rust-lang/socket2)
 - stable_deref_trait 1.2.1 (https://github.com/storyyeller/stable_deref_trait)
@@ -5951,7 +5957,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 Community Data License Agreement Permissive 2.0
 ----------------------------------------------------------------------
 Used by:
-- webpki-roots 1.0.11 (https://github.com/rustls/webpki-roots)
+- webpki-root-certs 1.0.12 (https://github.com/rustls/webpki-roots)
 
 # Community Data License Agreement - Permissive - Version 2.0
 
@@ -6818,6 +6824,20 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
+
+
+MIT License
+----------------------------------------------------------------------
+Used by:
+- schannel 0.1.30 (https://github.com/steffengy/schannel-rs)
+
+Copyright (c) 2015 steffengy
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 
 MIT License

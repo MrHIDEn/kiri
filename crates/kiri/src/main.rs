@@ -1,5 +1,9 @@
 //! The `kiri` command.
 
+// Share's roots, aliased at the crate root so its crate::roots::trusted()
+// resolves; kiri-win mounts the same file by #[path] instead.
+#[cfg(any(unix, windows))]
+use kiri_image::roots;
 use std::process::ExitCode;
 
 #[cfg(target_os = "macos")]
@@ -74,6 +78,10 @@ mod setup;
 mod usb;
 #[cfg(unix)]
 mod stale;
+#[cfg(unix)]
+mod storage_cli;
+#[cfg(target_os = "macos")]
+mod vm_cli;
 #[cfg(any(windows, test))]
 mod wsl;
 #[cfg(any(unix, windows))]
@@ -97,10 +105,11 @@ const USAGE_LINES: &[&str] = &[
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     "       kiri ui [--start] [--view containers|images|volumes|networks|builds]",
     #[cfg(target_os = "macos")]
-    "       kiri setup [--use] [--no-agent] | kiri setup --uninstall",
+    "       kiri setup [--use] [--no-agent] [--no-profiles] | kiri setup --uninstall",
     #[cfg(unix)]
     "       kiri build-with [docker|kiri]   which builder docker build uses",
     "       kiri domains [set [--http N] [--https N] | reset]   the *.kiri.local routers' ports",
+    "       kiri storage [status | reclaim]   storage location, disk usage, and reclaiming VM disk space",
     "       kiri registry [insecure|mirror] [list | add X... | remove X...]   daemon.json's insecure registries and Docker Hub mirrors",
     "       kiri scan [--json] [--history] <image>   known vulnerabilities in an image, found by Grype",
     #[cfg(target_os = "macos")]
@@ -111,9 +120,11 @@ const USAGE_LINES: &[&str] = &[
     "       kiri diag report [--out PATH] [--send]   (a file to send us, tokens taken out)",
     "       kiri PORT [NAME]           share a local port on the internet (same as kiri share PORT)",
     "       kiri share PORT|CONTAINER [--name N] | share login | logout | status",
-    "       kiri k8s start [--use] | stop | status | delete | set [--lan on|off] [--tls-san NAME,…] [--port N]",
+    "       kiri k8s start [--use] | stop | status | delete | set [--lan on|off] [--tls-san NAME,…] [--port N] [--version TAG|default] [--k3s-arg ARG]… [--clear-k3s-args]",
     "       kiri usb [list] | attach DEVICE | detach DEVICE   USB devices for containers, beta (Mac: pass through to the VM)",
     "       kiri machine create NAME [--distro D] | list | shell NAME | stop | delete NAME",
+    #[cfg(target_os = "macos")]
+    "       kiri vm [status | set --shared-nat on|off]   VM networking (off avoids macOS InternetSharing)",
     #[cfg(target_os = "macos")]
     "       kiri import [orbstack | desktop-linux] [--list | [--force] [image|volume|container NAME]]",
     #[cfg(target_os = "macos")]
@@ -170,6 +181,8 @@ enum Command<'a> {
     #[cfg(unix)]
     Domains(&'a [String]),
     #[cfg(unix)]
+    Storage(&'a [String]),
+    #[cfg(unix)]
     Registry(&'a [String]),
     #[cfg(unix)]
     Scan(&'a [String]),
@@ -181,6 +194,8 @@ enum Command<'a> {
     Usb(&'a [String]),
     #[cfg(target_os = "macos")]
     Import(&'a [String]),
+    #[cfg(target_os = "macos")]
+    Vm(&'a [String]),
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     Update(&'a [String]),
     #[cfg(unix)]
@@ -236,6 +251,8 @@ impl<'a> Command<'a> {
             #[cfg(unix)]
             Some("domains") => Some(Command::Domains(&args[1..])),
             #[cfg(unix)]
+            Some("storage") => Some(Command::Storage(&args[1..])),
+            #[cfg(unix)]
             Some("registry") => Some(Command::Registry(&args[1..])),
             #[cfg(unix)]
             Some("scan") => Some(Command::Scan(&args[1..])),
@@ -247,6 +264,8 @@ impl<'a> Command<'a> {
             Some("usb") => Some(Command::Usb(&args[1..])),
             #[cfg(target_os = "macos")]
             Some("import") => Some(Command::Import(&args[1..])),
+            #[cfg(target_os = "macos")]
+            Some("vm") => Some(Command::Vm(&args[1..])),
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             Some("update") if !docker::is_container_update(&args[1..]) => Some(Command::Update(&args[1..])),
             #[cfg(unix)]
@@ -318,6 +337,8 @@ fn main() -> ExitCode {
         #[cfg(unix)]
         Some(Command::Domains(rest)) => domains_cli::run(rest),
         #[cfg(unix)]
+        Some(Command::Storage(rest)) => storage_cli::run(rest),
+        #[cfg(unix)]
         Some(Command::Registry(rest)) => registry_cli::run(rest),
         #[cfg(unix)]
         Some(Command::Scan(rest)) => scan_cli::run(rest),
@@ -329,6 +350,8 @@ fn main() -> ExitCode {
         Some(Command::Usb(rest)) => usb::run(rest),
         #[cfg(target_os = "macos")]
         Some(Command::Import(rest)) => import::run(rest),
+        #[cfg(target_os = "macos")]
+        Some(Command::Vm(rest)) => vm_cli::run(rest),
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         Some(Command::Update(rest)) => update::run(rest),
         #[cfg(unix)]
@@ -474,9 +497,10 @@ mod tests {
     fn usage_lists_only_commands_for_this_os() {
         let help = usage();
         let cmds = advertised_subcommands(&help);
-        for common in ["COMMAND", "start", "domains", "registry", "scan", "diag", "PORT", "share", "k8s", "usb", "machine"] {
+        for common in ["COMMAND", "start", "domains", "storage", "registry", "scan", "diag", "PORT", "share", "k8s", "usb", "machine"] {
             assert!(cmds.contains(&common), "help missing `{common}`:\n{help}");
         }
+        assert!(help.contains("kiri storage [status | reclaim]"), "help missing `kiri storage`:\n{help}");
         #[cfg(unix)]
         {
             for unix_cmd in ["daemon", "ui", "build-with", "update", "raw"] {
@@ -489,9 +513,13 @@ mod tests {
         }
         #[cfg(target_os = "macos")]
         {
-            for mac_cmd in ["setup", "update", "import", "bench", "boot"] {
+            for mac_cmd in ["setup", "update", "vm", "import", "bench", "boot"] {
                 assert!(cmds.contains(&mac_cmd), "macOS help missing `{mac_cmd}`:\n{help}");
             }
+            assert!(
+                help.contains("kiri setup [--use] [--no-agent] [--no-profiles] | kiri setup --uninstall"),
+                "macOS help missing `kiri setup` flags:\n{help}"
+            );
             assert!(help.contains("kiri update [--check]"), "macOS help missing `kiri update [--check]`:\n{help}");
             assert!(!cmds.contains(&"bridge"), "macOS help must not list Linux-only `bridge`:\n{help}");
         }
@@ -501,13 +529,13 @@ mod tests {
             assert!(cmds.contains(&"update"), "Linux help missing `update`:\n{help}");
             assert!(help.contains("kiri update --check"), "Linux help missing `kiri update --check`:\n{help}");
             assert!(!help.contains("kiri update [--check]"), "Linux help must not list macOS `kiri update [--check]`:\n{help}");
-            for mac_cmd in ["setup", "import", "bench", "boot"] {
+            for mac_cmd in ["setup", "vm", "import", "bench", "boot"] {
                 assert!(!cmds.contains(&mac_cmd), "Linux help must not list macOS-only `{mac_cmd}`:\n{help}");
             }
         }
         #[cfg(windows)]
         {
-            for unix_or_mac in ["daemon", "bridge", "ui", "setup", "build-with", "update", "import", "bench", "boot", "raw"] {
+            for unix_or_mac in ["daemon", "bridge", "ui", "setup", "build-with", "update", "vm", "import", "bench", "boot", "raw"] {
                 assert!(!cmds.contains(&unix_or_mac), "Windows help must not list `{unix_or_mac}`:\n{help}");
             }
         }
@@ -574,12 +602,12 @@ mod tests {
         #[cfg(target_os = "macos")]
         assert!(parse(&["bridge"]).is_none());
         #[cfg(target_os = "linux")]
-        for mac_cmd in ["setup", "import", "bench", "boot"] {
+        for mac_cmd in ["setup", "vm", "import", "bench", "boot"] {
             assert!(parse(&[mac_cmd]).is_none(), "`kiri {mac_cmd}` should not dispatch on Linux");
         }
         #[cfg(windows)]
         {
-            for unix_cmd in ["bridge", "ui", "setup", "build-with", "import", "bench", "boot", "raw"] {
+            for unix_cmd in ["bridge", "ui", "setup", "build-with", "vm", "import", "bench", "boot", "raw"] {
                 assert!(parse(&[unix_cmd]).is_none(), "`kiri {unix_cmd}` should not dispatch on Windows");
             }
             let daemon_args = ["daemon".to_owned()];

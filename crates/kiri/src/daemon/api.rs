@@ -165,15 +165,14 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixStrea
         super::storage::refuse_while_moving(w)?;
         return Ok(Next::Close);
     }
-    if let Some(done) = super::ops::route(req, engine, w) {
+    if let Some(done) = super::ops::route(req, engine, caller, w) {
         return done;
     }
     match (m, p) {
         ("GET" | "HEAD", "/_ping") => {
-            // Builder-Version 1: the classic POST /build, which Kiri serves
-            // with its managed BuildKit (builder.rs). "2" would tell older
-            // CLIs and Compose to use BuildKit inside the engine (/session,
-            // /grpc), which Kiri doesn't have.
+            // Builder-Version 1 keeps classic CLIs, older Compose and SDKs
+            // without buildx on POST /build (served by builder.rs), while
+            // buildx probes POST /grpc directly and uses the docker driver.
             http::respond_with(w, 200, "text/plain; charset=utf-8", "Builder-Version: 1\r\n", if m == "HEAD" { b"" } else { b"OK" })?;
             return Ok(Next::KeepAlive);
         }
@@ -191,6 +190,9 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixStrea
         ("GET", "/kiri/proxy") => return reply(w, Ok(super::proxy::report()), 200),
         ("POST", "/kiri/proxy") => return reply(w, set_proxy(req), 200),
         ("PUT", "/kiri/proxy/system") => return reply(w, set_host_proxy(req), 200),
+        // kiri-win's Windows roots, for the engine in WSL (#303).
+        #[cfg(target_os = "linux")]
+        ("PUT", "/kiri/roots/host") => return reply(w, set_host_roots(req, caller), 200),
         // daemon.json's registry keys: Settings → Registries, `kiri registry`.
         ("GET", "/kiri/registries") => return reply(w, Ok(super::daemon_json::report()), 200),
         ("POST", "/kiri/registries") => return reply(w, set_registries(req, engine), 200),
@@ -266,11 +268,14 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixStrea
         ("POST", "/build") => return super::builder::build(req, engine, w, r),
         ("POST", "/build/cancel") => return reply(w, super::builder::cancel(req, engine), 200),
         ("POST", "/build/prune") => return reply(w, super::builder::prune(req, engine), 200),
+        ("POST", "/grpc") => return super::grpc::grpc(req, engine, w, r),
+        ("POST", "/session") => return super::grpc::session(req, engine, w, r),
         // Settings → Storage: where the data is, and moving it (storage.rs).
         ("GET", "/kiri/storage") => return reply(w, Ok(super::storage::report(engine)), 200),
         ("POST", "/kiri/storage/check") => return reply(w, super::storage::check_request(req, engine), 200),
         ("POST", "/kiri/storage") => return reply(w, super::storage::start(req, engine), 202),
         ("POST", "/kiri/storage/reset") => return reply(w, super::storage::start_reset(engine), 202),
+        ("POST", "/kiri/storage/reclaim") => return reply(w, super::storage::reclaim(engine), 200),
         ("DELETE", "/kiri/storage/old") => return reply(w, super::storage::remove_old(engine), 200),
         ("GET", "/kiri/builder") => return reply(w, Ok(super::builder::settings_report(engine)), 200),
         ("POST", "/kiri/builder") => return reply(w, super::builder::set_settings(req).map(|()| super::builder::settings_report(engine)), 200),
@@ -379,7 +384,7 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixStrea
                 super::builder::before_exec(engine, id);
                 return reply(w, exec_create(req, engine, id), 201);
             }
-            ("HEAD" | "GET", "archive") => return archive_get(req, engine, id, w),
+            ("HEAD" | "GET", "archive") => return archive_get(req, engine, id, caller, w),
             ("PUT", "archive") => return archive_put(req, engine, id, w, r),
             ("DELETE", "") => return reply(w, engine.remove(id, req.flag("force"), req.flag("v")).map(|()| Value::Null), 204),
             _ => {}
@@ -555,6 +560,8 @@ fn info(engine: &Engine) -> Value {
         "KiriMemoryStall": engine.memory_trouble().0,
         "KiriOomKills": engine.memory_trouble().1,
         "KiriCpuPercent": engine.cpu_percent(),
+        "KiriStorageReadOnly": engine.storage_readonly(),
+        "KiriStorageZfs": engine.storage_zfs(),
         "Warnings": engine.records_damage().into_iter().chain(engine.image_damage()).chain(engine.host_warnings()).collect::<Vec<_>>(),
     })
 }
@@ -704,7 +711,7 @@ fn image_list_dangling(f: &Filters) -> Result<Option<bool>, Error> {
 }
 
 fn image_inspect(engine: &Engine, name: &str) -> Result<Value, Error> {
-    let i = engine.image(name)?.ok_or_else(|| Error::NotFound(format!("No such image: {name}")))?;
+    let (i, _blob_pins) = engine.image_pinned(name)?.ok_or_else(|| Error::NotFound(format!("No such image: {name}")))?;
     let cfg = image_config_json(engine, &i.config_digest);
     // Docker's RootFS.Layers are the image config's uncompressed diff_ids,
     // not the manifest's compressed blob digests (scanners like Trivy match
@@ -766,7 +773,7 @@ fn image_remove(engine: &Engine, name: &str, force: bool) -> Result<Value, Error
 
 /// `docker tag SOURCE TARGET`: another name for the same image.
 fn image_tag(req: &Request, engine: &Engine, source: &str) -> Result<(), Error> {
-    let i = engine.image(source)?.ok_or_else(|| Error::NotFound(format!("No such image: {source}")))?;
+    let (i, _blob_pins) = engine.image_pinned(source)?.ok_or_else(|| Error::NotFound(format!("No such image: {source}")))?;
     let repo = req.query("repo").unwrap_or_default();
     if repo.is_empty() {
         return Err(Error::BadRequest("repository name must have at least one component".into()));
@@ -920,12 +927,12 @@ fn import(req: &Request, engine: &Engine, stdin: &mut dyn io::Read) -> Result<St
     // An uncompressed layer: its digest is its diff id.
     let mut layer = engine.store.ingest()?;
     io::copy(&mut io::Cursor::new(block).chain(tar), &mut layer).map_err(|e| upload_error(gzip, e))?;
-    let (digest, size) = layer.finish()?;
+    let (digest, size, _layer_pin) = layer.finish_pinned()?;
     cfg["rootfs"]["diff_ids"] = json!([digest]);
     let bytes = serde_json::to_vec(&cfg).map_err(|e| Error::Io(io::Error::other(e)))?;
     let mut w = engine.store.ingest()?;
     io::Write::write_all(&mut w, &bytes)?;
-    let (config_digest, _) = w.finish()?;
+    let (config_digest, _, _config_pin) = w.finish_pinned()?;
     let layers = vec![kiri_image::Layer { digest, size, media_type: "application/vnd.oci.image.layer.v1.tar".into() }];
     let name = name.unwrap_or_else(|| config_digest.clone());
     engine.store.put_image(kiri_image::archive::from_config(name.clone(), &config_digest, &cfg, layers))?;
@@ -965,9 +972,13 @@ fn tar_header(block: &[u8]) -> bool {
 /// `docker save`: the named images as one archive.
 fn image_save(engine: &Engine, names: &[String], w: &mut UnixStream) -> io::Result<Next> {
     let mut images = Vec::new();
+    let mut _lookup_pins = Vec::new();
     for n in names {
-        match engine.image(n) {
-            Ok(Some(i)) => images.push(i),
+        match engine.image_pinned(n) {
+            Ok(Some((i, pins))) => {
+                images.push(i);
+                _lookup_pins.extend(pins);
+            }
             Ok(None) => return reply(w, Err(Error::NotFound(format!("No such image: {n}"))), 200),
             Err(e) => return reply(w, Err(Error::Io(e)), 200),
         }
@@ -1089,6 +1100,22 @@ fn set_host_proxy(req: &Request) -> Result<Value, Error> {
     Ok(super::proxy::report())
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn set_host_roots(req: &Request, caller: &Caller) -> Result<Value, Error> {
+    // Only the Windows host (via kiri-win over the daemon's own socket) may
+    // supply host roots: never a container or an integrated WSL distro (#303).
+    if *caller != Caller::Host {
+        return Err(Error::Forbidden("the Windows roots can only be set from Kiri on Windows".into()));
+    }
+    // Only the engine in WSL takes them: a native Linux daemon has its own
+    // certificate store.
+    if !super::hostroots::in_wsl() {
+        return Err(Error::BadRequest("the Windows roots are for the engine in WSL".into()));
+    }
+    let body: Value = serde_json::from_slice(&req.body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
+    super::hostroots::set(&body).map_err(Error::Io)
+}
+
 fn set_proxy(req: &Request) -> Result<Value, Error> {
     let body: Value = serde_json::from_slice(&req.body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
     let mode = body["mode"].as_str().filter(|m| ["system", "custom", "none"].contains(m)).ok_or_else(|| Error::BadRequest("mode must be system, custom or none".into()))?;
@@ -1164,6 +1191,7 @@ fn set_resources(req: &Request) -> Result<(), Error> {
         e::physical_memory_bytes() >> 20,
         current_disk,
         e::vm_disk_gb_config(),
+        e::vm_shared_nat_config(),
     )
 }
 
@@ -1174,11 +1202,18 @@ fn save_resources(
     max_mem: u64,
     current_disk_gb: Option<u64>,
     existing_disk_gb: Option<u64>,
+    existing_shared_nat: Option<bool>,
 ) -> Result<(), Error> {
     let body: Value = serde_json::from_slice(raw_body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
     let cpus = body["cpus"].as_u64().filter(|c| (1..=max_cpus).contains(c)).ok_or_else(|| Error::BadRequest(format!("cpus must be 1 to {max_cpus}")))?;
     let mem = body["memory_mib"].as_u64().filter(|m| (1024..=max_mem).contains(m)).ok_or_else(|| Error::BadRequest(format!("memory_mib must be 1024 to {max_mem}")))?;
-    let mut out = json!({"cpus": cpus, "memory_mib": mem});
+    let mut out = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    out["cpus"] = json!(cpus);
+    out["memory_mib"] = json!(mem);
     if let Some(val) = body.get("disk_gb").filter(|v| !v.is_null()) {
         let current = current_disk_gb.unwrap_or(crate::guest::disk::DEFAULT_GB);
         let (min_disk, max_disk) = crate::guest::disk::ui_bounds(current, existing_disk_gb.unwrap_or(current));
@@ -1189,6 +1224,12 @@ fn save_resources(
         out["disk_gb"] = json!(disk_gb);
     } else if let Some(prev) = existing_disk_gb {
         out["disk_gb"] = json!(prev);
+    }
+    if let Some(val) = body.get("shared_nat").filter(|v| !v.is_null()) {
+        let shared_nat = val.as_bool().ok_or_else(|| Error::BadRequest("shared_nat must be a boolean".into()))?;
+        out["shared_nat"] = json!(shared_nat);
+    } else if let Some(prev) = existing_shared_nat {
+        out["shared_nat"] = json!(prev);
     }
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(Error::Io)?;
@@ -1338,8 +1379,8 @@ fn auth(req: &Request) -> Result<Value, Error> {
 fn push(req: &Request, engine: &Engine, name: &str, w: &mut UnixStream) -> io::Result<Next> {
     let tag = req.query("tag").unwrap_or_default();
     let full = if tag.is_empty() { name.to_owned() } else { format!("{name}:{tag}") };
-    let (image, target) = match (engine.image(&full), Reference::parse(&full)) {
-        (Ok(Some(i)), Ok(r)) => (i, r),
+    let (image, _blob_pins, target) = match (engine.image_pinned(&full), Reference::parse(&full)) {
+        (Ok(Some((i, pins))), Ok(r)) => (i, pins, r),
         (Ok(None), _) => return reply(w, Err(Error::NotFound(format!("An image does not exist locally with the tag: {full}"))), 200),
         (Err(e), _) => return reply(w, Err(Error::Io(e)), 200),
         (_, Err(e)) => return reply(w, Err(Error::BadRequest(e.to_string())), 200),
@@ -1623,6 +1664,82 @@ fn is_ssh_agent_sock(src: &str) -> bool {
     src.starts_with('/') && lexical_path(src) == SSH_AGENT_SOCK
 }
 
+/// Classification of a container bind mount source that should be backed by
+/// Kiri's SSH agent relay socket instead of a plain filesystem bind.
+#[derive(Debug, PartialEq, Eq)]
+enum SshAgentBind {
+    /// Docker Desktop / OrbStack's virtual `/run/host-services/ssh-auth.sock`.
+    Virtual,
+    /// A macOS host SSH agent Unix socket (virtiofs cannot forward host Unix
+    /// domain sockets into the Linux VM). Holds `Some(canonical_path)` when a
+    /// live, current-UID-owned socket exists on disk; `None` when a well-known
+    /// agent socket path does not exist yet.
+    MacHost(Option<std::path::PathBuf>),
+}
+
+fn ssh_agent_bind_for(src: &str, mac: bool) -> Option<SshAgentBind> {
+    if is_ssh_agent_sock(src) {
+        return Some(SshAgentBind::Virtual);
+    }
+    if !mac || !src.starts_with('/') {
+        return None;
+    }
+    let p = std::path::Path::new(src);
+    match std::fs::symlink_metadata(p) {
+        Ok(_) => {
+            // Resolve symlinks first so a link named `S.gpg-agent.ssh` pointing
+            // to `docker.sock` or another socket is judged by its real target.
+            let canon = std::fs::canonicalize(p).ok()?;
+            if !super::ports::is_owned_unix_socket(&canon) || super::ports::is_kiri_socket_path(&canon) {
+                return None;
+            }
+            if super::ports::is_known_mac_ssh_agent_sock_path(&canon)
+                || super::ports::matches_default_ssh_auth_sock(&canon)
+            {
+                Some(SshAgentBind::MacHost(Some(canon)))
+            } else {
+                None
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Not on disk yet (e.g. gpg-agent not started): still translate
+            // well-known Mac agent socket paths to the guest relay so `-v` does
+            // not create a directory over `S.gpg-agent.ssh`.
+            let clean = std::path::PathBuf::from(lexical_path(src));
+            if !super::ports::is_kiri_socket_path(&clean)
+                && super::ports::is_known_mac_ssh_agent_sock_path(&clean)
+            {
+                Some(SshAgentBind::MacHost(None))
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
+    }
+}
+
+/// Restores a strict host SSH agent bind mount as the preferred upstream on
+/// container start (macOS only), so restarting a container after a daemon
+/// reboot keeps reaching the agent it mounted without allowing container-created
+/// specs to point `serve_ssh_agent` at arbitrary sockets.
+pub(super) fn refresh_ssh_agent_mounts(info: &[Value]) {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    for m in info {
+        if m["Type"] != "bind" {
+            continue;
+        }
+        let Some(src) = m["Source"].as_str() else { continue };
+        if super::binds::engine_socket(src).is_some() {
+            continue;
+        }
+        if let Some(SshAgentBind::MacHost(Some(host_path))) = ssh_agent_bind_for(src, true) {
+            super::ports::set_preferred_ssh_auth_sock_strict(&host_path);
+        }
+    }
+}
+
 /// A container's mounts, worked out at create time.
 struct Mounts {
     /// For the guest: `source\ttarget\tflags`.
@@ -1729,7 +1846,13 @@ fn fresh_bind_sources_with(guest: &[String], info: &[Value], engine_socket: impl
                 return given.map_or_else(|| line.clone(), |given| format!("{given}\t{rest}"));
             }
             let Some(src) = src else { return line.clone() };
-            if !old.strip_prefix(MAC_ROOT).is_some_and(|p| p.starts_with('/')) || engine_socket(src).is_some() {
+            if engine_socket(src).is_some() {
+                return line.clone();
+            }
+            if ssh_agent_bind_for(src, mac).is_some() {
+                return format!("{}\t{rest}", ssh_agent_source_for(!mac));
+            }
+            if !old.strip_prefix(MAC_ROOT).is_some_and(|p| p.starts_with('/')) {
                 return line.clone();
             }
             format!("{}\t{rest}", guest_bind_source(src))
@@ -1903,10 +2026,11 @@ fn volumes_from_mounts(guest: &[String], info: &[Value], ro: bool) -> Vec<(Strin
 /// VOLUME lines.
 #[cfg(test)]
 fn mounts(body: &Value, engine: &Engine, image: &kiri_image::Image) -> Result<Mounts, Error> {
-    mounts_for(body, engine, image, None)
+    mounts_for(body, engine, image, &super::caller::Caller::Host)
 }
 
-fn mounts_for(body: &Value, engine: &Engine, image: &kiri_image::Image, wsl_distro: Option<&str>) -> Result<Mounts, Error> {
+fn mounts_for(body: &Value, engine: &Engine, image: &kiri_image::Image, caller: &super::caller::Caller) -> Result<Mounts, Error> {
+    let wsl_distro = caller.wsl_distro();
     let host = &body["HostConfig"];
     let mut out = Mounts { guest: Vec::new(), info: Vec::new(), volumes: Vec::new(), anon: Vec::new() };
     let check_target = |t: &str| -> Result<(), Error> {
@@ -1941,12 +2065,22 @@ fn mounts_for(body: &Value, engine: &Engine, image: &kiri_image::Image, wsl_dist
         // The engine's own socket (Testcontainers' Ryuk, CI runners): the VM's
         // relay to this daemon on a Mac, or Kiri's socket on a Linux host.
         let engine_sock = if kind == "bind" { super::binds::engine_socket_for_distro(src, wsl_distro) } else { None };
+        let ssh_sock = if kind == "bind" && engine_sock.is_none() {
+            ssh_agent_bind_for(src, cfg!(target_os = "macos"))
+        } else {
+            None
+        };
         match kind {
             "bind" if engine_sock.is_some() => {
                 out.guest.push(format!("{}\t{dst}\t{}", engine_sock.as_deref().unwrap_or_default(), flag("")));
                 out.info.push(json!({"Type": "bind", "Source": src, "Destination": dst, "Mode": "", "RW": !ro, "Propagation": "rprivate"}));
             }
-            "bind" if is_ssh_agent_sock(src) => {
+            "bind" if ssh_sock.is_some() => {
+                if let Some(SshAgentBind::MacHost(Some(ref host_path))) = ssh_sock
+                    && *caller == super::caller::Caller::Host
+                {
+                    super::ports::set_preferred_ssh_auth_sock(host_path);
+                }
                 out.guest.push(format!("{}\t{dst}\t{}", ssh_agent_source(), flag("")));
                 out.info.push(json!({"Type": "bind", "Source": src, "Destination": dst, "Mode": "", "RW": !ro, "Propagation": "rprivate"}));
             }
@@ -2534,14 +2668,15 @@ pub(super) fn limits_from(h: &Value, base: super::engine::Limits) -> Result<supe
     }
     if let Some(q) = h["CpuQuota"].as_i64().filter(|q| *q > 0) {
         l.cpu_quota = q as u64;
-        l.cpu_period = h["CpuPeriod"].as_u64().filter(|p| *p > 0).unwrap_or(100_000) as u32;
+        l.cpu_period = u32::try_from(h["CpuPeriod"].as_u64().filter(|p| *p > 0).unwrap_or(100_000))
+            .map_err(|_| Error::BadRequest("CpuPeriod is too large".into()))?;
     }
     if let Some(shares) = h["CpuShares"].as_u64().filter(|s| *s > 0) {
         l.cpu_shares = shares;
         l.cpu_weight = cpu_weight(shares);
     }
-    if let Some(p) = h["PidsLimit"].as_i64().filter(|p| *p > 0) {
-        l.pids_max = p as u32;
+    if let Some(p) = h["PidsLimit"].as_u64().filter(|p| *p > 0) {
+        l.pids_max = u32::try_from(p).map_err(|_| Error::BadRequest("PidsLimit is too large".into()))?;
     }
     Ok(l)
 }
@@ -2561,20 +2696,22 @@ pub(super) fn restart_policy(v: &Value, creating: bool) -> Result<RestartPolicy,
         };
         return Err(Error::BadRequest(message));
     }
-    let max_retries = v["MaximumRetryCount"].as_i64().unwrap_or(0);
-    if max_retries < 0 {
+    if v["MaximumRetryCount"].as_i64().is_some_and(|n| n < 0) {
         return Err(Error::BadRequest(
             "invalid restart policy: maximum retry count cannot be negative".into(),
         ));
     }
+    let max_retries = v["MaximumRetryCount"].as_u64().unwrap_or(0);
     if max_retries > 0 && name != "on-failure" {
         return Err(Error::BadRequest(
             "invalid restart policy: maximum retry count can only be used with 'on-failure'".into(),
         ));
     }
+    let max_retries = u32::try_from(max_retries)
+        .map_err(|_| Error::BadRequest("invalid restart policy: maximum retry count is too large".into()))?;
     Ok(RestartPolicy {
         name: name.to_owned(),
-        max_retries: max_retries as u32,
+        max_retries,
     })
 }
 
@@ -2588,7 +2725,7 @@ const SECCOMP_UNCONFINED_WARNING: &str =
     "seccomp=unconfined lifts the default syscall filter, but Kiri keeps its host boundary: io_uring and vsock sockets stay blocked";
 
 pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
-    create_for(req, engine, None)
+    create_by(req, engine, &super::caller::Caller::Host)
 }
 
 fn unc_wsl_distro(s: &str) -> Option<String> {
@@ -2656,15 +2793,20 @@ fn created_wsl_distro(caller: &Caller, engine_distro: Option<&str>, labels: &Val
 fn create_by(req: &Request, engine: &Engine, caller: &Caller) -> Result<Value, Error> {
     let body_labels = serde_json::from_slice::<Value>(&req.body).ok().map(|b| b["Labels"].clone()).unwrap_or(Value::Null);
     let record_distro = created_wsl_distro(caller, super::binds::wsl().and_then(|w| w.distro.as_deref()), &body_labels);
-    create_inner(req, engine, caller.wsl_distro(), record_distro)
+    create_inner(req, engine, caller, record_distro)
 }
 
+#[cfg(test)]
 pub(super) fn create_for(req: &Request, engine: &Engine, wsl_distro: Option<&str>) -> Result<Value, Error> {
     let record_distro = wsl_distro.filter(|d| super::binds::valid_distro_name(d)).map(str::to_owned);
-    create_inner(req, engine, wsl_distro, record_distro)
+    let caller = match wsl_distro {
+        Some(d) => Caller::Wsl(d.to_owned()),
+        None => Caller::Host,
+    };
+    create_inner(req, engine, &caller, record_distro)
 }
 
-fn create_inner(req: &Request, engine: &Engine, wsl_distro: Option<&str>, record_wsl_distro: Option<String>) -> Result<Value, Error> {
+fn create_inner(req: &Request, engine: &Engine, caller: &Caller, record_wsl_distro: Option<String>) -> Result<Value, Error> {
     let body: Value = serde_json::from_slice(&req.body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
     let image_name = body["Image"].as_str().unwrap_or_default();
     if image_name.is_empty() {
@@ -2773,7 +2915,7 @@ fn create_inner(req: &Request, engine: &Engine, wsl_distro: Option<&str>, record
         parse_signal(s)?;
     }
 
-    let image = engine.image(image_name)?.ok_or_else(|| Error::NotFound(format!("No such image: {image_name}")))?;
+    let (image, _blob_pins) = engine.image_pinned(image_name)?.ok_or_else(|| Error::NotFound(format!("No such image: {image_name}")))?;
     let _layer_pin = engine.pin_layers(image.layers.iter().map(|l| l.digest.as_str()));
     if let Some(why) = intel_mac_refusal(image_name, std::slice::from_ref(&image.platform)) {
         return Err(Error::BadRequest(why));
@@ -2797,7 +2939,7 @@ fn create_inner(req: &Request, engine: &Engine, wsl_distro: Option<&str>, record
             "can't create 'AutoRemove' container with restart policy".into(),
         ));
     }
-    let mounts = mounts_for(&body, engine, &image, wsl_distro)?;
+    let mounts = mounts_for(&body, engine, &image, caller)?;
     let exposed = exposed_ports(&body, &image_cfg);
     let ports = port_bindings(&body, &exposed)?;
     if !ports.is_empty() && network_mode == "none" {
@@ -3330,6 +3472,7 @@ fn inspect(c: &Container, nets: &[super::network::Network], anon_vols: &[String]
     for key in ["MaskedPaths", "ReadonlyPaths"] {
         v["HostConfig"][key] = super::hostopts::system_paths(&c.spec.host_opts, key, c.spec.privileged);
     }
+    v["HostConfig"]["CgroupnsMode"] = super::hostopts::inspect(&c.spec.host_opts, "CgroupnsMode");
     // Set apart: more keys in the macro above pass its recursion limit.
     v["HostConfig"]["MemorySwap"] = json!(c.spec.limits.memory_swap());
     let mounts = inspect_mounts(&c.spec, |name| anon_vols.iter().any(|a| a == name));
@@ -3592,7 +3735,7 @@ fn forward_stdin(engine: Arc<Engine>, id: String, r: &mut BufReader<UnixStream>)
 /// it closely follows data, though the next read would see the end. For
 /// `docker run -i` that was a process waiting forever for the end of its input,
 /// in 1 to 5 runs in 100. poll is woken for it.
-fn wait_readable(stream: &UnixStream) {
+pub(super) fn wait_readable(stream: &UnixStream) {
     let mut fd = libc::pollfd { fd: stream.as_raw_fd(), events: libc::POLLIN, revents: 0 };
     // SAFETY: one valid pollfd. Any other failure leaves the read to block or to
     // report it, as without this.
@@ -3864,12 +4007,55 @@ fn path_stat_header(e: &kiri_proto::FsEntry<'_>, link: &str) -> String {
     format!("X-Docker-Container-Path-Stat: {}\r\n", kiri_image::b64::encode(stat.to_string().as_bytes()))
 }
 
+const COPY_OUT_CHUNK: usize = 64 * 1024;
+
+pub(super) fn use_paced_copy(caller: &Caller) -> bool {
+    cfg!(target_os = "macos") && *caller == Caller::Container
+}
+
+/// Streams a `COPY_PORT` archive (`OUT` or `EXPORT`) to an HTTP chunked
+/// response. When `paced` is true, sends a 1-byte credit ack before reading
+/// each `<= 64 KiB` chunk and finishes `f` before `http::chunk` writes to `w`,
+/// so `COPY_PORT` never fills its host buffer while `w` blocks on
+/// `ENGINE_API_PORT` (#874).
+pub(super) fn stream_copy_out(f: &mut (impl io::Read + io::Write), w: &mut impl io::Write, paced: bool) -> io::Result<()> {
+    let mut buf = vec![0u8; COPY_OUT_CHUNK];
+    if paced {
+        let mut hdr = [0u8; 4];
+        loop {
+            f.write_all(&[1])?;
+            f.read_exact(&mut hdr)?;
+            let n = u32::from_le_bytes(hdr) as usize;
+            if n == 0 {
+                return Ok(());
+            }
+            if n > COPY_OUT_CHUNK {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, format!("oversized paced copy chunk {n}")));
+            }
+            f.read_exact(&mut buf[..n])?;
+            http::chunk(w, &buf[..n])?;
+        }
+    }
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            return Ok(());
+        }
+        http::chunk(w, &buf[..n])?;
+    }
+}
+
 /// `docker cp` out of a container (GET), or the stat it starts with (HEAD).
-fn archive_get(req: &Request, engine: &Engine, id: &str, w: &mut UnixStream) -> io::Result<Next> {
-    use std::io::Read;
+fn archive_get(req: &Request, engine: &Engine, id: &str, caller: &Caller, w: &mut UnixStream) -> io::Result<Next> {
     let path = req.query("path").unwrap_or("/");
-    let op = if req.method == "HEAD" { kiri_proto::copy_op::STAT } else { kiri_proto::copy_op::OUT };
-    let stream = match engine.copy(id, op, path, 0) {
+    let (op, paced, flags) = if req.method == "HEAD" {
+        (kiri_proto::copy_op::STAT, false, 0)
+    } else {
+        let paced = use_paced_copy(caller);
+        let flags = if paced { kiri_proto::copy_flags::PACED } else { 0 };
+        (kiri_proto::copy_op::OUT, paced, flags)
+    };
+    let stream = match engine.copy(id, op, path, flags) {
         Ok(s) => s,
         Err(e) => return reply(w, Err(e), 200),
     };
@@ -3898,14 +4084,7 @@ fn archive_get(req: &Request, engine: &Engine, id: &str, w: &mut UnixStream) -> 
         return Ok(Next::KeepAlive);
     }
     http::begin_stream_with(w, 200, "application/x-tar", &header)?;
-    let mut buf = vec![0u8; 256 * 1024];
-    loop {
-        let n = f.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        http::chunk(w, &buf[..n])?;
-    }
+    stream_copy_out(&mut f, w, paced)?;
     http::end(w)?;
     drop(stream);
     Ok(Next::KeepAlive)
@@ -4553,7 +4732,7 @@ mod tests {
                 serde_json::to_vec(&body).unwrap(),
             );
             let (mut client, mut server) = UnixStream::pair().unwrap();
-            super::super::ops::route(&req, &engine, &mut server)
+            super::super::ops::route(&req, &engine, &Caller::Host, &mut server)
                 .unwrap()
                 .unwrap();
             drop(server);
@@ -4919,6 +5098,140 @@ mod tests {
         assert_eq!(m.info[1]["RW"], false);
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// On macOS, direct bind mounts of host SSH agent sockets (GnuPG's
+    /// `S.gpg-agent.ssh`, 1Password's `agent.sock`, launchd's `Listeners`) map
+    /// the guest source to `/run/host-services/ssh-auth.sock` while keeping
+    /// inspect's `Source` intact — and never treat Kiri's `docker.sock` or
+    /// symlinks to it as an SSH agent socket (#763).
+    #[test]
+    fn mac_host_ssh_agent_bind_mounts_translate_and_never_match_kiri_socket() {
+        use std::os::unix::net::UnixListener;
+
+        // Well-known Mac SSH agent socket paths match only when mac == true.
+        for path in [
+            "/Users/alice/.gnupg/S.gpg-agent.ssh",
+            "/Users/alice/.1password/agent.sock",
+            "/Users/alice/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock",
+            "/private/tmp/com.apple.launchd.abc123/Listeners",
+            "/var/run/com.apple.launchd.abc123/Listeners",
+        ] {
+            assert!(super::ssh_agent_bind_for(path, true).is_some(), "mac should recognize {path}");
+            assert!(super::ssh_agent_bind_for(path, false).is_none(), "linux must leave {path} alone");
+        }
+
+        // Security: Kiri's socket (synthetic or real) is never recognized as an SSH agent socket.
+        assert!(super::ssh_agent_bind_for("/Users/alice/.kiri/run/docker.sock", true).is_none());
+        assert!(super::ssh_agent_bind_for("/var/run/docker.sock", true).is_none());
+        if let Ok(own) = super::super::socket_path() {
+            assert!(super::ssh_agent_bind_for(&own.to_string_lossy(), true).is_none());
+        }
+
+        // Real filesystem checks: live socket vs regular file vs symlink to docker.sock.
+        let dir = std::env::temp_dir().join(format!("kiri-api-ssh-bind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        std::fs::create_dir_all(dir.join("fake")).unwrap();
+        std::fs::create_dir_all(dir.join("link")).unwrap();
+
+        let live_gpg = dir.join("real/S.gpg-agent.ssh");
+        let _gpg_listener = UnixListener::bind(&live_gpg).unwrap();
+        let live_gpg_str = live_gpg.to_str().unwrap();
+        assert_eq!(
+            super::ssh_agent_bind_for(live_gpg_str, true),
+            Some(super::SshAgentBind::MacHost(Some(std::fs::canonicalize(&live_gpg).unwrap())))
+        );
+        assert_eq!(super::ssh_agent_bind_for(live_gpg_str, false), None);
+
+        // Regular file with the same name is not intercepted.
+        let regular_file = dir.join("fake/S.gpg-agent.ssh");
+        std::fs::write(&regular_file, b"plain file").unwrap();
+        assert_eq!(super::ssh_agent_bind_for(regular_file.to_str().unwrap(), true), None);
+
+        // Symlink named S.gpg-agent.ssh pointing to docker.sock is rejected after canonicalize.
+        let docker_sock = dir.join("docker.sock");
+        let _docker_listener = UnixListener::bind(&docker_sock).unwrap();
+        let evil_link = dir.join("link/S.gpg-agent.ssh");
+        std::os::unix::fs::symlink(&docker_sock, &evil_link).unwrap();
+        assert_eq!(super::ssh_agent_bind_for(evil_link.to_str().unwrap(), true), None);
+
+        // fresh_bind_sources_with on macOS preserves /run/host-services/ssh-auth.sock on
+        // restart and upgrades legacy /mnt/mac/.../S.gpg-agent.ssh mounts while keeping
+        // engine socket binds untouched.
+        let gpg_info = vec![
+            json!({"Type": "bind", "Source": "/Users/alice/.gnupg/S.gpg-agent.ssh"}),
+            json!({"Type": "bind", "Source": "/Users/alice/.kiri/run/docker.sock"}),
+        ];
+        let restarted = vec![
+            "/run/host-services/ssh-auth.sock\t/ssh-agent\t".to_owned(),
+            "/run/host-services/docker.sock\t/var/run/docker.sock\t".to_owned(),
+        ];
+        let legacy = vec![
+            "/mnt/mac/Users/alice/.gnupg/S.gpg-agent.ssh\t/ssh-agent\tro".to_owned(),
+            "/run/host-services/docker.sock\t/var/run/docker.sock\t".to_owned(),
+        ];
+        let sock = |s: &str| (s == "/Users/alice/.kiri/run/docker.sock").then(|| "/run/host-services/docker.sock".to_owned());
+        assert_eq!(super::fresh_bind_sources_with(&restarted, &gpg_info, sock, true), restarted);
+        assert_eq!(
+            super::fresh_bind_sources_with(&legacy, &gpg_info, sock, true),
+            [
+                "/run/host-services/ssh-auth.sock\t/ssh-agent\tro",
+                "/run/host-services/docker.sock\t/var/run/docker.sock\t",
+            ]
+        );
+
+        #[cfg(target_os = "macos")]
+        {
+            let _guard = super::super::ports::PREFERRED_SSH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            super::super::ports::clear_preferred_ssh_auth_sock();
+
+            let (root, engine) = engine_in("mac-gpg-ssh-mounts", false);
+            let image = test_image("ssh:1");
+            let own_sock = super::super::socket_path().unwrap().to_string_lossy().into_owned();
+            let body = json!({
+                "HostConfig": {
+                    "Binds": [
+                        "/Users/alice/.gnupg/S.gpg-agent.ssh:/ssh-agent",
+                        format!("{live_gpg_str}:/live-gpg.sock:ro"),
+                        format!("{own_sock}:/not-ssh"),
+                    ],
+                    "Mounts": [
+                        {"Type": "bind", "Source": "/Users/alice/.1password/agent.sock", "Target": "/op.sock", "ReadOnly": true},
+                    ],
+                }
+            });
+            // Container caller must never mutate the daemon's preferred SSH agent socket.
+            let m_container = super::mounts_for(&body, &engine, &image, &super::super::caller::Caller::Container).unwrap();
+            assert!(super::super::ports::current_preferred_ssh_auth_sock().is_none(), "Caller::Container must not set preferred SSH socket");
+            assert_eq!(
+                m_container.guest,
+                [
+                    "/run/host-services/ssh-auth.sock\t/ssh-agent\t",
+                    "/run/host-services/ssh-auth.sock\t/live-gpg.sock\tro",
+                    "/run/host-services/docker.sock\t/not-ssh\t",
+                    "/run/host-services/ssh-auth.sock\t/op.sock\tro",
+                ]
+            );
+            assert_eq!(m_container.info[0]["Source"], "/Users/alice/.gnupg/S.gpg-agent.ssh");
+            assert_eq!(m_container.info[1]["Source"], live_gpg_str);
+            assert_eq!(m_container.info[2]["Source"], own_sock);
+            assert_eq!(m_container.info[3]["Source"], "/Users/alice/.1password/agent.sock");
+
+            // Host caller records the live GPG socket as preferred while keeping inspect intact.
+            let m_host = super::mounts_for(&body, &engine, &image, &super::super::caller::Caller::Host).unwrap();
+            assert_eq!(m_host.guest, m_container.guest);
+            assert_eq!(
+                super::super::ports::current_preferred_ssh_auth_sock(),
+                Some(std::fs::canonicalize(&live_gpg).unwrap())
+            );
+
+            super::super::ports::clear_preferred_ssh_auth_sock();
+            drop(engine);
+            let _ = std::fs::remove_dir_all(root);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `--pid`: empty and `host` as given, `container:<name>` kept with the
@@ -5377,7 +5690,7 @@ mod tests {
         };
         let mut routes = kiri_routes(body_of(include_str!("api.rs"), "\nfn route("));
         routes.extend(kiri_routes(body_of(include_str!("ops.rs"), "\npub fn route(")));
-        for known in [("POST", "/kiri/stop"), ("POST", "/kiri/sleep"), ("POST", "/kiri/registries"), ("PUT", "/kiri/proxy/system"), ("POST", "/kiri/builder"), ("POST", "/kiri/containers/1/ports"), ("POST", "/kiri/containers/1/upper"), ("DELETE", "/kiri/k8s/forward/1"), ("GET", "/kiri/watch-roots"), ("POST", "/kiri/fs-events")] {
+        for known in [("POST", "/kiri/stop"), ("POST", "/kiri/sleep"), ("POST", "/kiri/registries"), ("PUT", "/kiri/proxy/system"), ("PUT", "/kiri/roots/host"), ("POST", "/kiri/builder"), ("POST", "/kiri/containers/1/ports"), ("POST", "/kiri/containers/1/upper"), ("DELETE", "/kiri/k8s/forward/1"), ("GET", "/kiri/watch-roots"), ("POST", "/kiri/fs-events")] {
             assert!(routes.iter().any(|(m, p)| (m.as_str(), p.as_str()) == known), "{known:?} not found in route(): {routes:?}");
         }
         for (m, p) in &routes {
@@ -5449,7 +5762,7 @@ mod tests {
     fn a_containers_stop_and_settings_are_refused() {
         use std::io::{Read, Write};
         let (root, engine) = engine_in("container-gate", false);
-        for req in ["POST /v1.47/kiri/stop", "POST /kiri/sleep", "POST /kiri/registries", "POST /kiri/proxy", "POST /kiri/resources", "POST /kiri/domains", "DELETE /kiri/domains", "POST /kiri/fs-events"] {
+        for req in ["POST /v1.47/kiri/stop", "POST /kiri/sleep", "POST /kiri/registries", "POST /kiri/proxy", "PUT /kiri/roots/host", "POST /kiri/resources", "POST /kiri/domains", "DELETE /kiri/domains", "POST /kiri/fs-events"] {
             let (mut client, server) = UnixStream::pair().unwrap();
             let served = std::thread::spawn({
                 let engine = engine.clone();
@@ -5488,6 +5801,40 @@ mod tests {
         assert!(got.starts_with("HTTP/1.1 200 "), "{got}");
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `PUT /kiri/roots/host` accepts only `Caller::Host` (kiri-win): neither a
+    /// container nor an integrated WSL distro may inject root CAs (#303).
+    #[test]
+    fn host_roots_endpoint_requires_host_caller() {
+        let req = Request::internal("PUT", "/kiri/roots/host", &[], br#"{"certs":["3001"],"distrusted":[]}"#.to_vec());
+        assert!(matches!(set_host_roots(&req, &Caller::Container), Err(Error::Forbidden(_))));
+        assert!(matches!(set_host_roots(&req, &Caller::Wsl("Ubuntu".into())), Err(Error::Forbidden(_))));
+        if !crate::daemon::hostroots::in_wsl() {
+            assert!(matches!(set_host_roots(&req, &Caller::Host), Err(Error::BadRequest(_))));
+        }
+
+        // Over the live HTTP handler: a WSL distro receives 403 on Linux.
+        #[cfg(target_os = "linux")]
+        {
+            use std::io::{Read, Write};
+            let (root, engine) = engine_in("wsl-host-roots-gate", false);
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let served = std::thread::spawn({
+                let engine = engine.clone();
+                move || serve(server, engine, Caller::Wsl("Ubuntu".into()))
+            });
+            let body = r#"{"certs":["3001"],"distrusted":[]}"#;
+            client
+                .write_all(format!("PUT /kiri/roots/host HTTP/1.1\r\nHost: d\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes())
+                .unwrap();
+            let mut got = String::new();
+            client.read_to_string(&mut got).unwrap();
+            served.join().unwrap().unwrap();
+            assert!(got.starts_with("HTTP/1.1 403 "), "{got}");
+            drop(engine);
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
     /// `POST /kiri/registries` refreshes synchronously on the request thread
@@ -6478,6 +6825,25 @@ mod network_option_tests {
         }
         let l = super::limits_from(&json!({"CpuShares": 1024}), Default::default()).unwrap();
         assert_eq!((l.cpu_shares, l.cpu_weight), (1024, 100));
+        // Limits above `u32::MAX` were silently truncated (`as u32`); they are
+        // a 400 now, while legal values and `0`/`-1` sentinels stay intact.
+        let big = (u32::MAX as u64) + 1;
+        assert!(matches!(limits_from(&json!({"CpuQuota": 100_000, "CpuPeriod": big}), Default::default()), Err(Error::BadRequest(_))));
+        assert!(matches!(limits_from(&json!({"CpuQuota": 100_000, "CpuPeriod": u64::MAX}), Default::default()), Err(Error::BadRequest(_))));
+        assert_eq!(limits_from(&json!({"CpuQuota": 100_000, "CpuPeriod": 50_000}), Default::default()).unwrap().cpu_period, 50_000);
+        assert_eq!(limits_from(&json!({"CpuQuota": 100_000, "CpuPeriod": 0}), Default::default()).unwrap().cpu_period, 100_000);
+        assert_eq!(limits_from(&json!({"CpuQuota": 100_000, "CpuPeriod": -1}), Default::default()).unwrap().cpu_period, 100_000);
+        assert!(matches!(limits_from(&json!({"PidsLimit": big}), Default::default()), Err(Error::BadRequest(_))));
+        assert!(matches!(limits_from(&json!({"PidsLimit": u64::MAX}), Default::default()), Err(Error::BadRequest(_))));
+        let pids_set = limits_from(&json!({"PidsLimit": 256}), Default::default()).unwrap();
+        assert_eq!(pids_set.pids_max, 256);
+        assert_eq!(limits_from(&json!({"PidsLimit": 0}), Default::default()).unwrap().pids_max, 0);
+        assert_eq!(limits_from(&json!({"PidsLimit": -1}), Default::default()).unwrap().pids_max, 0);
+        assert_eq!(limits_from(&json!({"PidsLimit": 0}), pids_set).unwrap().pids_max, 256);
+        assert_eq!(limits_from(&json!({"PidsLimit": -1}), pids_set).unwrap().pids_max, 256);
+        assert!(matches!(restart_policy(&json!({"Name": "on-failure", "MaximumRetryCount": big}), true), Err(Error::BadRequest(_))));
+        assert!(matches!(restart_policy(&json!({"Name": "on-failure", "MaximumRetryCount": u64::MAX}), false), Err(Error::BadRequest(_))));
+        assert_eq!(restart_policy(&json!({"Name": "on-failure", "MaximumRetryCount": 5}), true).unwrap().max_retries, 5);
         // Rises with the shares, never backwards.
         let mut last = 0;
         for s in 2..5000 {
@@ -6737,6 +7103,52 @@ mod network_option_tests {
         let (status, message) = create(json!({}), "demo:nosuch");
         assert_eq!(status, 404);
         assert!(message.starts_with("No such image: demo:nosuch"));
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cgroupns_mode_is_kept_in_inspect_and_bad_modes_are_refused() {
+        let dir = std::env::temp_dir().join(format!("kiri-cgroupns-api-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = super::super::engine::boot_without_vm(&dir);
+        let cfg = json!({"created": "2026-11-23T00:00:00Z", "architecture": "arm64", "os": "linux", "config": {"Cmd": ["true"]}});
+        let mut w = engine.store.ingest().unwrap();
+        io::Write::write_all(&mut w, &serde_json::to_vec(&cfg).unwrap()).unwrap();
+        let (digest, _) = w.finish().unwrap();
+        engine.store.put_image(kiri_image::archive::from_config("demo:local".into(), &digest, &cfg, Vec::new())).unwrap();
+
+        let make = |host: Value| {
+            let body = json!({"Image": "demo:local", "HostConfig": host});
+            super::create(&Request::internal("POST", "/containers/create", &[], serde_json::to_vec(&body).unwrap()), &engine)
+        };
+        let default_id = make(json!({})).unwrap()["Id"].as_str().unwrap().to_owned();
+        assert_eq!(super::container_inspect(&engine, &default_id).unwrap()["HostConfig"]["CgroupnsMode"], "private");
+        let null_id = make(json!({"CgroupnsMode": Value::Null})).unwrap()["Id"].as_str().unwrap().to_owned();
+        assert_eq!(super::container_inspect(&engine, &null_id).unwrap()["HostConfig"]["CgroupnsMode"], "private");
+        let empty_id = make(json!({"CgroupnsMode": ""})).unwrap()["Id"].as_str().unwrap().to_owned();
+        assert_eq!(super::container_inspect(&engine, &empty_id).unwrap()["HostConfig"]["CgroupnsMode"], "private");
+        let priv_id = make(json!({"CgroupnsMode": "private"})).unwrap()["Id"].as_str().unwrap().to_owned();
+        assert_eq!(super::container_inspect(&engine, &priv_id).unwrap()["HostConfig"]["CgroupnsMode"], "private");
+        let host_id = make(json!({"CgroupnsMode": "host"})).unwrap()["Id"].as_str().unwrap().to_owned();
+        let host_inspected = super::container_inspect(&engine, &host_id).unwrap();
+        assert_eq!(host_inspected["HostConfig"]["CgroupnsMode"], "host");
+        // Recreating from inspect keeps CgroupnsMode persisted.
+        let mut recreate = host_inspected["Config"].clone();
+        recreate["HostConfig"] = host_inspected["HostConfig"].clone();
+        let host_id2 = super::create(&Request::internal("POST", "/containers/create", &[], serde_json::to_vec(&recreate).unwrap()), &engine).unwrap()["Id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(super::container_inspect(&engine, &host_id2).unwrap()["HostConfig"]["CgroupnsMode"], "host");
+        for bad in [json!("bogus"), json!("container:abc"), json!(123)] {
+            let want = match &bad {
+                Value::String(s) => format!("invalid cgroup namespace mode: {s}"),
+                other => format!("invalid cgroup namespace mode: {other}"),
+            };
+            assert_eq!(super::status_of(make(json!({"CgroupnsMode": bad})).unwrap_err()), (400, want));
+        }
         drop(engine);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7419,19 +7831,46 @@ mod resources_disk_tests {
 
         // Save CPUs, memory and disk_gb; verify vm.json contents.
         let body = json!({"cpus": 4, "memory_mib": 8192, "disk_gb": 128}).to_string();
-        save_resources(body.as_bytes(), &path, 12, 32768, Some(64), None).unwrap();
+        save_resources(body.as_bytes(), &path, 12, 32768, Some(64), None, None).unwrap();
         let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(saved, json!({"cpus": 4, "memory_mib": 8192, "disk_gb": 128}));
 
-        // Omitting disk_gb preserves the existing disk_gb in vm.json.
+        // Omitting disk_gb preserves the existing disk_gb in vm.json, and omitting
+        // shared_nat preserves an existing shared_nat flag in vm.json.
         let body2 = json!({"cpus": 6, "memory_mib": 4096}).to_string();
-        save_resources(body2.as_bytes(), &path, 12, 32768, Some(64), saved["disk_gb"].as_u64()).unwrap();
+        save_resources(body2.as_bytes(), &path, 12, 32768, Some(64), saved["disk_gb"].as_u64(), Some(false)).unwrap();
         let saved2: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(saved2, json!({"cpus": 6, "memory_mib": 4096, "disk_gb": 128}));
+        assert_eq!(saved2, json!({"cpus": 6, "memory_mib": 4096, "disk_gb": 128, "shared_nat": false}));
+
+        // Explicitly updating shared_nat works and non-boolean values are rejected with 400.
+        let body3 = json!({"cpus": 6, "memory_mib": 4096, "shared_nat": true}).to_string();
+        save_resources(body3.as_bytes(), &path, 12, 32768, Some(64), Some(128), Some(false)).unwrap();
+        let saved3: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved3, json!({"cpus": 6, "memory_mib": 4096, "disk_gb": 128, "shared_nat": true}));
+
+        // Existing balloon / memory_min_mib fields in vm.json survive save_resources updates.
+        std::fs::write(
+            &path,
+            json!({"cpus": 6, "memory_mib": 4096, "disk_gb": 128, "shared_nat": true, "balloon": false, "memory_min_mib": 2048}).to_string(),
+        )
+        .unwrap();
+        let body4 = json!({"cpus": 8, "memory_mib": 8192}).to_string();
+        save_resources(body4.as_bytes(), &path, 12, 32768, Some(64), Some(128), Some(true)).unwrap();
+        let saved4: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved4,
+            json!({"cpus": 8, "memory_mib": 8192, "disk_gb": 128, "shared_nat": true, "balloon": false, "memory_min_mib": 2048})
+        );
+
+        let bad_nat = json!({"cpus": 4, "memory_mib": 8192, "shared_nat": "off"}).to_string();
+        match save_resources(bad_nat.as_bytes(), &path, 12, 32768, Some(64), None, None) {
+            Err(Error::BadRequest(msg)) => assert!(msg.contains("shared_nat must be a boolean"), "{msg}"),
+            other => panic!("expected BadRequest for non-bool shared_nat, got {other:?}"),
+        }
 
         // Shrinking below current data.img size (128 GiB) is rejected with 400.
         let shrink = json!({"cpus": 4, "memory_mib": 8192, "disk_gb": 96}).to_string();
-        match save_resources(shrink.as_bytes(), &path, 12, 32768, Some(128), Some(128)) {
+        match save_resources(shrink.as_bytes(), &path, 12, 32768, Some(128), Some(128), None) {
             Err(Error::BadRequest(msg)) => assert!(msg.contains("disk_gb must be 128 to 1024"), "{msg}"),
             other => panic!("expected BadRequest for shrink, got {other:?}"),
         }
@@ -7439,7 +7878,7 @@ mod resources_disk_tests {
         // Below 64 GiB template floor, zero, negative, and oversized values are rejected.
         for bad in [json!(0), json!(32), json!(-1), json!(2048), json!("128")] {
             let raw = json!({"cpus": 4, "memory_mib": 8192, "disk_gb": bad}).to_string();
-            match save_resources(raw.as_bytes(), &path, 12, 32768, Some(64), None) {
+            match save_resources(raw.as_bytes(), &path, 12, 32768, Some(64), None, None) {
                 Err(Error::BadRequest(msg)) => assert!(msg.contains("disk_gb must be"), "{msg}"),
                 other => panic!("expected BadRequest for {bad}, got {other:?}"),
             }
@@ -7557,5 +7996,71 @@ mod resources_disk_tests {
         assert!(by_name("plain-host").get("KiriWslDistro").is_none());
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stream_copy_out_paces_chunks_and_rejects_oversized_frames() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        let (mut host_copy, mut guest_copy) = UnixStream::pair().unwrap();
+        let (mut api_client, mut api_server) = UnixStream::pair().unwrap();
+        let payload: Vec<u8> = (0..(150 * 1024)).map(|i| (i % 251) as u8).collect();
+        let expected = payload.clone();
+
+        let guest = std::thread::spawn(move || {
+            for chunk in payload.chunks(COPY_OUT_CHUNK) {
+                let mut ack = [0u8; 1];
+                guest_copy.read_exact(&mut ack).unwrap();
+                assert_eq!(ack[0], 1);
+                guest_copy.write_all(&(chunk.len() as u32).to_le_bytes()).unwrap();
+                guest_copy.write_all(chunk).unwrap();
+            }
+            let mut ack = [0u8; 1];
+            guest_copy.read_exact(&mut ack).unwrap();
+            guest_copy.write_all(&0u32.to_le_bytes()).unwrap();
+        });
+
+        let server = std::thread::spawn(move || {
+            super::stream_copy_out(&mut host_copy, &mut api_server, true).unwrap();
+            http::end(&mut api_server).unwrap();
+        });
+
+        let mut raw = Vec::new();
+        api_client.read_to_end(&mut raw).unwrap();
+        guest.join().unwrap();
+        server.join().unwrap();
+
+        // Decode HTTP chunked response body and verify exact payload.
+        let mut decoded = Vec::new();
+        let mut pos = 0;
+        loop {
+            let line_end = raw[pos..].windows(2).position(|w| w == b"\r\n").unwrap() + pos;
+            let len_str = std::str::from_utf8(&raw[pos..line_end]).unwrap();
+            let len = usize::from_str_radix(len_str, 16).unwrap();
+            pos = line_end + 2;
+            if len == 0 {
+                assert_eq!(&raw[pos..], b"\r\n");
+                break;
+            }
+            assert!(len <= COPY_OUT_CHUNK);
+            decoded.extend_from_slice(&raw[pos..pos + len]);
+            pos += len;
+            assert_eq!(&raw[pos..pos + 2], b"\r\n");
+            pos += 2;
+        }
+        assert_eq!(decoded, expected);
+
+        // Oversized paced chunk header (or BE Msg::Error frame) is rejected cleanly.
+        let (mut host_bad, mut guest_bad) = UnixStream::pair().unwrap();
+        let mut sink = Vec::new();
+        let bad_guest = std::thread::spawn(move || {
+            let mut ack = [0u8; 1];
+            guest_bad.read_exact(&mut ack).unwrap();
+            guest_bad.write_all(&((COPY_OUT_CHUNK as u32) + 1).to_le_bytes()).unwrap();
+        });
+        let err = super::stream_copy_out(&mut host_bad, &mut sink, true).unwrap_err();
+        bad_guest.join().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

@@ -464,6 +464,23 @@ t pid-container-stopped "cannot join PID of a non running container" bash -c "$D
 # missing image and pulls for: the output is shown only when no pull was.
 t pid-container-unknown "No such container: pid-nosuch" bash -c "o=\$($D run --rm --pid container:pid-nosuch busybox:1.37 true 2>&1); grep -q 'Unable to find image' <<<\"\$o\" || echo \"\$o\""
 $D rm -f pid-a pid-b pid-h >/dev/null 2>&1
+# `--cgroupns`: `private` (the default) unshares a cgroup namespace rooted at
+# the container's cgroup (`0::/`); `host` shares the VM's (or Linux host's)
+# cgroup namespace (`0::/.../<id>`), keeps `/sys/fs/cgroup` and any cgroup
+# submounts (including parent binds like `-v /sys:/hostsys`) read-only for an
+# unprivileged container, and lets a privileged init such as systemd manage
+# sub-cgroups with `-v /sys/fs/cgroup:/sys/fs/cgroup` (#413).
+$D rm -f cgns-d cgns-p cgns-h cgns-sd >/dev/null 2>&1
+$D create --name cgns-d alpine true >/dev/null
+$D create --name cgns-p --cgroupns private alpine true >/dev/null
+$D create --name cgns-h --cgroupns host alpine true >/dev/null
+t cgroupns-mode-inspect "private private host" $D inspect -f '{{.HostConfig.CgroupnsMode}}' cgns-d cgns-p cgns-h
+$D rm -f cgns-d cgns-p cgns-h >/dev/null 2>&1
+t cgroupns-mode-invalid "invalid cgroup namespace mode: bogus" curl -s --unix-socket "$SOCK" -H 'Content-Type: application/json' -d '{"Image":"alpine","Cmd":["true"],"HostConfig":{"CgroupnsMode":"bogus"}}' http://d/v1.47/containers/create
+t cgroupns-private-default "0::/" $D run --rm alpine cat /proc/1/cgroup
+t cgroupns-host-view "host-ok" bash -c "a=\$($D run --rm --cgroupns host alpine sh -c 'printf \"%s %s\" \"\$(readlink /proc/1/ns/cgroup)\" \"\$(cat /proc/1/cgroup)\"'); b=\$($D run --rm --cgroupns host alpine readlink /proc/1/ns/cgroup); p=\$($D run --rm --cgroupns private alpine readlink /proc/1/ns/cgroup); ns=\${a%% *}; cg=\${a#* }; [ -n \"\$ns\" ] && [ \"\$ns\" = \"\$b\" ] && [ \"\$ns\" != \"\$p\" ] && [ \"\$cg\" != '0::/' ] && case \"\$cg\" in 0::/*) echo host-ok ;; *) echo \"bad:\$a\" ;; esac || echo \"ns=\$a b=\$b p=\$p\""
+t cgroupns-host-unpriv-ro "ro1 ro2 ro3 ro4 67108864" $D run --rm --memory 64m --cgroupns host -v /sys/fs/cgroup:/sys/fs/cgroup -v /sys/fs/cgroup:/mnt -v /sys:/hostsys -v /sys/fs/./cgroup:/mnt2 alpine sh -c 'cg=$(sed -n "s/^0:://p" /proc/1/cgroup); probe() { [ -d "$1/unified" ] && d="$1/unified" || d="$1"; (echo max > "$d${cg%/}/memory.max") 2>/dev/null || (mkdir "$d/roprobe" 2>/dev/null && rmdir "$d/roprobe" 2>/dev/null); }; probe /sys/fs/cgroup && r1=rw || r1=ro1; probe /mnt && r2=rw || r2=ro2; probe /hostsys/fs/cgroup && r3=rw || r3=ro3; probe /mnt2 && r4=rw || r4=ro4; echo "$r1 $r2 $r3 $r4 $(cat /sys/fs/cgroup${cg%/}/memory.max)"'
+t cgroupns-host-systemd-bind "host=init.scope:exec-ok ro=ro subro=ro priv=0::/init.scope" bash -c "id=\$($D run -d --name cgns-sd --privileged --cgroupns host -v /sys/fs/cgroup:/sys/fs/cgroup --tmpfs /run --tmpfs /run/lock --security-opt label=disable --stop-signal SIGRTMIN+3 alpine sh -c 'cg=/sys/fs/cgroup\$(sed -n \"s/^0:://p\" /proc/1/cgroup); mkdir -p \"\$cg/init.scope\" && echo 1 > \"\$cg/init.scope/cgroup.procs\" && echo +pids > \"\$cg/cgroup.subtree_control\" && sleep 60'); for _ in \$(seq 30); do $D exec cgns-sd cat /proc/1/cgroup 2>/dev/null | grep -q '/init.scope\$' && break; sleep 0.1; done; c1=\$($D exec cgns-sd cat /proc/1/cgroup 2>/dev/null); ce=\$($D exec cgns-sd cat /proc/self/cgroup 2>/dev/null); $D rm -f cgns-sd >/dev/null 2>&1; [ \"\${c1##*/}\" = init.scope ] && [ \"\$c1\" = \"\$ce\" ] && h=init.scope:exec-ok || h=\"c1=\$c1:ce=\$ce\"; ro=\$($D run --rm --privileged --cgroupns host -v /sys/fs/cgroup:/sys/fs/cgroup:ro alpine sh -c 'cg=/sys/fs/cgroup\$(sed -n \"s/^0:://p\" /proc/1/cgroup); mkdir \"\$cg/roprobe\" 2>/dev/null && echo rw || echo ro'); subro=\$($D run --rm --privileged --cgroupns host -v /sys:/hostsys:ro alpine sh -c 'cg=/hostsys/fs/cgroup\$(sed -n \"s/^0:://p\" /proc/1/cgroup); [ -d /hostsys/fs/cgroup/unified ] && cg=/hostsys/fs/cgroup/unified\$(sed -n \"s/^0:://p\" /proc/1/cgroup); mkdir \"\$cg/roprobe\" 2>/dev/null && echo rw || echo ro'); pv=\$($D run --rm --privileged -v /sys/fs/cgroup:/sys/fs/cgroup alpine sh -c 'mkdir -p /sys/fs/cgroup/init.scope && echo 1 > /sys/fs/cgroup/init.scope/cgroup.procs && cat /proc/1/cgroup'); echo \"host=\$h ro=\$ro subro=\$subro priv=\$pv\""
 t python "3.13" $D run --rm python:3.13-alpine python -c 'import sys;print(sys.version)'
 t node "v22" $D run --rm node:22-alpine node -v
 t debian-image "Valkey server" $D run --rm valkey/valkey valkey-server --version
@@ -1083,10 +1100,35 @@ only mac t bind-nonroot-parallel "ok" bash -c "mkdir -p $BIND/nr/sticky && chmod
 # A read-only 0444 file on a macOS bind mount still denies non-root writes,
 # even inside an unprivileged user namespace (unshare -Ur, #796).
 only mac t bind-nonroot-ro "ro-ok userns-ok" bash -c "mkdir -p $BIND/ro && printf 'secret\n' > $BIND/ro/f && chmod 0444 $BIND/ro/f && out=\$($D run --rm --user 501:20 --security-opt seccomp=unconfined -v $BIND/ro:/w alpine sh -c 'r=\$(cat /w/f); st=\$(stat -c \"%u:%g %a\" /w/f); w=\$( (echo bad > /w/f) 2>&1 || true ); c=\$( (chown 0:0 /w/f) 2>&1 || true ); u=\$(unshare -Ur sh -c \"(echo bad > /w/f) 2>&1 || true\"); [ \"\$r\" = secret ] && [ \"\$st\" = \"501:20 444\" ] && case \"\$w\" in *\"Permission denied\"*) ;; *) echo \"write:\$w\"; exit 1 ;; esac && case \"\$c\" in *\"Operation not permitted\"*) ;; *) echo \"chown:\$c\"; exit 1 ;; esac && printf \"ro-ok \" && case \"\$u\" in *\"Permission denied\"*) echo userns-ok ;; *) echo \"userns:\$u\" ;; esac'); chmod 0644 $BIND/ro/f && [ \"\$(cat $BIND/ro/f)\" = secret ] && rm -rf $BIND/ro && echo \"\$out\""
+# Explicit chown on a macOS bind mount persists in the guest inode across stat,
+# chmod and owner/group/other permission checks, while host edits remain
+# immediately visible across close-to-open page caching (#382, #415).
+only mac t bind-chown-chmod "chown-ok edit-ok" bash -c "mkdir -p $BIND/ch && printf 'v1\n' > $BIND/ch/c && out=\$($D run --rm -v $BIND/ch:/w alpine sh -euc 'adduser -D -u 10001 probe; adduser -D -u 10002 other; echo hi > /w/f; chown 10001:10001 /w/f; [ \"\$(stat -c %u:%g /w/f)\" = 10001:10001 ]; su probe -c \"chmod 600 /w/f\"; [ \"\$(su probe -c \"cat /w/f\")\" = hi ]; su other -c \"cat /w/f\" 2>/dev/null && exit 1 || true; echo sec > /w/g; chmod 640 /w/g; chown 10001 /w/g; [ \"\$(su other -c \"stat -c %u:%g /w/g\")\" = 10001:0 ]; su other -c \"cat /w/g\" 2>/dev/null && exit 1 || true; printf \"chown-ok \"') && cid=\$($D run -d -v $BIND/ch:/w alpine sleep 60) && [ \"\$($D exec \$cid cat /w/c)\" = v1 ] && printf 'v2\n' > $BIND/ch/c && sleep 0.3 && [ \"\$($D exec \$cid cat /w/c)\" = v2 ] && $D rm -f \$cid >/dev/null && rm -rf $BIND/ch && echo \"\${out}edit-ok\""
 # Docker Desktop's SSH agent mount path (/run/host-services/ssh-auth.sock) works
 # through -v and --mount for non-root container users too, while inspect shows
 # the path asked for (#420).
 t host-services-ssh-agent-mount "sock1=ok sock2=ok src=/run/host-services/ssh-auth.sock" bash -c "id=\$($D create -u 1000:1000 -v /run/host-services/ssh-auth.sock:/run/host-services/ssh-auth.sock --mount type=bind,source=/run/host-services/ssh-auth.sock,target=/ssh2.sock alpine sh -c 'test -S /run/host-services/ssh-auth.sock && test -w /run/host-services/ssh-auth.sock && s1=ok || s1=no; test -S /ssh2.sock && test -w /ssh2.sock && s2=ok || s2=no; printf \"sock1=%s sock2=%s \" \"\$s1\" \"\$s2\"'); src=\$($D inspect -f '{{(index .Mounts 0).Source}}' \$id); $D start -a \$id; $D rm -f \$id >/dev/null; echo \"src=\$src\""
+# On macOS, mounting a host GPG SSH agent socket (S.gpg-agent.ssh) translates
+# to the VM's SSH agent relay socket while inspect keeps the Mac path, survives
+# restart, and forwards real SSH agent identities (#763).
+only mac t mac-gpg-ssh-agent-mount "run1=ok run2=ok src=ok" env D="$D" bash -c '
+  d=$(mktemp -d /tmp/kiri-gpg-ssh.XXXXXX); pid=""
+  cleanup() { [ -n "$pid" ] && kill "$pid" 2>/dev/null || true; rm -rf "$d"; }
+  trap cleanup EXIT
+  sock="$d/S.gpg-agent.ssh"
+  eval "$(ssh-agent -s -a "$sock")" >/dev/null
+  pid=$SSH_AGENT_PID
+  ssh-keygen -q -t ed25519 -N "" -C "kiri-gpg-test" -f "$d/id"
+  SSH_AUTH_SOCK="$sock" ssh-add "$d/id" >/dev/null 2>&1
+  py="import socket; s=socket.socket(socket.AF_UNIX); s.connect(\"/ssh-agent\"); s.sendall(bytes([0,0,0,1,11])); r=s.recv(4096); print(\"ok\" if b\"kiri-gpg-test\" in r else repr(r))"
+  id=$($D create -v "$sock:/ssh-agent" python:3.13-alpine python3 -c "$py")
+  r1=$($D start -a "$id")
+  r2=$($D start -a "$id")
+  src=$($D inspect -f "{{(index .Mounts 0).Source}}" "$id")
+  $D rm -f "$id" >/dev/null
+  [ "$src" = "$sock" ] && s=ok || s="bad:$src"
+  echo "run1=$r1 run2=$r2 src=$s"
+'
 # A file made, changed and deleted on the Mac raises inotify events in the
 # container, as one made there does: file watchers (Vite, webpack, nodemon)
 # pick up saves made in an editor on the Mac. inotifyd prints n (created),
@@ -1592,6 +1634,36 @@ t layer-dir-times-edges "deep=1000000000 n1=1000000001 n24=1000000024 two=100030
 # The times stay through docker cp out, docker commit and a run of the commit.
 t layer-dir-times-cp-out "1000300000 two 1000100000 two/f1" bash -c "id=\$($D create $LT:dirs) && $D cp \$id:/two - | python3 -c 'import sys,tarfile; [print(int(m.mtime), m.name) for m in tarfile.open(fileobj=sys.stdin.buffer,mode=\"r|\")]' | sort -k2 | tr '\n' ' '; $D rm \$id >/dev/null"
 t layer-dir-times-commit "1000000000 /cd 1100000000 /two 1000000001 /deep/n1" bash -c "$D rm -f e2e-ltc >/dev/null 2>&1; $D run --name e2e-ltc $LT:dirs sh -c 'mkdir /cd && touch -d @1000000000 /cd && echo x > /two/f3 && touch -d @1100000000 /two' && $D commit e2e-ltc $LT:dirs-committed >/dev/null && $D run --rm $LT:dirs-committed stat -c '%Y %n' /cd /two /deep/n1 | tr '\n' ' '; $D rm -f e2e-ltc >/dev/null"
+# Opening a committed lower-layer file O_WRONLY copies it up to a new ext4
+# inode on the upper layer; the guest kernel clears STATX_BTIME on overlayfs
+# so creationTime() callers (OpenJDK 22+ / Elasticsearch node.lock, #412) fall
+# back to mtime and never see btime jump across copy-up.
+only mac t overlay-copyup-btime "btime-ok" bash -c "$D rm -f e2e-btime-seed >/dev/null 2>&1; $D rmi kiri-test/btime:1 >/dev/null 2>&1; $D run --name e2e-btime-seed python:3.13-alpine python -c 'import os; os.close(os.open(\"/node.lock\", os.O_CREAT | os.O_WRONLY, 0o644)); os.utime(\"/node.lock\", (1700000000, 1700000000))' && $D commit e2e-btime-seed kiri-test/btime:1 >/dev/null && $D rm -f e2e-btime-seed >/dev/null && out=\$($D run --rm kiri-test/btime:1 python -c 'import ctypes, os, platform, struct, time
+nr = {\"aarch64\": 291, \"x86_64\": 332}[platform.machine()]
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.argtypes = [ctypes.c_long, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p]
+libc.syscall.restype = ctypes.c_long
+def sx(dfd, p, fl):
+    b = ctypes.create_string_buffer(256)
+    r = libc.syscall(nr, dfd, p, fl, 0xfff, b)
+    assert r == 0, (r, ctypes.get_errno())
+    m, = struct.unpack_from(\"<I\", b, 0x00)
+    ino, = struct.unpack_from(\"<Q\", b, 0x20)
+    bt = struct.unpack_from(\"<qI\", b, 0x50)
+    mt = struct.unpack_from(\"<qI\", b, 0x70)
+    dev = struct.unpack_from(\"<II\", b, 0x88)
+    assert (m & 0x7ff) == 0x7ff and ino > 0, (hex(m), ino)
+    return m & 0x800, bt, mt, (dev, ino)
+b1 = sx(-100, b\"/node.lock\", 0)
+time.sleep(0.1)
+fd = os.open(\"/node.lock\", os.O_WRONLY)
+b2 = sx(-100, b\"/node.lock\", 0)
+b3 = sx(fd, b\"\", 0x1000)
+os.close(fd)
+os.close(os.open(\"/upper.lock\", os.O_CREAT | os.O_WRONLY, 0o644))
+os.utime(\"/upper.lock\", (1700000001, 1700000001))
+bu = sx(-100, b\"/upper.lock\", 0)
+print(\"btime-ok\" if b1 == b2 == b3 and b1[:3] == (0, (0, 0), (1700000000, 0)) and bu[:3] == (0, (0, 0), (1700000001, 0)) else (b1, b2, b3, bu))'); $D rmi kiri-test/btime:1 >/dev/null 2>&1; echo \"\$out\""
 # Images of 59 to 125 layers start, with their top and lowest layers in the
 # container (#253: from 60 the overlay's options did not fit in a page). The
 # 125-layer one is also the next check's.

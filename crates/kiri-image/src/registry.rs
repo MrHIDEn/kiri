@@ -14,7 +14,7 @@ use crate::config::{Reach, RegistryConfig};
 use crate::mirror::Mirror;
 use crate::tags::{next_link, version_order};
 use crate::reference::Reference;
-use crate::store::{Image, Layer, RunConfig, Store, sha256_digest};
+use crate::store::{Image, Layer, Pin, RunConfig, Store, sha256_digest};
 
 const ACCEPT: &str = "application/vnd.oci.image.index.v1+json, \
     application/vnd.docker.distribution.manifest.list.v2+json, \
@@ -563,7 +563,7 @@ const IDLE: Duration = Duration::from_secs(90);
 /// hop is checked (never from HTTPS down to plain HTTP to a host the list
 /// does not allow, credentials only to the origin first asked).
 fn shared_agent() -> ureq::Agent {
-    static AGENT: Mutex<Option<(ProxyChoice, ureq::Agent)>> = Mutex::new(None);
+    static AGENT: Mutex<Option<(ProxyChoice, u64, ureq::Agent)>> = Mutex::new(None);
     cached_agent(&AGENT, false)
 }
 
@@ -573,15 +573,19 @@ fn shared_agent() -> ureq::Agent {
 /// goes to a verified connection. Made the first time a listed host is
 /// asked, never otherwise.
 fn insecure_agent() -> ureq::Agent {
-    static AGENT: Mutex<Option<(ProxyChoice, ureq::Agent)>> = Mutex::new(None);
+    static AGENT: Mutex<Option<(ProxyChoice, u64, ureq::Agent)>> = Mutex::new(None);
     cached_agent(&AGENT, true)
 }
 
-fn cached_agent(slot: &Mutex<Option<(ProxyChoice, ureq::Agent)>>, insecure: bool) -> ureq::Agent {
+fn cached_agent(slot: &Mutex<Option<(ProxyChoice, u64, ureq::Agent)>>, insecure: bool) -> ureq::Agent {
     let chosen = PROXY_SOURCE.get().and_then(|f| f());
+    // A host's roots arriving (kiri-win, from the Windows store) builds the
+    // verified agent again too.
+    let roots = if insecure { 0 } else { crate::roots::generation() };
     let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((c, agent)) = slot.as_ref()
+    if let Some((c, g, agent)) = slot.as_ref()
         && *c == chosen
+        && *g == roots
     {
         return agent.clone();
     }
@@ -597,9 +601,12 @@ fn cached_agent(slot: &Mutex<Option<(ProxyChoice, ureq::Agent)>>, insecure: bool
         // Redirects are followed by hand, hop by hop ([`Client::get_following`]).
         .max_redirects(0);
     // A listed host's certificate is not checked, as Docker reaches an
-    // insecure registry; every other agent keeps ureq's verified TLS.
+    // insecure registry; every other agent verifies against the merged roots
+    // so corporate proxies and private CAs trusted by the OS work (#303).
     if insecure {
         cfg = cfg.tls_config(crate::connect::unverified_tls_config());
+    } else {
+        cfg = cfg.tls_config(crate::tls_config(&crate::roots::trusted()));
     }
     if let Some(p) = proxy(chosen.clone()) {
         cfg = cfg.proxy(p);
@@ -607,7 +614,7 @@ fn cached_agent(slot: &Mutex<Option<(ProxyChoice, ureq::Agent)>>, insecure: bool
     // Happy Eyeballs rather than ureq's one address after another, so an
     // IPv6 address without a working route does not stall the pull.
     let agent = ureq::Agent::with_parts(cfg.build(), crate::connect::connector(), ureq::unversioned::resolver::DefaultResolver::default());
-    *slot = Some((chosen, agent.clone()));
+    *slot = Some((chosen, roots, agent.clone()));
     agent
 }
 
@@ -1202,13 +1209,20 @@ impl Client {
         queue.sort_by_key(|l| l.size);
         let queue = Mutex::new(queue);
         let first_error: Mutex<Option<Error>> = Mutex::new(None);
+        // Every reused and newly written blob is held until `store.put_image`
+        // records the image, so a concurrent tag replacement or removal of
+        // another image sharing a blob cannot delete it mid-pull.
+        let pins: Mutex<Vec<Pin>> = Mutex::new(Vec::new());
         // Bounded: the manifest declares the size, and a config is small.
         let fetch_config = || -> Result<(), Error> {
             let _on = cancel.enter();
-            if store.has_blob(&config.digest, config.size) {
+            if let Some(pin) = store.pin_existing(&config.digest, config.size) {
+                pins.lock().unwrap_or_else(|e| e.into_inner()).push(pin);
                 return Ok(());
             }
-            self.download_with(store, target, &config.digest, crate::store::MAX_CONFIG, Some(config.size), &|_| {}, cancel).map(|_| ())
+            let (_, pin) = self.download_with(store, target, &config.digest, crate::store::MAX_CONFIG, Some(config.size), &|_| {}, cancel)?;
+            pins.lock().unwrap_or_else(|e| e.into_inner()).push(pin);
+            Ok(())
         };
         // A mirror stands in for Docker Hub: an image for another platform
         // than the one asked is not Hub's answer, and the pull moves on
@@ -1223,11 +1237,20 @@ impl Client {
             }
         }
         // The layers are announced once the pull will fetch them: a mirror
-        // passed over above shows none.
-        let cached = layers.iter().filter(|l| store.has_blob(&l.digest, l.size)).count();
-        progress(Progress::Resolved { layers: layers.len(), bytes: total, cached });
+        // passed over above shows none. Pin any already on disk right away so
+        // they stay cached until the workers and `put_image` finish.
+        let mut initial_cached = Vec::with_capacity(layers.len());
         for l in &layers {
-            progress(Progress::Layer { digest: l.digest.clone(), size: l.size, cached: store.has_blob(&l.digest, l.size) });
+            let pin = store.pin_existing(&l.digest, l.size);
+            initial_cached.push(pin.is_some());
+            if let Some(pin) = pin {
+                pins.lock().unwrap_or_else(|e| e.into_inner()).push(pin);
+            }
+        }
+        let cached = initial_cached.iter().filter(|&&c| c).count();
+        progress(Progress::Resolved { layers: layers.len(), bytes: total, cached });
+        for (l, &cached) in layers.iter().zip(&initial_cached) {
+            progress(Progress::Layer { digest: l.digest.clone(), size: l.size, cached });
         }
         std::thread::scope(|s| {
             // From the registry itself the config comes alongside the layers
@@ -1249,15 +1272,21 @@ impl Client {
                         if cancel.is_cancelled() || first_error.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
                             return;
                         }
-                        let cached = store.has_blob(&layer.digest, layer.size);
-                        let result = if cached {
-                            Ok(layer.size)
+                        let (cached, result) = if let Some(pin) = store.pin_existing(&layer.digest, layer.size) {
+                            pins.lock().unwrap_or_else(|e| e.into_inner()).push(pin);
+                            (true, Ok(layer.size))
                         } else {
                             // No more than the manifest says (one byte over is
                             // what tells a longer body from the end), and
                             // exactly that.
                             let on_bytes = |got| progress(Progress::Downloading { digest: layer.digest.clone(), got, size: layer.size });
-                            self.download_with(store, target, &layer.digest, layer.size.saturating_add(1), Some(layer.size), &on_bytes, cancel)
+                            match self.download_with(store, target, &layer.digest, layer.size.saturating_add(1), Some(layer.size), &on_bytes, cancel) {
+                                Ok((bytes, pin)) => {
+                                    pins.lock().unwrap_or_else(|e| e.into_inner()).push(pin);
+                                    (false, Ok(bytes))
+                                }
+                                Err(e) => (false, Err(e)),
+                            }
                         };
                         match result {
                             Ok(bytes) => progress(Progress::LayerDone { digest: layer.digest.clone(), bytes, cached }),
@@ -1277,6 +1306,7 @@ impl Client {
         if let Some(e) = first_error.into_inner().unwrap_or_else(|e| e.into_inner()) {
             return Err(e);
         }
+        let mut pins = pins.into_inner().unwrap_or_else(|e| e.into_inner());
         let cfg_bytes = store.read_config(&config.digest)?;
         let cfg: ImageConfig = serde_json::from_slice(&cfg_bytes).map_err(|e| Error::Manifest(e.to_string()))?;
 
@@ -1304,13 +1334,14 @@ impl Client {
         // blob store so Kiri's build mirror can serve digest-pinned FROM
         // references (`FROM repo:tag@sha256:…` and `FROM repo@sha256:…`) with
         // matching SHA-256 digests (#288, #330).
-        let save_raw = |d: &str, bytes: &[u8]| -> Result<(), Error> {
-            if store.has_blob(d, bytes.len() as u64) {
+        let mut save_raw = |d: &str, bytes: &[u8]| -> Result<(), Error> {
+            if let Some(pin) = store.pin_existing(d, bytes.len() as u64) {
+                pins.push(pin);
                 return Ok(());
             }
             let mut w = store.blob_writer(d)?;
             w.write_all(bytes)?;
-            w.finish()?;
+            pins.push(w.finish_pinned()?);
             Ok(())
         };
         save_raw(digest, manifest_bytes)?;
@@ -1322,6 +1353,7 @@ impl Client {
             return Err(Error::Cancelled);
         }
         store.put_image(image.clone())?;
+        drop(pins);
         Ok(image)
     }
 
@@ -1349,7 +1381,7 @@ impl Client {
     /// Streams one blob into the store, verifying its digest. Returns its size.
     #[cfg(test)]
     fn download(&self, store: &Store, r: &Reference, digest: &str, on_bytes: &dyn Fn(u64)) -> Result<u64, Error> {
-        self.download_with(store, r, digest, u64::MAX, None, on_bytes, &Cancel::new())
+        Ok(self.download_with(store, r, digest, u64::MAX, None, on_bytes, &Cancel::new())?.0)
     }
 
     /// Downloads a blob, telling `on_bytes` how much has arrived every
@@ -1361,7 +1393,7 @@ impl Client {
     /// exactly `want` bytes when given (before it goes into the store), and
     /// stops (removing what it wrote) once `cancel` is.
     #[allow(clippy::too_many_arguments)]
-    fn download_with(&self, store: &Store, r: &Reference, digest: &str, max: u64, want: Option<u64>, on_bytes: &dyn Fn(u64), cancel: &Cancel) -> Result<u64, Error> {
+    fn download_with(&self, store: &Store, r: &Reference, digest: &str, max: u64, want: Option<u64>, on_bytes: &dyn Fn(u64), cancel: &Cancel) -> Result<(u64, Pin), Error> {
         // A declared size bounds the read too: one byte over it is enough
         // to tell a longer body from the end.
         let max = want.map_or(max, |w| w.saturating_add(1).min(max));
@@ -1404,7 +1436,7 @@ impl Client {
                 Ok(()) if want.is_some_and(|w| w != got) => {
                     return Err(Error::Manifest(format!("{digest} is {got} bytes, the manifest says {}", want.unwrap_or_default())));
                 }
-                Ok(()) => return Ok(out.finish()?),
+                Ok(()) => return Ok((got, out.finish_pinned()?)),
                 Err(_) if cancel.is_cancelled() => return Err(Error::Cancelled),
                 Err(e) if transient(&e) => {
                     failed = if got > before { 1 } else { failed + 1 };
@@ -2445,7 +2477,11 @@ mod tests {
     }
 
     fn test_client() -> Client {
-        let cfg = ureq::Agent::config_builder().http_status_as_error(false).max_redirects(0).build();
+        let cfg = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .tls_config(crate::tls_config(&crate::roots::trusted()))
+            .build();
         let agent = ureq::Agent::with_parts(cfg, crate::connect::connector_with(Duration::from_millis(300)), ureq::unversioned::resolver::DefaultResolver::default());
         Client { agent, credentials: None, config: Default::default(), use_mirrors: true, mirror_scheme: None }
     }
@@ -2694,7 +2730,10 @@ mod tests {
         let root = std::env::temp_dir().join(format!("kiri-slow-cancel-test-{}", std::process::id()));
         let store = Store::open(&root).unwrap();
         let reference = Reference::parse(&format!("{host}/test/blob:1")).unwrap();
-        let config = ureq::Agent::config_builder().http_status_as_error(false).build();
+        let config = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .tls_config(crate::tls_config(&crate::roots::trusted()))
+            .build();
         let agent = ureq::Agent::with_parts(config, crate::connect::connector_with(Duration::from_secs(2)), ureq::unversioned::resolver::DefaultResolver::default());
         let client = Client { agent, credentials: None, config: Default::default(), use_mirrors: true, mirror_scheme: None };
         let _ = client.base(&host);
@@ -2707,7 +2746,7 @@ mod tests {
         let requests = served.join().unwrap();
         let saved = store.has_blob(&digest, data.len() as u64);
         let _ = std::fs::remove_dir_all(&root);
-        assert_eq!(result.unwrap(), data.len() as u64);
+        assert_eq!(result.unwrap().0, data.len() as u64);
         assert!(saved);
         assert_eq!(requests, [0], "slow data must not start a retry");
     }
@@ -2726,7 +2765,10 @@ mod tests {
         let store = Store::open(&root).unwrap();
         let r = Reference::parse(&format!("{host}/test/blob:1")).unwrap();
         // Stalls only give up after 10 s: the cancel must not wait for that.
-        let cfg = ureq::Agent::config_builder().http_status_as_error(false).build();
+        let cfg = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .tls_config(crate::tls_config(&crate::roots::trusted()))
+            .build();
         let agent = ureq::Agent::with_parts(cfg, crate::connect::connector_with(Duration::from_secs(10)), ureq::unversioned::resolver::DefaultResolver::default());
         let client = Client { agent, credentials: None, config: Default::default(), use_mirrors: true, mirror_scheme: None };
         // A loopback registry's scheme is asked once (HTTPS, then HTTP):
@@ -4127,5 +4169,18 @@ mod tests {
             seen
         });
         (host, served)
+    }
+
+    /// The shared pull agent verifies against the merged roots, every one
+    /// of them and in order, not the bundled set only (#303).
+    #[test]
+    fn the_shared_agent_trusts_the_merged_roots() {
+        let agent = shared_agent();
+        let ureq::tls::RootCerts::Specific(certs) = agent.config().tls_config().root_certs() else {
+            panic!("the shared agent must trust a list of roots of its own");
+        };
+        let roots = crate::roots::trusted();
+        assert_eq!(certs.len(), roots.len());
+        assert!(certs.iter().zip(roots.iter()).all(|(a, b)| a.der() == b.as_ref()));
     }
 }

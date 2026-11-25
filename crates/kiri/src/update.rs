@@ -68,10 +68,19 @@ pub fn newer(candidate: &str, current: &str) -> bool {
     false
 }
 
+/// The same guard the registry client (`kiri-image/src/connect.rs`) uses: a
+/// read that sits silent this long fails, so a stalled server cannot hang
+/// `kiri update`'s feed check or download forever.
+const STALL: std::time::Duration = std::time::Duration::from_secs(60);
+
 fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_connect(Some(std::time::Duration::from_secs(10)))
+        .timeout_per_read(Some(STALL))
         .user_agent(concat!("kiri/", env!("CARGO_PKG_VERSION")))
+        // The system's roots merged with webpki's, like the registry client
+        // (#303); the feed often sits behind a corporate proxy's CA.
+        .tls_config(kiri_image::tls_config(&kiri_image::roots::trusted()))
         .build()
         .into()
 }
@@ -534,6 +543,19 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The update agent verifies against the merged roots, every one of
+    /// them and in order, not the bundled set only (#303).
+    #[test]
+    fn the_update_agent_trusts_the_merged_roots() {
+        let agent = super::agent();
+        let ureq::tls::RootCerts::Specific(certs) = agent.config().tls_config().root_certs() else {
+            panic!("the update agent must trust a list of roots of its own");
+        };
+        let roots = kiri_image::roots::trusted();
+        assert_eq!(certs.len(), roots.len());
+        assert!(certs.iter().zip(roots.iter()).all(|(a, b)| a.der() == b.as_ref()));
     }
 
     #[test]
