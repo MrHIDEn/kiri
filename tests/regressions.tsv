@@ -334,3 +334,19 @@ crates/kiri/src/ui/compose.rs	#770	on Windows, Compose projects started inside a
 crates/kiri/src/daemon/api.rs	#770	containers created inside WSL did not expose their owning WSL distro on GET /containers/json for Windows Compose path mapping
 bind-nonroot-parallel	#796	concurrent non-root file and directory creation on a macOS bind mount raced with root stat/ls and /proc/kiri-fsnotify on the shared virtiofs inode's cached i_uid/i_gid, failing with EACCES/EPERM
 bind-nonroot-ro	#796	non-root writes to a read-only 0444 bind-mount file must still fail with EACCES, including inside an unprivileged unshare -Ur user namespace
+crates/kiri/src/daemon/rofs.rs	#768	when Kiri's WSL 2 ext4.vhdx or Linux storage filesystem was remounted read-only (emergency_ro), daemon startup, /info and diagnostics lacked actionable fsck / storage recovery steps
+crates/kiri-init/src/linux/sys.rs	#768	on a read-only or emergency_ro storage filesystem, overlayfs silently mounted writable container rootfs read-only instead of refusing with actionable recovery steps
+crates/kiri-win/src/wslsync.rs	#768	kiri-start and kiri-win reported a generic WSL install failure instead of ext4.vhdx emergency_ro e2fsck recovery steps when Kiri's WSL 2 disk was remounted read-only
+tls-company-root-pull	#303	a registry signed by a root the system trusts failed UnknownIssuer: only the bundled roots were trusted
+tls-company-root-login	#303	docker login to a registry signed by a root the system trusts failed UnknownIssuer
+tls-unknown-root-refused	#303	a root the system does not trust must still be refused
+crates/kiri-image/src/roots.rs	#303	root store merge, system distrust filtering (macOS Never Trust, Windows Disallowed and disabled Server Auth EKU), cross-cert preservation, caps, and KIRI_TLS_ROOTS=webpki escape hatch
+crates/kiri/src/daemon/hostroots.rs	#303	Windows host roots persistence in WSL must enforce Caller::Host, 0600 atomic writes, non-symlink/non-FIFO reads, and bounded sizes
+crates/kiri/src/setup.rs	#556	opening Kiri.app re-appended the ~/.kiri/bin PATH block to shell profiles on every launch even when removed or when a profile already put ~/.kiri/bin on PATH, with no kiri setup --no-profiles opt-out
+crates/kiri/src/k8s.rs	#816	kiri k8s set had no --version or --k3s-arg/--clear-k3s-args options to pin a k3s image tag or pass custom k3s server flags, and kiri k8s start did not sync ~/.kiri/k8s-manifests into k3s
+crates/kiri-win/src/k8s.rs	#816	Windows k8s.json config and container creation did not preserve or apply custom k3s version tags and extra k3s server arguments
+mac-gpg-ssh-agent-mount	#763	macOS launchd-started daemons used Apple's empty default Listeners SSH socket instead of GnuPG's S.gpg-agent.ssh when enable-ssh-support was set, and direct host SSH agent socket bind mounts failed across virtiofs
+crates/kiri/src/daemon/grpc.rs	#734	docker build run from a Docker CLI inside a socket-mounted container auto-created a buildx docker-container builder without default-load=true and never stored the built image in Kiri's image store
+crates/kiri-image/src/store.rs	#864	an image put under a name another image had dropped the old record without freeing its unreferenced blobs, and Store::pin updated PINNED without BLOB_LOCK
+bind-chown-chmod	#382	chown on a macOS virtiofs bind mount returned 0 while leaving files owned by the caller so chmod by the new owner failed with EPERM, and warm bind-mount reads lacked close-to-open page/dir caching and BDI read-ahead (#415)
+crates/kiri/src/vm_cli.rs	#473	macOS low ports (<1024) on 127.0.0.1/::1 failed without root instead of falling back to dual-stack with strict loopback peer filtering, and macOS VM had no shared_nat=false option (`kiri vm set --shared-nat off`) to omit VZNATNetworkDeviceAttachment and route egress/DNS over vsock under Cloudflare WARP (#383) or non-DF firewall drops (#350)

@@ -249,6 +249,17 @@ pub enum Msg<'a> {
     /// security network extensions, or `0.0.0.0/0` under host egress). Empty
     /// clears the redirect rules. No reply.
     SetEgressRoutes(StrList<'a>),
+    /// Host → guest: query the guest data disk's (`DATA`) filesystem usage via
+    /// `statvfs`. Answered by `DiskUsage` or `Error`; an older agent answers `Error`.
+    DiskUsageQuery,
+    /// Guest → host: data disk bytes currently in use (`(blocks - bavail) * frsize`)
+    /// and total capacity (`blocks * frsize`).
+    DiskUsage { in_use: u64, capacity: u64 },
+    /// Host → guest: run `FITRIM` immediately on the guest data disk (`DATA`).
+    /// Answered by `DiskTrimmed` or `Error`; an older agent answers `Error`.
+    TrimDisk,
+    /// Guest → host: bytes discarded by `FITRIM`, plus updated `statvfs` usage.
+    DiskTrimmed { trimmed: u64, in_use: u64, capacity: u64 },
     /// Success, for requests with nothing else to say.
     Ack,
 }
@@ -308,6 +319,12 @@ pub mod copy_flags {
     /// `IN`: the container has `--read-only` (`HostConfig.ReadonlyRootfs`), so
     /// writes outside writable mounts are refused.
     pub const READONLY_ROOTFS: u32 = 8;
+    /// `OUT` / `EXPORT`: the guest sends the archive in `<= 64 KiB` chunks
+    /// (`len: u32 LE | bytes`, ending with an empty chunk), waiting for a
+    /// 1-byte credit ack from the host before sending each chunk, so
+    /// `COPY_PORT` is never left unread while the host writes to
+    /// `ENGINE_API_PORT` (#874).
+    pub const PACED: u32 = 16;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -429,6 +446,10 @@ pub struct Stats {
     /// Pages held by the memory balloon, in KiB. None from an agent or
     /// kernel that does not report it.
     pub mem_balloon_kib: Option<u64>,
+    /// Committed address space (`Committed_AS` from `/proc/meminfo`: writable
+    /// `VM_ACCOUNT` mappings, excluding `MAP_NORESERVE` virtual arenas), in
+    /// KiB. None from an older agent or kernel that does not report it.
+    pub mem_committed_kib: Option<u64>,
 }
 
 /// What the guest knows about its own boot, in nanoseconds of CLOCK_BOOTTIME.
@@ -579,7 +600,7 @@ pub struct RunSpec<'a> {
     /// HostConfig settings applied at start, one per line, tab-separated:
     /// `rlimit res soft hard`, `sysctl ns path value`, `device host
     /// container perms`, `devrule type major minor perms`, `group name`,
-    /// `masked path…`, `readonly path…`.
+    /// `masked path…`, `readonly path…`, `cgroupns host`.
     /// Empty from an older daemon.
     pub opts: StrList<'a>,
     /// The container's own seccomp profile, compiled by the daemon to a
@@ -876,6 +897,10 @@ mod kind {
     pub const FS_READ_LINK: u16 = 82;
     pub const SET_UPLINK: u16 = 83;
     pub const SET_EGRESS_ROUTES: u16 = 84;
+    pub const DISK_USAGE_QUERY: u16 = 85;
+    pub const DISK_USAGE: u16 = 86;
+    pub const TRIM_DISK: u16 = 87;
+    pub const DISK_TRIMMED: u16 = 88;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1095,9 +1120,10 @@ impl Msg<'_> {
                 for v in [st.uptime_ns, st.mem_total_kib, st.mem_available_kib, st.agent_rss_kib, st.mem_used_kib, st.mem_stall, st.oom_kills] {
                     put_u64(o, v);
                 }
-                // Always emit the 8th word (u64::MAX for None) so any future
-                // trailing fields stay at fixed offsets.
+                // Always emit the 8th and 9th words (u64::MAX for None) so any
+                // future trailing fields stay at fixed offsets.
                 put_u64(o, st.mem_balloon_kib.unwrap_or(u64::MAX));
+                put_u64(o, st.mem_committed_kib.unwrap_or(u64::MAX));
             }),
             Msg::LayerQuery(d) => frame(out, kind::LAYER_QUERY, |o| put_str(o, d)),
             Msg::LayerStatus(have) => frame(out, kind::LAYER_STATUS, |o| o.push(have as u8)),
@@ -1275,6 +1301,17 @@ impl Msg<'_> {
                 put_u32(o, routes.count);
                 o.extend_from_slice(routes.raw);
             }),
+            Msg::DiskUsageQuery => frame(out, kind::DISK_USAGE_QUERY, |_| {}),
+            Msg::DiskUsage { in_use, capacity } => frame(out, kind::DISK_USAGE, |o| {
+                put_u64(o, in_use);
+                put_u64(o, capacity);
+            }),
+            Msg::TrimDisk => frame(out, kind::TRIM_DISK, |_| {}),
+            Msg::DiskTrimmed { trimmed, in_use, capacity } => frame(out, kind::DISK_TRIMMED, |o| {
+                put_u64(o, trimmed);
+                put_u64(o, in_use);
+                put_u64(o, capacity);
+            }),
             Msg::Listening(lines) => frame(out, kind::LISTENING, |o| {
                 put_u32(o, lines.count);
                 o.extend_from_slice(lines.raw);
@@ -1441,6 +1478,12 @@ pub fn decode(frame: &[u8]) -> Result<Msg<'_>, DecodeError> {
             } else {
                 None
             },
+            mem_committed_kib: if r.remaining() >= 8 {
+                let v = r.u64()?;
+                (v != u64::MAX).then_some(v)
+            } else {
+                None
+            },
         }),
         kind::LAYER_QUERY => Msg::LayerQuery(r.str()?),
         kind::LAYER_STATUS => Msg::LayerStatus(r.u8()? != 0),
@@ -1586,6 +1629,10 @@ pub fn decode(frame: &[u8]) -> Result<Msg<'_>, DecodeError> {
         kind::USB_NODES => Msg::UsbNodes(r.list()?),
         kind::FS_EVENTS => Msg::FsEvents(r.list()?),
         kind::SET_EGRESS_ROUTES => Msg::SetEgressRoutes(r.list()?),
+        kind::DISK_USAGE_QUERY => Msg::DiskUsageQuery,
+        kind::DISK_USAGE => Msg::DiskUsage { in_use: r.u64()?, capacity: r.u64()? },
+        kind::TRIM_DISK => Msg::TrimDisk,
+        kind::DISK_TRIMMED => Msg::DiskTrimmed { trimmed: r.u64()?, in_use: r.u64()?, capacity: r.u64()? },
         kind::NET_ATTACH => Msg::NetAttach {
             id: r.str()?,
             ifname: r.str()?,
@@ -1671,18 +1718,26 @@ mod tests {
         round(Msg::Shutdown);
         round(Msg::Error("boom"));
         round(Msg::StatsRequest);
-        let full = Stats { uptime_ns: 5, mem_total_kib: 6, mem_available_kib: 7, agent_rss_kib: 8, mem_used_kib: 9, mem_stall: 9173, oom_kills: 2, mem_balloon_kib: Some(4096) };
+        let full = Stats { uptime_ns: 5, mem_total_kib: 6, mem_available_kib: 7, agent_rss_kib: 8, mem_used_kib: 9, mem_stall: 9173, oom_kills: 2, mem_balloon_kib: Some(4096), mem_committed_kib: Some(2_097_152) };
         round(Msg::Stats(full));
-        round(Msg::Stats(Stats { mem_balloon_kib: Some(0), ..full }));
+        round(Msg::Stats(Stats { mem_balloon_kib: Some(0), mem_committed_kib: Some(0), ..full }));
         round(Msg::Stats(Stats { mem_balloon_kib: None, ..full }));
+        round(Msg::Stats(Stats { mem_committed_kib: None, ..full }));
+        round(Msg::Stats(Stats { mem_balloon_kib: None, mem_committed_kib: None, ..full }));
+        round(Msg::DiskUsageQuery);
+        round(Msg::DiskUsage { in_use: 17_300_000_000, capacity: 68_719_476_736 });
+        round(Msg::TrimDisk);
+        round(Msg::DiskTrimmed { trimmed: 12_100_000_000, in_use: 17_300_000_000, capacity: 68_719_476_736 });
         // Older agents' Stats, without the later words, still decode.
         let mut buf = Vec::new();
         Msg::Stats(full).encode(&mut buf);
-        let no_balloon = Stats { mem_balloon_kib: None, ..full };
-        assert_eq!(decode(&buf[..buf.len() - 8]).unwrap(), Msg::Stats(no_balloon));
+        let no_committed = Stats { mem_committed_kib: None, ..full };
+        assert_eq!(decode(&buf[..buf.len() - 8]).unwrap(), Msg::Stats(no_committed));
+        let no_balloon = Stats { mem_balloon_kib: None, ..no_committed };
+        assert_eq!(decode(&buf[..buf.len() - 16]).unwrap(), Msg::Stats(no_balloon));
         let no_memory_words = Stats { mem_stall: 0, oom_kills: 0, ..no_balloon };
-        assert_eq!(decode(&buf[..buf.len() - 24]).unwrap(), Msg::Stats(no_memory_words));
-        assert_eq!(decode(&buf[..buf.len() - 32]).unwrap(), Msg::Stats(Stats { mem_used_kib: 0, ..no_memory_words }));
+        assert_eq!(decode(&buf[..buf.len() - 32]).unwrap(), Msg::Stats(no_memory_words));
+        assert_eq!(decode(&buf[..buf.len() - 40]).unwrap(), Msg::Stats(Stats { mem_used_kib: 0, ..no_memory_words }));
         round(Msg::LayerQuery("sha256:ab"));
         round(Msg::LayerStatus(true));
         round(Msg::LayerBegin(LayerBegin { digest: "sha256:ab", media_type: "x+gzip", size: 9 }));
@@ -1722,21 +1777,28 @@ mod tests {
 
     #[test]
     fn stats_none_balloon_keeps_wire_offset() {
-        let base = Stats { uptime_ns: 5, mem_total_kib: 6, mem_available_kib: 7, agent_rss_kib: 8, mem_used_kib: 9, mem_stall: 10, oom_kills: 1, mem_balloon_kib: Some(4096) };
-        let absent = Stats { mem_balloon_kib: None, ..base };
-        let mut with_balloon = Vec::new();
-        let mut without_balloon = Vec::new();
-        Msg::Stats(base).encode(&mut with_balloon);
-        Msg::Stats(absent).encode(&mut without_balloon);
-        assert_eq!(without_balloon.len(), with_balloon.len());
-        // Appending a future 9th word must not be decoded into mem_balloon_kib.
-        let mut extended = without_balloon.clone();
+        let base = Stats { uptime_ns: 5, mem_total_kib: 6, mem_available_kib: 7, agent_rss_kib: 8, mem_used_kib: 9, mem_stall: 10, oom_kills: 1, mem_balloon_kib: Some(4096), mem_committed_kib: Some(8192) };
+        let no_balloon_with_commit = Stats { mem_balloon_kib: None, ..base };
+        round(Msg::Stats(no_balloon_with_commit));
+        let absent = Stats { mem_balloon_kib: None, mem_committed_kib: None, ..base };
+        let mut with_optional = Vec::new();
+        let mut without_optional = Vec::new();
+        Msg::Stats(base).encode(&mut with_optional);
+        Msg::Stats(absent).encode(&mut without_optional);
+        assert_eq!(without_optional.len(), with_optional.len());
+        // Appending a future 10th word must not be decoded into mem_balloon_kib or mem_committed_kib.
+        let mut extended = without_optional.clone();
         extended.extend_from_slice(&42u64.to_le_bytes());
         let len = (extended.len() - 4) as u32;
         extended[..4].copy_from_slice(&len.to_le_bytes());
         assert_eq!(decode(&extended).unwrap(), Msg::Stats(absent));
-        // An older 7-word agent omitting the 8th word still decodes as None.
-        let mut old = without_balloon[..without_balloon.len() - 8].to_vec();
+        // An older 8-word agent omitting mem_committed_kib decodes it as None while preserving mem_balloon_kib.
+        let mut eight_word = with_optional[..with_optional.len() - 8].to_vec();
+        let len = (eight_word.len() - 4) as u32;
+        eight_word[..4].copy_from_slice(&len.to_le_bytes());
+        assert_eq!(decode(&eight_word).unwrap(), Msg::Stats(Stats { mem_committed_kib: None, ..base }));
+        // An older 7-word agent omitting both optional words still decodes both as None.
+        let mut old = without_optional[..without_optional.len() - 16].to_vec();
         let len = (old.len() - 4) as u32;
         old[..4].copy_from_slice(&len.to_le_bytes());
         assert_eq!(decode(&old).unwrap(), Msg::Stats(absent));

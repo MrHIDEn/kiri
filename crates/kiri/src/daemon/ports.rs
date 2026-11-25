@@ -15,11 +15,11 @@
 //! CPUs; through the bridge alone, one CPU carried it all and the port
 //! ran at about half of Docker's speed on 127.0.0.1.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -39,6 +39,9 @@ const RELAY_FRAMED_PORT: u32 = 1030;
 static NO_FRAMED_RELAY: AtomicBool = AtomicBool::new(false);
 /// A UDP client quiet this long has its session closed, as conntrack does.
 const UDP_IDLE: Duration = Duration::from_secs(60);
+/// Port-53 DNS queries churn many short-lived client ports, so reap faster
+/// to avoid filling the 1024-session cap (#760).
+const UDP_DNS_IDLE: Duration = Duration::from_secs(10);
 /// A TCP peer that takes none of the relay's bytes for this long is given up
 /// on. Quiet is not stuck: nothing limits how long a connection may idle,
 /// as with docker-proxy (#388).
@@ -77,6 +80,59 @@ static NAT_DOWN_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 static NAT_TIMEOUTS: AtomicUsize = AtomicUsize::new(0);
 /// Set once this run has warned that the NAT network is unreachable.
 static NAT_WARNED: AtomicBool = AtomicBool::new(false);
+/// Running VM's shared NAT state on macOS (`0` = not booted / read config,
+/// `1` = booted without `VZNATNetworkDeviceAttachment`, `2` = booted with it).
+static SHARED_NAT_STATE: AtomicU8 = AtomicU8::new(0);
+
+pub fn set_shared_nat_active(active: Option<bool>) {
+    let val = match active {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    SHARED_NAT_STATE.store(val, Ordering::Relaxed);
+}
+
+pub fn shared_nat_active() -> bool {
+    match SHARED_NAT_STATE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => super::engine::shared_nat(),
+    }
+}
+
+static HOST_PORT_53_BINDS: AtomicUsize = AtomicUsize::new(0);
+
+struct HostPort53Guard;
+
+impl HostPort53Guard {
+    fn acquire() -> Self {
+        HOST_PORT_53_BINDS.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for HostPort53Guard {
+    fn drop(&mut self) {
+        HOST_PORT_53_BINDS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// True while at least one container publishes host port 53 on loopback or
+/// wildcard, so `dns::mac_resolvers` skips `127.0.0.1:53` / `[::1]:53` (#760).
+pub fn host_port_53_published() -> bool {
+    HOST_PORT_53_BINDS.load(Ordering::Relaxed) > 0
+}
+
+fn binds_host_dns_port(bound: &[(Binding, String, u16)]) -> bool {
+    bound.iter().any(|(_, ip, port)| {
+        *port == 53
+            && (ip.is_empty()
+                || ip == "0.0.0.0"
+                || ip == "::"
+                || ip.parse::<IpAddr>().is_ok_and(|a| a.is_loopback()))
+    })
+}
 /// New connections over the NAT network: a burst of `NAT_BURST`, then
 /// `NAT_RATE` a second; the rest go over vsock, which takes thousands a
 /// second (bulk transfers are what the NAT network is for). Each connection
@@ -416,6 +472,15 @@ pub fn wsl_ipv4() -> Option<std::net::Ipv4Addr> {
         .map(|(_, ip)| ip)
 }
 
+/// Monotonic generation tagging each `Forwards` publish batch so a stale
+/// `Forwards::drop` -> `Msg::Unpublish` can never wipe the DNAT rules of a
+/// newly restarted container with the same ID (#649).
+static PUBLISH_GEN: AtomicU64 = AtomicU64::new(1);
+
+fn publish_key(id: &str) -> String {
+    format!("{id}:{}", PUBLISH_GEN.fetch_add(1, Ordering::Relaxed))
+}
+
 /// A running forward for one container; dropping it closes every listener.
 pub struct Forwards {
     wake: Vec<OwnedFd>,
@@ -430,8 +495,47 @@ pub struct Forwards {
     /// `--network host` containers (`loopback_ports`); dropping tells the
     /// agent to stop if `nat` didn't already unpublish the container.
     loopback: Option<(Arc<VmLink>, String)>,
+    /// Tracks an active host port-53 binding while these forwards stay up (#760).
+    host_port_53: Option<HostPort53Guard>,
     /// What was actually bound: (binding, host address, host port).
     pub bound: Vec<(Binding, String, u16)>,
+    #[cfg(test)]
+    on_drop: Option<Box<dyn FnOnce() + Send>>,
+}
+
+#[cfg(test)]
+impl Forwards {
+    /// Test helper: builds a `Forwards` that runs `on_drop` (after joining any
+    /// listener thread and closing any bound socket) when dropped.
+    pub(super) fn test_dummy(bound: Vec<(Binding, String, u16)>, listener: Option<TcpListener>, on_drop: impl FnOnce() + Send + 'static) -> Forwards {
+        let mut wake = Vec::new();
+        let mut threads = Vec::new();
+        if let Some(l) = listener {
+            let (wake_r, wake_w) = pipe().unwrap();
+            wake.push(wake_w);
+            threads.push(
+                std::thread::Builder::new()
+                    .name("kiri-test-port".into())
+                    .spawn(move || {
+                        let _keep = l;
+                        let mut pfd = libc::pollfd { fd: wake_r.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+                        // SAFETY: polling a single owned pipe descriptor until its write end closes.
+                        unsafe { libc::poll(&mut pfd, 1, -1) };
+                    })
+                    .unwrap(),
+            );
+        }
+        Forwards {
+            wake,
+            threads,
+            kernel: None,
+            nat: None,
+            loopback: None,
+            host_port_53: None,
+            bound,
+            on_drop: Some(Box::new(on_drop)),
+        }
+    }
 }
 
 impl std::fmt::Debug for Forwards {
@@ -460,6 +564,10 @@ impl Drop for Forwards {
         self.wake.clear();
         for t in self.threads.drain(..) {
             let _ = t.join();
+        }
+        #[cfg(test)]
+        if let Some(f) = self.on_drop.take() {
+            f();
         }
     }
 }
@@ -503,10 +611,38 @@ fn relays_too(ip: &str) -> bool {
     !kernel_forwards(ip) || kernel_host_ip(ip) == Some([0; 4])
 }
 
+#[cfg(target_os = "macos")]
+fn bind_loopback_interface(fd: std::os::fd::RawFd, is_ipv6: bool) -> io::Result<()> {
+    // SAFETY: `c"lo0"` is a static NUL-terminated C string.
+    let idx = unsafe { libc::if_nametoindex(c"lo0".as_ptr()) };
+    if idx == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let (level, opt) = if is_ipv6 {
+        (libc::IPPROTO_IPV6, libc::IPV6_BOUND_IF)
+    } else {
+        (libc::IPPROTO_IP, libc::IP_BOUND_IF)
+    };
+    // SAFETY: `idx` is a `c_uint` interface index matching `setsockopt`.
+    if unsafe { libc::setsockopt(fd, level, opt, (&idx as *const libc::c_uint).cast(), std::mem::size_of::<libc::c_uint>() as libc::socklen_t) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn bind_loopback_interface(_fd: std::os::fd::RawFd, _is_ipv6: bool) -> io::Result<()> {
+    Ok(())
+}
+
 /// A socket bound to `addr`; an IPv6 one with IPV6_V6ONLY, so `[::]:port`
 /// sits beside `0.0.0.0:port` (as Docker binds both) instead of clashing
 /// with it, and serves IPv6 alone.
 fn bind_socket(addr: SocketAddr, udp: bool) -> io::Result<OwnedFd> {
+    bind_socket_on_if(addr, udp, false)
+}
+
+fn bind_socket_on_if(addr: SocketAddr, udp: bool, bind_lo0: bool) -> io::Result<OwnedFd> {
     let (family, ty) = (if addr.is_ipv6() { libc::AF_INET6 } else { libc::AF_INET }, if udp { libc::SOCK_DGRAM } else { libc::SOCK_STREAM });
     // SAFETY: plain socket creation; owned at once.
     let fd = unsafe { libc::socket(family, ty, 0) };
@@ -526,6 +662,9 @@ fn bind_socket(addr: SocketAddr, udp: bool) -> io::Result<OwnedFd> {
     }
     if addr.is_ipv6() && set(libc::IPPROTO_IPV6, libc::IPV6_V6ONLY) != 0 {
         return Err(io::Error::last_os_error());
+    }
+    if cfg!(target_os = "macos") && bind_lo0 {
+        bind_loopback_interface(sock.as_raw_fd(), addr.is_ipv6())?;
     }
     // SAFETY: the sockaddr storage is filled for `addr`'s family and sized to match.
     let (storage, len) = sockaddr_of(addr);
@@ -593,7 +732,7 @@ fn listen_addrs(b: &Binding) -> Vec<(String, bool)> {
 /// an engine left running beside Kiri (the one containers were imported
 /// from) or a server on the Mac holds the port, and "already allocated"
 /// alone reads as if Kiri had lost track of its own containers. None when
-/// Kiri itself has it, or when lsof says nothing.
+/// Kiri itself has it, or when neither `lsof` nor `netstat -anv` finds a holder.
 #[cfg(target_os = "macos")]
 fn holder(port: u16, udp: bool) -> Option<String> {
     let spec = if udp { format!("-iUDP:{port}") } else { format!("-iTCP:{port}") };
@@ -602,8 +741,18 @@ fn holder(port: u16, udp: bool) -> Option<String> {
     if !udp {
         cmd.arg("-sTCP:LISTEN");
     }
-    let out = cmd.stderr(std::process::Stdio::null()).output().ok()?;
-    holder_in(&String::from_utf8_lossy(&out.stdout))
+    if let Ok(out) = cmd.stderr(std::process::Stdio::null()).output()
+        && let Some(name) = holder_in(&String::from_utf8_lossy(&out.stdout))
+    {
+        return Some(name);
+    }
+    let proto = if udp { "udp" } else { "tcp" };
+    let out = std::process::Command::new("/usr/sbin/netstat")
+        .args(["-anv", "-p", proto])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    holder_in_netstat(&String::from_utf8_lossy(&out.stdout), port, udp, std::process::id(), super::vmnet::process_name)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -681,7 +830,10 @@ pub fn start_local(
         kernel: None,
         nat: None,
         loopback: None,
+        host_port_53: None,
         bound: Vec::new(),
+        #[cfg(test)]
+        on_drop: None,
     };
     for (b, ip, port, listener) in listeners {
         let (wake_r, wake_w) = pipe()?;
@@ -694,7 +846,212 @@ pub fn start_local(
         );
         fw.bound.push((b, ip, port));
     }
+    if binds_host_dns_port(&fw.bound) {
+        fw.host_port_53 = Some(HostPort53Guard::acquire());
+    }
     Ok(fw)
+}
+
+/// Fallback holder lookup from `netstat -anv` when unprivileged `lsof` cannot
+/// inspect root-owned sockets (e.g. `mDNSResponder` on port 53, #760).
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn holder_in_netstat(
+    netstat: &str,
+    port: u16,
+    udp: bool,
+    self_pid: u32,
+    mut resolve_pid: impl FnMut(u32) -> Option<String>,
+) -> Option<String> {
+    for (name, pid) in super::vmnet::parse_netstat_listeners(netstat, port, udp) {
+        if pid == self_pid {
+            continue;
+        }
+        let Some(resolved) = name.or_else(|| resolve_pid(pid)) else { continue };
+        let trimmed = resolved.trim();
+        if !trimmed.is_empty() && !trimmed.to_ascii_lowercase().starts_with("kiri") {
+            return Some(trimmed.to_owned());
+        }
+    }
+    None
+}
+
+fn is_non_default_ipv4_loopback(ip: &str) -> bool {
+    ip.parse::<std::net::Ipv4Addr>().is_ok_and(|v4| v4.is_loopback() && v4 != std::net::Ipv4Addr::LOCALHOST)
+}
+
+fn format_bind_error(
+    e: io::Error,
+    shown_ip: &str,
+    bare_ip: &str,
+    host_port: u16,
+    holder_name: Option<&str>,
+    is_macos: bool,
+    shared_nat_active: bool,
+) -> io::Error {
+    if e.kind() == io::ErrorKind::AddrInUse {
+        let by = holder_name.map(|name| format!(" (in use by {name})")).unwrap_or_default();
+        let mut msg = format!("Bind for {shown_ip}:{host_port} failed: port is already allocated{by}");
+        if is_macos && host_port == 53 && (shared_nat_active || holder_name.is_some_and(|n| n.eq_ignore_ascii_case("mDNSResponder"))) {
+            msg.push_str("; macOS shared NAT uses port 53 (mDNSResponder): run `kiri vm set --shared-nat off` and restart Kiri, or bind a high port with `/etc/resolver/<domain>` (`port <N>`)");
+        }
+        return io::Error::new(e.kind(), msg);
+    }
+    if is_macos
+        && (e.kind() == io::ErrorKind::AddrNotAvailable || e.raw_os_error() == Some(libc::EADDRNOTAVAIL))
+        && is_non_default_ipv4_loopback(bare_ip)
+    {
+        return io::Error::new(
+            e.kind(),
+            format!("Bind for {shown_ip}:{host_port} failed: address is not assigned on macOS (run `sudo ifconfig lo0 alias {bare_ip}` or use `127.0.0.1`)"),
+        );
+    }
+    e
+}
+
+fn wildcard_of(addr: SocketAddr) -> SocketAddr {
+    let ip = if addr.is_ipv6() {
+        IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+    } else {
+        IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+    };
+    SocketAddr::new(ip, addr.port())
+}
+
+/// Whether `peer` may use a listener or UDP socket: when a macOS low-port
+/// loopback binding (`127.0.0.1:<port>` or `[::1]:<port>`, `port < 1024`) fell
+/// back to the wildcard address (`loopback_only`), only loopback peers
+/// (`127.0.0.0/8`, `::1`, `::ffff:127.0.0.0/104`) are accepted (#473).
+fn peer_allowed(peer: IpAddr, loopback_only: bool) -> bool {
+    !loopback_only || peer.to_canonical().is_loopback()
+}
+
+fn bind_with_macos_low_loopback(
+    addr: SocketAddr,
+    port: u16,
+    is_udp: bool,
+    step_aside: impl FnMut(u16) -> bool,
+) -> io::Result<(OwnedFd, bool)> {
+    let bind = |a: SocketAddr, u: bool| {
+        let bind_lo0 = addr.ip().is_loopback() && a.ip().is_unspecified();
+        bind_socket_on_if(a, u, bind_lo0)
+    };
+    bind_with_macos_low_loopback_with(addr, port, is_udp, cfg!(target_os = "macos"), bind, step_aside)
+}
+
+fn bind_with_macos_low_loopback_with<T>(
+    addr: SocketAddr,
+    port: u16,
+    is_udp: bool,
+    is_macos: bool,
+    mut bind: impl FnMut(SocketAddr, bool) -> io::Result<T>,
+    mut step_aside: impl FnMut(u16) -> bool,
+) -> io::Result<(T, bool)> {
+    let mut try_bind = |a: SocketAddr| {
+        bind(a, is_udp).or_else(|e| {
+            if e.kind() == io::ErrorKind::AddrInUse && !is_udp && port != 0 && step_aside(port) {
+                bind(a, false)
+            } else {
+                Err(e)
+            }
+        })
+    };
+    match try_bind(addr) {
+        Ok(s) => Ok((s, false)),
+        // On macOS XNU, unprivileged processes get EACCES (`PermissionDenied`)
+        // when binding `127.0.0.1:<port>` or `[::1]:<port>` for `port < 1024`,
+        // even though XNU lets unprivileged processes bind `0.0.0.0:<port>` and
+        // `[::]:<port>` (#473). Fall back to the wildcard of the same family
+        // (stepping the container-domain router aside on AddrInUse via
+        // `try_bind`) and filter non-loopback peers in `accept_loop`/`udp_loop`.
+        Err(e)
+            if is_macos
+                && e.kind() == io::ErrorKind::PermissionDenied
+                && addr.ip().is_loopback()
+                && (1..1024).contains(&port) =>
+        {
+            try_bind(wildcard_of(addr)).map(|s| (s, true))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Result of attempting Linux-host kernel DNAT publication for a container's
+/// bound sockets (`publish_linux_host`).
+struct LinuxPublish<T, U> {
+    any_published: bool,
+    kernel_bound: Vec<(Binding, String, u16)>,
+    kernel_tcp: Vec<T>,
+    kernel_udp: Vec<U>,
+    relay_tcp: Vec<(Binding, Option<String>, String, u16, bool, T)>,
+    relay_udp: Vec<(Binding, Option<String>, String, u16, bool, U)>,
+    fallback_error: Option<io::Error>,
+}
+
+/// Linux host: installs kernel DNAT rules for every non-loopback IPv4 binding
+/// and separates kernel-only sockets (kept bound to reserve the ports) from
+/// user-space relayed ones (`relay_direct` / `udp_loop`). If any `publish`
+/// fails — notably when the host firewall blocks kernel `FORWARD` (#649) —
+/// unpublishes `publish_id` and leaves every socket in the user-space relay
+/// lists so remote connections are accepted on `INPUT` via `relay_direct`
+/// instead of being blackholed by `prerouting` DNAT.
+fn publish_linux_host<T, U>(
+    publish_id: &str,
+    target_ip: [u8; 4],
+    tcp: Vec<(Binding, Option<String>, String, u16, bool, T)>,
+    udp: Vec<(Binding, Option<String>, String, u16, bool, U)>,
+    mut publish: impl FnMut(kiri_proto::Publish<'_>) -> io::Result<()>,
+    mut unpublish: impl FnMut(&str),
+) -> LinuxPublish<T, U> {
+    let all = udp
+        .iter()
+        .map(|(b, _, bind_ip, port, _, _)| (b, bind_ip, *port, true))
+        .chain(tcp.iter().map(|(b, _, bind_ip, port, _, _)| (b, bind_ip, *port, false)));
+    let mut published = Ok(false);
+    for (b, bind_ip, port, is_udp) in all.filter(|(_, bind_ip, ..)| kernel_forwards(bind_ip)) {
+        let p = kiri_proto::Publish {
+            id: publish_id,
+            udp: is_udp,
+            host_ip: kernel_host_ip(bind_ip).expect("checked IPv4 binding"),
+            host_port: port,
+            to_ip: target_ip,
+            to_port: b.container_port,
+        };
+        published = publish(p).map(|()| true);
+        if published.is_err() {
+            break;
+        }
+    }
+    match published {
+        Ok(any_published) => {
+            // Sockets only the kernel serves stay bound, so the ports read as taken.
+            let (kernel_udp, relay_udp): (Vec<_>, Vec<_>) = udp.into_iter().partition(|(_, _, bind_ip, ..)| !relays_too(bind_ip));
+            let (kernel_tcp, relay_tcp): (Vec<_>, Vec<_>) = tcp.into_iter().partition(|(_, _, bind_ip, ..)| !relays_too(bind_ip));
+            let mut kernel_bound = Vec::with_capacity(kernel_udp.len() + kernel_tcp.len());
+            kernel_bound.extend(kernel_udp.iter().filter_map(|(b, rep_ip, _, port, _, _)| rep_ip.as_ref().map(|ip| (b.clone(), ip.clone(), *port))));
+            kernel_bound.extend(kernel_tcp.iter().filter_map(|(b, rep_ip, _, port, _, _)| rep_ip.as_ref().map(|ip| (b.clone(), ip.clone(), *port))));
+            LinuxPublish {
+                any_published,
+                kernel_bound,
+                kernel_tcp: kernel_tcp.into_iter().map(|(.., s)| s).collect(),
+                kernel_udp: kernel_udp.into_iter().map(|(.., s)| s).collect(),
+                relay_tcp,
+                relay_udp,
+                fallback_error: None,
+            }
+        }
+        Err(e) => {
+            unpublish(publish_id);
+            LinuxPublish {
+                any_published: false,
+                kernel_bound: Vec::new(),
+                kernel_tcp: Vec::new(),
+                kernel_udp: Vec::new(),
+                relay_tcp: tcp,
+                relay_udp: udp,
+                fallback_error: Some(e),
+            }
+        }
+    }
 }
 
 /// Binds every port first (so a clash fails the start cleanly), then starts
@@ -710,8 +1067,8 @@ pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]
     } else {
         None
     };
-    let mut listeners: Vec<(Binding, Option<String>, String, u16, TcpListener)> = Vec::with_capacity(bindings.len());
-    let mut udp: Vec<(Binding, Option<String>, String, u16, UdpSocket)> = Vec::new();
+    let mut listeners: Vec<(Binding, Option<String>, String, u16, bool, TcpListener)> = Vec::with_capacity(bindings.len());
+    let mut udp: Vec<(Binding, Option<String>, String, u16, bool, UdpSocket)> = Vec::new();
     for b in bindings {
         // A port picked by the kernel (0) is picked once: the `::` listener
         // takes the one 0.0.0.0 got.
@@ -719,29 +1076,15 @@ pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]
         for (ip, required) in listen_addrs(b) {
             let addr = host_addr(&ip, port)?;
             let taken = |e: io::Error| {
-                if e.kind() == io::ErrorKind::AddrInUse {
-                    let shown = if addr.is_ipv6() { format!("[{ip}]") } else { ip.clone() };
-                    // Docker's words, then who has the port when it is not Kiri.
-                    let by = holder(b.host_port, b.proto == "udp").map(|name| format!(" (in use by {name})")).unwrap_or_default();
-                    io::Error::new(e.kind(), format!("Bind for {shown}:{} failed: port is already allocated{by}", b.host_port))
-                } else {
-                    e
-                }
+                let shown = if addr.is_ipv6() { format!("[{ip}]") } else { ip.clone() };
+                // Docker's words, then who has the port when it is not Kiri.
+                let by = (e.kind() == io::ErrorKind::AddrInUse).then(|| holder(b.host_port, b.proto == "udp")).flatten();
+                format_bind_error(e, &shown, &ip, b.host_port, by.as_deref(), cfg!(target_os = "macos"), shared_nat_active())
             };
             let is_udp = b.proto == "udp";
-            // Kiri's own container-domain router on this port lets it go
-            // (domains::step_aside), and the bind goes again.
-            let try_bind = |a: SocketAddr| {
-                bind_socket(a, is_udp).or_else(|e| {
-                    if e.kind() == io::ErrorKind::AddrInUse && !is_udp && port != 0 && super::domains::step_aside(port) {
-                        bind_socket(a, false)
-                    } else {
-                        Err(e)
-                    }
-                })
-            };
-            let (bound, bind_ip) = match try_bind(addr) {
-                Ok(s) => (Ok(s), ip.clone()),
+            let (bound, bind_ip, loopback_only) = match bind_with_macos_low_loopback(addr, port, is_udp, super::domains::step_aside) {
+                Ok((s, true)) => (Ok(s), wildcard_of(addr).ip().to_string(), true),
+                Ok((s, false)) => (Ok(s), ip.clone(), false),
                 // In WSL 2, a Windows host interface IP (`-p <WinLANIP>:port:cport`)
                 // is not assigned inside the Linux VM (`EADDRNOTAVAIL` / os error 99).
                 // When the IP belongs to a Windows host interface and WSL has a
@@ -756,12 +1099,16 @@ pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]
                 {
                     if let Some(fallback_ip) = wsl_eth0 {
                         let fallback_addr = SocketAddr::new(IpAddr::V4(fallback_ip), port);
-                        (try_bind(fallback_addr), fallback_ip.to_string())
+                        (
+                            bind_with_macos_low_loopback(fallback_addr, port, is_udp, super::domains::step_aside).map(|(s, _)| s),
+                            fallback_ip.to_string(),
+                            false,
+                        )
                     } else {
-                        (Err(e), ip.clone())
+                        (Err(e), ip.clone(), false)
                     }
                 }
-                Err(e) => (Err(e), ip.clone()),
+                Err(e) => (Err(e), ip.clone(), false),
             };
             let sock = match bound {
                 Ok(s) => s,
@@ -777,7 +1124,7 @@ pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]
                 let s = UdpSocket::from(sock);
                 s.set_nonblocking(true)?;
                 port = s.local_addr()?.port();
-                udp.push((b.clone(), Some(ip), bind_ip.clone(), port, s));
+                udp.push((b.clone(), Some(ip), bind_ip.clone(), port, loopback_only, s));
                 // WSL 2's localhostForwarding never forwards UDP, so `kiri-win`
                 // forwards Windows UDP ports (including 127.0.0.1:port/udp) to
                 // `<wsl_eth0>:<port>/udp`. Ensure `<wsl_eth0>:<port>/udp` is
@@ -787,12 +1134,12 @@ pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]
                     let eth0_str = eth0.to_string();
                     if bind_ip != "0.0.0.0"
                         && bind_ip != eth0_str
-                        && !udp.iter().any(|(_, _, bip, p, _)| *p == port && (bip == "0.0.0.0" || bip == &eth0_str))
+                        && !udp.iter().any(|(_, _, bip, p, _, _)| *p == port && (bip == "0.0.0.0" || bip == &eth0_str))
                         && let Ok(aux_fd) = bind_socket(SocketAddr::new(IpAddr::V4(eth0), port), true)
                     {
                         let aux = UdpSocket::from(aux_fd);
                         let _ = aux.set_nonblocking(true);
-                        udp.push((b.clone(), None, eth0_str, port, aux));
+                        udp.push((b.clone(), None, eth0_str, port, false, aux));
                     }
                 }
                 continue;
@@ -800,84 +1147,80 @@ pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]
             let l = TcpListener::from(sock);
             l.set_nonblocking(true)?;
             port = l.local_addr()?.port();
-            listeners.push((b.clone(), Some(ip.clone()), bind_ip.clone(), port, l));
+            listeners.push((b.clone(), Some(ip.clone()), bind_ip.clone(), port, loopback_only, l));
             if let Some(eth0) = wsl_eth0 {
                 let eth0_str = eth0.to_string();
                 if ip == "::"
-                    && !listeners.iter().any(|(_, _, bip, p, _)| *p == port && (bip == "0.0.0.0" || bip == &eth0_str))
+                    && !listeners.iter().any(|(_, _, bip, p, _, _)| *p == port && (bip == "0.0.0.0" || bip == &eth0_str))
                     && let Ok(aux_fd) = bind_socket(SocketAddr::new(IpAddr::V4(eth0), port), false)
                 {
                     let aux = TcpListener::from(aux_fd);
                     let _ = aux.set_nonblocking(true);
-                    listeners.push((b.clone(), None, eth0_str, port, aux));
+                    listeners.push((b.clone(), None, eth0_str, port, false, aux));
                 }
             }
         }
     }
-    let mut fw = Forwards { wake: Vec::new(), threads: Vec::new(), kernel: None, nat: None, loopback: None, bound: Vec::new() };
+    let publish_id = publish_key(id);
+    let mut fw = Forwards {
+        wake: Vec::new(),
+        threads: Vec::new(),
+        kernel: None,
+        nat: None,
+        loopback: None,
+        host_port_53: None,
+        bound: Vec::new(),
+        #[cfg(test)]
+        on_drop: None,
+    };
     // On a Linux host the daemon shares the kernel with the containers, so
     // the kernel can rewrite the packets (nftables DNAT) instead of two
     // user-space relays copying every byte; that serves every address but
-    // loopback. The listeners below relay the rest.
+    // loopback. The listeners below relay the rest (and everything when the
+    // host firewall blocks kernel FORWARD, #649).
     if cfg!(target_os = "linux") && target_ip != [127, 0, 0, 1] {
-        let all = udp
-            .iter()
-            .map(|(b, _, bind_ip, port, _)| (b, bind_ip, *port, true))
-            .chain(listeners.iter().map(|(b, _, bind_ip, port, _)| (b, bind_ip, *port, false)));
-        let mut published = Ok(false);
-        for (b, bind_ip, port, is_udp) in all.filter(|(_, bind_ip, ..)| kernel_forwards(bind_ip)) {
-            let p = kiri_proto::Publish {
-                id,
-                udp: is_udp,
-                host_ip: kernel_host_ip(bind_ip).expect("checked IPv4 binding"),
-                host_port: port,
-                to_ip: target_ip,
-                to_port: b.container_port,
-            };
-            published = vm.publish(p).map(|()| true);
-            if published.is_err() {
-                break;
+        let res = publish_linux_host(
+            &publish_id,
+            target_ip,
+            listeners,
+            udp,
+            |p| vm.publish(p),
+            |pid| {
+                let _ = vm.unpublish(pid);
+            },
+        );
+        if let Some(e) = res.fallback_error {
+            crate::diag::warn!("kernel port forwarding failed; relaying in user space", id = &id[..id.len().min(12)], error = e);
+        } else {
+            fw.bound.extend(res.kernel_bound);
+            if res.any_published {
+                fw.kernel = Some((vm.clone(), publish_id.clone(), res.kernel_tcp, res.kernel_udp));
             }
         }
-        match published {
-            Ok(any) => {
-                // Sockets only the kernel serves stay bound, so the ports read as taken.
-                let (kernel_udp, relay_udp): (Vec<_>, Vec<_>) = udp.into_iter().partition(|(_, _, bind_ip, ..)| !relays_too(bind_ip));
-                let (kernel_tcp, relay_tcp): (Vec<_>, Vec<_>) = listeners.into_iter().partition(|(_, _, bind_ip, ..)| !relays_too(bind_ip));
-                fw.bound.extend(kernel_udp.iter().filter_map(|(b, rep_ip, _, port, _)| rep_ip.as_ref().map(|ip| (b.clone(), ip.clone(), *port))));
-                fw.bound.extend(kernel_tcp.iter().filter_map(|(b, rep_ip, _, port, _)| rep_ip.as_ref().map(|ip| (b.clone(), ip.clone(), *port))));
-                if any {
-                    fw.kernel = Some((vm.clone(), id.to_owned(), kernel_tcp.into_iter().map(|(.., s)| s).collect(), kernel_udp.into_iter().map(|(.., s)| s).collect()));
-                }
-                udp = relay_udp;
-                listeners = relay_tcp;
-            }
-            Err(e) => {
-                let _ = vm.unpublish(id);
-                crate::diag::warn!("kernel port forwarding failed; relaying in user space", id = &id[..id.len().min(12)], error = e);
-            }
-        }
+        udp = res.relay_udp;
+        listeners = res.relay_tcp;
     }
-    for (b, rep_ip, _bind_ip, port, sock) in udp {
+    for (b, rep_ip, _bind_ip, port, loopback_only, sock) in udp {
         let (wake_r, wake_w) = pipe()?;
         fw.wake.push(wake_w);
         let vm = vm.clone();
         let container_port = b.container_port;
         fw.threads.push(std::thread::Builder::new().name(format!("kiri-udp-{port}")).spawn(move || {
-            udp_loop(&sock, &wake_r, &vm, target_ip, container_port);
+            udp_loop(&sock, &wake_r, &vm, target_ip, container_port, loopback_only);
         })?);
         if let Some(ip) = rep_ip {
             fw.bound.push((b, ip, port));
         }
     }
     // In the VM: the guest kernel forwards each TCP binding from a port of
-    // its own on the NAT network. A target on loopback stays relayed.
+    // its own on the NAT network. A target on loopback (or a VM booted without
+    // shared NAT) stays relayed over vsock.
     let mut nat = vec![None; listeners.len()];
-    if cfg!(target_os = "macos") && target_ip != [127, 0, 0, 1] && !listeners.is_empty() {
-        match publish_nat(&vm, id, &listeners.iter().map(|(b, ..)| b.container_port).collect::<Vec<_>>(), target_ip) {
+    if cfg!(target_os = "macos") && shared_nat_active() && target_ip != [127, 0, 0, 1] && !listeners.is_empty() {
+        match publish_nat(&vm, &publish_id, &listeners.iter().map(|(b, ..)| b.container_port).collect::<Vec<_>>(), target_ip) {
             Ok((addrs, ports)) => {
                 nat = addrs.into_iter().map(Some).collect();
-                fw.nat = Some((vm.clone(), id.to_owned(), ports));
+                fw.nat = Some((vm.clone(), publish_id.clone(), ports));
             }
             Err(e) => crate::diag::warn!("NAT port forwarding unavailable; relaying over vsock", id = &id[..id.len().min(12)], error = e),
         }
@@ -889,30 +1232,33 @@ pub fn start(vm: Arc<VmLink>, id: &str, bindings: &[Binding], target_ip: [u8; 4]
     // listener. As on Docker, where a published port is bound in the host's
     // namespace. A target on loopback is itself a host-network container.
     if cfg!(target_os = "macos") && target_ip != [127, 0, 0, 1] {
-        let ports = loopback_ports(listeners.iter().filter_map(|(b, rep_ip, _, port, _)| rep_ip.as_deref().map(|ip| (b.container_port, ip, *port))));
+        let ports = loopback_ports(listeners.iter().filter_map(|(b, rep_ip, _, port, _, _)| rep_ip.as_deref().map(|ip| (b.container_port, ip, *port))));
         let mut published = false;
         for (to_port, host_port) in ports {
-            let p = kiri_proto::Publish { id, udp: false, host_ip: [127, 0, 0, 1], host_port, to_ip: target_ip, to_port };
+            let p = kiri_proto::Publish { id: &publish_id, udp: false, host_ip: [127, 0, 0, 1], host_port, to_ip: target_ip, to_port };
             match vm.publish(p) {
                 Ok(()) => published = true,
                 Err(e) => crate::diag::warn!("published port not reachable from host-network containers", port = host_port, error = e),
             }
         }
         if published {
-            fw.loopback = Some((vm.clone(), id.to_owned()));
+            fw.loopback = Some((vm.clone(), publish_id.clone()));
         }
     }
-    for ((b, rep_ip, _bind_ip, port, listener), nat) in listeners.into_iter().zip(nat) {
+    for ((b, rep_ip, _bind_ip, port, loopback_only, listener), nat) in listeners.into_iter().zip(nat) {
         let (wake_r, wake_w) = pipe()?;
         fw.wake.push(wake_w);
         let vm = vm.clone();
         let container_port = b.container_port;
         fw.threads.push(std::thread::Builder::new().name(format!("kiri-port-{port}")).spawn(move || {
-            accept_loop(&listener, &wake_r, &vm, target_ip, container_port, nat);
+            accept_loop(&listener, &wake_r, &vm, target_ip, container_port, nat, loopback_only);
         })?);
         if let Some(ip) = rep_ip {
             fw.bound.push((b, ip, port));
         }
+    }
+    if binds_host_dns_port(&fw.bound) {
+        fw.host_port_53 = Some(HostPort53Guard::acquire());
     }
     Ok(fw)
 }
@@ -959,7 +1305,7 @@ struct UdpSession {
     last: Instant,
     reader: JoinHandle<()>,
     // Keeps the connection open until the session ends.
-    _guest: kiri_vmm::VsockStream,
+    _guest: Option<kiri_vmm::VsockStream>,
 }
 
 impl UdpSession {
@@ -970,9 +1316,31 @@ impl UdpSession {
     }
 }
 
+fn udp_idle_timeout(host_port: u16, container_port: u16) -> Duration {
+    if host_port == 53 || container_port == 53 { UDP_DNS_IDLE } else { UDP_IDLE }
+}
+
 /// Datagrams from each client go to the container over its own session;
 /// replies come back to that client. Quiet sessions close.
-fn udp_loop(sock: &UdpSocket, wake: &OwnedFd, vm: &Arc<VmLink>, ip: [u8; 4], port: u16) {
+fn udp_loop(sock: &UdpSocket, wake: &OwnedFd, vm: &Arc<VmLink>, ip: [u8; 4], port: u16, loopback_only: bool) {
+    let host_port = sock.local_addr().map(|a| a.port()).unwrap_or(0);
+    udp_loop_with(sock, wake, loopback_only, udp_idle_timeout(host_port, port), |s, peer| {
+        open_udp_session(s, vm, ip, port, peer)
+    });
+}
+
+fn udp_loop_with(
+    sock: &UdpSocket,
+    wake: &OwnedFd,
+    loopback_only: bool,
+    idle: Duration,
+    mut open_session: impl FnMut(&UdpSocket, SocketAddr) -> io::Result<UdpSession>,
+) {
+    if cfg!(target_os = "macos") && loopback_only {
+        let is_v6 = sock.local_addr().is_ok_and(|a| a.is_ipv6());
+        let _ = bind_loopback_interface(sock.as_raw_fd(), is_v6);
+    }
+    let poll_ms = (idle.as_millis() / 2).clamp(100, 5_000) as libc::c_int;
     let mut sessions: std::collections::HashMap<SocketAddr, UdpSession> = std::collections::HashMap::new();
     let mut buf = vec![0u8; 65_536];
     loop {
@@ -989,7 +1357,7 @@ fn udp_loop(sock: &UdpSocket, wake: &OwnedFd, vm: &Arc<VmLink>, ip: [u8; 4], por
             },
         ];
         // SAFETY: polling two descriptors we own; wake up now and then to reap.
-        let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, 5_000) };
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, poll_ms) };
         if n < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
             break;
         }
@@ -997,6 +1365,9 @@ fn udp_loop(sock: &UdpSocket, wake: &OwnedFd, vm: &Arc<VmLink>, ip: [u8; 4], por
             break; // the container stopped
         }
         while let Ok((len, peer)) = sock.recv_from(&mut buf) {
+            if !peer_allowed(peer.ip(), loopback_only) {
+                continue;
+            }
             if !sessions.contains_key(&peer) {
                 // Cap sessions so a source-spoofing flood cannot exhaust
                 // threads and guest connections; drop the oldest to make room.
@@ -1007,7 +1378,7 @@ fn udp_loop(sock: &UdpSocket, wake: &OwnedFd, vm: &Arc<VmLink>, ip: [u8; 4], por
                         }
                     }
                 }
-                match open_udp_session(sock, vm, ip, port, peer) {
+                match open_session(sock, peer) {
                     Ok(s) => {
                         sessions.insert(peer, s);
                     }
@@ -1025,8 +1396,8 @@ fn udp_loop(sock: &UdpSocket, wake: &OwnedFd, vm: &Arc<VmLink>, ip: [u8; 4], por
                 }
             }
         }
-        let idle: Vec<SocketAddr> = sessions.iter().filter(|(_, s)| s.last.elapsed() >= UDP_IDLE || s.reader.is_finished()).map(|(a, _)| *a).collect();
-        for a in idle {
+        let idle_peers: Vec<SocketAddr> = sessions.iter().filter(|(_, s)| s.last.elapsed() >= idle || s.reader.is_finished()).map(|(a, _)| *a).collect();
+        for a in idle_peers {
             if let Some(s) = sessions.remove(&a) {
                 s.close();
             }
@@ -1063,7 +1434,7 @@ fn open_udp_session(sock: &UdpSocket, vm: &VmLink, ip: [u8; 4], port: u16, peer:
         to_guest,
         last: Instant::now(),
         reader,
-        _guest: guest,
+        _guest: Some(guest),
     })
 }
 
@@ -1104,7 +1475,7 @@ fn relay_local(client: TcpStream, to: SocketAddr) -> io::Result<()> {
     relay_tcp(client, guest)
 }
 
-fn accept_loop(listener: &TcpListener, wake: &OwnedFd, vm: &Arc<VmLink>, ip: [u8; 4], port: u16, nat: Option<SocketAddr>) {
+fn accept_loop(listener: &TcpListener, wake: &OwnedFd, vm: &Arc<VmLink>, ip: [u8; 4], port: u16, nat: Option<SocketAddr>, loopback_only: bool) {
     loop {
         let mut fds = [
             libc::pollfd {
@@ -1129,6 +1500,11 @@ fn accept_loop(listener: &TcpListener, wake: &OwnedFd, vm: &Arc<VmLink>, ip: [u8
             return; // the container stopped
         }
         while let Ok((client, from)) = listener.accept() {
+            if !peer_allowed(from.ip(), loopback_only)
+                || (loopback_only && !client.local_addr().is_ok_and(|a| peer_allowed(a.ip(), true)))
+            {
+                continue;
+            }
             let Some(permit) = tcp_permit(from.ip()) else {
                 continue;
             };
@@ -1180,7 +1556,7 @@ fn relay(client: TcpStream, vm: &VmLink, ip: [u8; 4], port: u16, nat: Option<Soc
     if cfg!(target_os = "linux") {
         return relay_direct(client, ip, port);
     }
-    if let Some(addr) = nat.filter(|_| nat_usable() && nat_budget()) {
+    if let Some(addr) = nat.filter(|_| shared_nat_active() && nat_usable() && nat_budget()) {
         match TcpStream::connect_timeout(&addr, NAT_CONNECT) {
             Ok(guest) => {
                 NAT_TIMEOUTS.store(0, Ordering::Relaxed);
@@ -2028,11 +2404,13 @@ fn parse_cidr_str(s: &str) -> Option<([u8; 4], u8)> {
 
 /// Computes the egress CIDR strings to send to the guest given:
 /// - `env_mode`: `KIRI_HOST_EGRESS` (`auto`, `always`, `off`, or comma-separated CIDRs)
+/// - `shared_nat`: whether the macOS VM attached `VZNATNetworkDeviceAttachment`
 /// - `has_net_ext`: whether an active third-party macOS NetworkExtension filter/proxy is enabled
 /// - `tunnel_routes`: IPv4 prefixes routed over tunnel interfaces (`utun*`, `ipsec*`, `ppp*`, `gpd*`, `feth*`)
 /// - `is_macos`: whether the host is macOS
-pub fn host_egress_routes_for(
+pub fn host_egress_routes_with_nat(
     env_mode: Option<&str>,
+    shared_nat: bool,
     has_net_ext: bool,
     tunnel_routes: &[([u8; 4], u8)],
     is_macos: bool,
@@ -2054,7 +2432,7 @@ pub fn host_egress_routes_for(
     if !is_macos {
         return Vec::new();
     }
-    if has_net_ext {
+    if !shared_nat || has_net_ext {
         return vec!["0.0.0.0/0".into()];
     }
     let mut all = tunnel_routes.to_vec();
@@ -2063,6 +2441,16 @@ pub fn host_egress_routes_for(
         .into_iter()
         .map(|(ip, p)| format!("{}.{}.{}.{}/{p}", ip[0], ip[1], ip[2], ip[3]))
         .collect()
+}
+
+#[cfg(test)]
+pub fn host_egress_routes_for(
+    env_mode: Option<&str>,
+    has_net_ext: bool,
+    tunnel_routes: &[([u8; 4], u8)],
+    is_macos: bool,
+) -> Vec<String> {
+    host_egress_routes_with_nat(env_mode, true, has_net_ext, tunnel_routes, is_macos)
 }
 
 #[cfg(target_os = "macos")]
@@ -2110,7 +2498,7 @@ pub fn current_egress_routes() -> Vec<String> {
     };
     #[cfg(not(target_os = "macos"))]
     let (has_ext, tunnel_routes) = (false, Vec::new());
-    host_egress_routes_for(env_mode.as_deref(), has_ext, &tunnel_routes, cfg!(target_os = "macos"))
+    host_egress_routes_with_nat(env_mode.as_deref(), shared_nat_active(), has_ext, &tunnel_routes, cfg!(target_os = "macos"))
 }
 
 /// Sends the initial egress routes to `vm` and, on macOS, watches `PF_ROUTE`
@@ -2179,22 +2567,533 @@ fn watch_macos_routes(weak: std::sync::Weak<VmLink>, mut last: Vec<String>) {
 /// vsock port the guest dials for SSH agent connections.
 pub const SSH_AGENT_PORT: u32 = 1027;
 
-/// The Mac's SSH agent socket: `$SSH_AUTH_SOCK`, or launchd's if the daemon
-/// was not started from a shell that has it.
-fn ssh_auth_sock() -> Option<std::path::PathBuf> {
-    if let Some(p) = std::env::var_os("SSH_AUTH_SOCK") {
-        return Some(p.into());
+/// Host SSH agent socket last bind-mounted explicitly by a host-side create
+/// (or restored at start from a strict user agent mount) on macOS. Validated
+/// before storing (canonicalized, owned Unix socket, allowed SSH agent path,
+/// never Kiri's own socket) and re-checked on every connection.
+static PREFERRED_SSH_AUTH_SOCK: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+/// Normalizes an absolute path lexically (`//`, `/./`, `/../`) without
+/// touching the filesystem.
+fn lexical_clean_path(p: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for c in p.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
     }
-    let out = std::process::Command::new("/bin/launchctl").args(["getenv", "SSH_AUTH_SOCK"]).output().ok()?;
+    format!("/{}", out.join("/"))
+}
+
+/// Whether `path` is Apple launchd's default per-session SSH agent socket:
+/// `/private/tmp/com.apple.launchd.<id>/Listeners`,
+/// `/tmp/com.apple.launchd.<id>/Listeners`,
+/// `/private/var/run/com.apple.launchd.<id>/Listeners`, or
+/// `/var/run/com.apple.launchd.<id>/Listeners`.
+pub(crate) fn is_launchd_ssh_sock(path: &std::path::Path) -> bool {
+    let Some(s) = path.to_str() else { return false };
+    if !s.starts_with('/') {
+        return false;
+    }
+    let clean = lexical_clean_path(s);
+    const PREFIXES: &[&str] = &["/private/tmp/", "/tmp/", "/private/var/run/", "/var/run/"];
+    let Some(rest) = PREFIXES.iter().find_map(|p| clean.strip_prefix(p)) else {
+        return false;
+    };
+    let Some(dir) = rest.strip_suffix("/Listeners") else {
+        return false;
+    };
+    dir.starts_with("com.apple.launchd.")
+        && !dir.contains('/')
+        && dir.len() > "com.apple.launchd.".len()
+}
+
+/// Whether `path` exists as a Unix domain socket owned by this process's
+/// effective UID (follows symlinks, matching `UnixStream::connect`).
+pub(crate) fn is_owned_unix_socket(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    // SAFETY: geteuid only reads this process's effective user ID.
+    meta.file_type().is_socket() && meta.uid() == unsafe { libc::geteuid() }
+}
+
+fn is_kiri_run_dir(dir: &std::path::Path) -> bool {
+    match dir.file_name().and_then(|n| n.to_str()) {
+        Some("kiri") => true,
+        Some("run") => dir
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(".kiri") || n == "kiri"),
+        _ => false,
+    }
+}
+
+/// Whether `path` is Kiri's own daemon socket or sits inside Kiri's runtime
+/// socket directory (`~/.kiri*/run/` or `/run/kiri/`). Never allowed as an SSH
+/// agent upstream.
+pub(crate) fn is_kiri_socket_path(path: &std::path::Path) -> bool {
+    let Some(s) = path.to_str() else { return false };
+    if super::binds::engine_socket(s).is_some() {
+        return true;
+    }
+    let clean = std::path::PathBuf::from(lexical_clean_path(s));
+    let canon = std::fs::canonicalize(path).unwrap_or_else(|_| clean.clone());
+    for own in [super::socket_path().ok(), super::home_socket_path().ok()].into_iter().flatten() {
+        let own_clean = std::path::PathBuf::from(lexical_clean_path(&own.to_string_lossy()));
+        let own_canon = std::fs::canonicalize(&own).unwrap_or_else(|_| own_clean.clone());
+        if canon == own_canon || clean == own_clean {
+            return true;
+        }
+        if let Some(dir) = own_canon.parent()
+            && is_kiri_run_dir(dir)
+            && canon.starts_with(dir)
+        {
+            return true;
+        }
+        if let Some(dir) = own_clean.parent()
+            && is_kiri_run_dir(dir)
+            && clean.starts_with(dir)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether `path` (already canonicalized when on disk, or lexically cleaned
+/// otherwise) names a well-known macOS SSH agent socket:
+/// - Apple launchd's `com.apple.launchd.*/Listeners`
+/// - GnuPG's `S.gpg-agent.ssh` under a Mac user or temp share
+/// - 1Password's `~/.1password/agent.sock` or
+///   `~/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock`
+pub(crate) fn is_known_mac_ssh_agent_sock_path(path: &std::path::Path) -> bool {
+    if is_launchd_ssh_sock(path) {
+        return true;
+    }
+    let Some(s) = path.to_str() else { return false };
+    if !s.starts_with('/') {
+        return false;
+    }
+    let clean = lexical_clean_path(s);
+    if clean.ends_with("/S.gpg-agent.ssh") {
+        const SHARES: &[&str] = &[
+            "/Users/",
+            "/Volumes/",
+            "/private/tmp/",
+            "/tmp/",
+            "/private/var/folders/",
+            "/var/folders/",
+        ];
+        if SHARES.iter().any(|p| clean.starts_with(p)) {
+            return true;
+        }
+        for var in ["HOME", "GNUPGHOME"] {
+            if let Some(dir) = std::env::var_os(var).filter(|v| !v.is_empty()) {
+                let base = lexical_clean_path(&dir.to_string_lossy());
+                if clean.strip_prefix(&base).is_some_and(|r| r.starts_with('/')) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    const ONE_PASSWORD_SUFFIXES: &[&str] = &[
+        "/.1password/agent.sock",
+        "/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock",
+    ];
+    for suffix in ONE_PASSWORD_SUFFIXES {
+        if let Some(prefix) = clean.strip_suffix(suffix) {
+            if prefix.starts_with("/Users/") || prefix.starts_with("/Volumes/") {
+                return true;
+            }
+            if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty())
+                && prefix == lexical_clean_path(&home.to_string_lossy())
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Strict allowlist used when restoring a preferred SSH agent socket on
+/// container start (without caller context): only permits launchd's
+/// `Listeners`, 1Password's `agent.sock` directly under the user's `$HOME`,
+/// or GnuPG's `S.gpg-agent.ssh` inside `~/.gnupg`, `$GNUPGHOME`, or
+/// `gpgconf --list-dirs agent-ssh-socket`.
+fn is_strict_mac_ssh_agent_sock_path_for(
+    path: &std::path::Path,
+    home: Option<&std::path::Path>,
+    gnupg_home: Option<&std::path::Path>,
+    gpgconf_sock: Option<&std::path::Path>,
+) -> bool {
+    if is_launchd_ssh_sock(path) {
+        return true;
+    }
+    let Some(s) = path.to_str() else { return false };
+    if !s.starts_with('/') {
+        return false;
+    }
+    let clean = lexical_clean_path(s);
+    let same = |candidate: std::path::PathBuf| -> bool {
+        let cand_clean = lexical_clean_path(&candidate.to_string_lossy());
+        if clean == cand_clean {
+            return true;
+        }
+        std::fs::canonicalize(&candidate)
+            .ok()
+            .and_then(|c| c.to_str().map(lexical_clean_path))
+            .is_some_and(|c| c == clean)
+    };
+    if let Some(h) = home {
+        for rel in [
+            ".gnupg/S.gpg-agent.ssh",
+            ".1password/agent.sock",
+            "Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock",
+        ] {
+            if same(h.join(rel)) {
+                return true;
+            }
+        }
+    }
+    if let Some(g) = gnupg_home
+        && same(g.join("S.gpg-agent.ssh"))
+    {
+        return true;
+    }
+    if let Some(sock) = gpgconf_sock
+        && same(sock.to_path_buf())
+    {
+        return true;
+    }
+    false
+}
+
+/// Whether a `gpg-agent.conf` file enables SSH agent support via an
+/// uncommented `enable-ssh-support` directive.
+fn gpg_agent_ssh_enabled(conf: &str) -> bool {
+    let mut enabled = false;
+    for line in conf.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        match line.split_whitespace().next() {
+            Some("enable-ssh-support") => enabled = true,
+            Some("no-enable-ssh-support") => enabled = false,
+            _ => {}
+        }
+    }
+    enabled
+}
+
+fn launchctl_getenv(var: &str) -> Option<std::path::PathBuf> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let out = std::process::Command::new("/bin/launchctl")
+        .args(["getenv", var])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
     let p = String::from_utf8_lossy(&out.stdout).trim().to_owned();
     (!p.is_empty()).then(|| p.into())
+}
+
+fn gpgconf_candidates() -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            if !dir.as_os_str().is_empty() {
+                out.push(dir.join("gpgconf"));
+            }
+        }
+    }
+    for fallback in [
+        "/opt/homebrew/bin/gpgconf",
+        "/usr/local/bin/gpgconf",
+        "/usr/local/MacGPG2/bin/gpgconf",
+    ] {
+        let p = std::path::PathBuf::from(fallback);
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+fn is_executable_file(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && (m.permissions().mode() & 0o111 != 0))
+}
+
+fn gpgconf_agent_ssh_socket(gnupg_home: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    let bin = gpgconf_candidates().into_iter().find(|p| is_executable_file(p))?;
+    let mut cmd = std::process::Command::new(bin);
+    cmd.args(["--list-dirs", "agent-ssh-socket"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if let Some(dir) = gnupg_home {
+        cmd.env("GNUPGHOME", dir);
+    }
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    (!s.is_empty()).then(|| std::path::PathBuf::from(s))
+}
+
+/// Checks whether GPG SSH support is enabled in `$GNUPGHOME/gpg-agent.conf`
+/// (when `GNUPGHOME` is set) or `~/.gnupg/gpg-agent.conf`, and if so returns
+/// candidate GPG SSH agent socket paths in preference order.
+fn gather_gpg_ssh_info(
+    gnupg_home: Option<&std::path::Path>,
+    home: Option<&std::path::Path>,
+    gpgconf_sock: impl FnOnce(Option<&std::path::Path>) -> Option<std::path::PathBuf>,
+) -> (bool, Vec<std::path::PathBuf>) {
+    let conf_dir = gnupg_home.map(std::path::Path::to_path_buf).or_else(|| home.map(|h| h.join(".gnupg")));
+    let enabled = conf_dir
+        .as_deref()
+        .and_then(|d| std::fs::read_to_string(d.join("gpg-agent.conf")).ok())
+        .is_some_and(|text| gpg_agent_ssh_enabled(&text));
+    if !enabled {
+        return (false, Vec::new());
+    }
+    let mut socks = Vec::new();
+    let mut push_unique = |p: std::path::PathBuf| {
+        if !p.as_os_str().is_empty() && !socks.contains(&p) {
+            socks.push(p);
+        }
+    };
+    if let Some(g) = gnupg_home {
+        push_unique(g.join("S.gpg-agent.ssh"));
+    }
+    if let Some(s) = gpgconf_sock(gnupg_home) {
+        push_unique(s);
+    }
+    if let Some(h) = home {
+        push_unique(h.join(".gnupg/S.gpg-agent.ssh"));
+    }
+    (true, socks)
+}
+
+/// Inputs to [`resolve_ssh_auth_sock_candidates`], factored out so the macOS
+/// resolution order can be unit-tested without touching process environment or
+/// spawning `launchctl`/`gpgconf`.
+#[derive(Default)]
+struct SshAuthInputs {
+    preferred: Option<std::path::PathBuf>,
+    env_sock: Option<std::path::PathBuf>,
+    launchctl_sock: Option<std::path::PathBuf>,
+    gpg_ssh_enabled: bool,
+    gpg_sockets: Vec<std::path::PathBuf>,
+}
+
+/// Orders live host SSH agent socket candidates on macOS:
+/// 1. Explicit host SSH agent socket recorded from a Mac bind mount.
+/// 2. Explicit non-launchd `$SSH_AUTH_SOCK` in this process's environment.
+/// 3. Explicit non-launchd `launchctl getenv SSH_AUTH_SOCK`.
+/// 4. GnuPG's `S.gpg-agent.ssh` when `gpg-agent.conf` has `enable-ssh-support`.
+/// 5. Fallback to launchd's default `com.apple.launchd.*/Listeners` socket.
+fn resolve_ssh_auth_sock_candidates(
+    inputs: &SshAuthInputs,
+    is_live: impl Fn(&std::path::Path) -> bool,
+) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut push_unique = |p: &std::path::Path| {
+        if !p.as_os_str().is_empty() && !out.iter().any(|existing: &std::path::PathBuf| existing == p) {
+            out.push(p.to_path_buf());
+        }
+    };
+    // 1) Explicit host SSH agent socket recorded from a Mac bind mount.
+    if let Some(p) = inputs.preferred.as_deref()
+        && is_live(p)
+    {
+        push_unique(p);
+    }
+    // 2) Explicit non-launchd $SSH_AUTH_SOCK from daemon environment.
+    if let Some(p) = inputs.env_sock.as_deref()
+        && !is_launchd_ssh_sock(p)
+        && is_live(p)
+    {
+        push_unique(p);
+    }
+    // 3) Explicit non-launchd `launchctl getenv SSH_AUTH_SOCK`.
+    if let Some(p) = inputs.launchctl_sock.as_deref()
+        && !is_launchd_ssh_sock(p)
+        && is_live(p)
+    {
+        push_unique(p);
+    }
+    // 4) GPG SSH agent socket when `enable-ssh-support` is configured.
+    if inputs.gpg_ssh_enabled {
+        for p in &inputs.gpg_sockets {
+            if is_live(p) {
+                push_unique(p);
+            }
+        }
+    }
+    // 5) Fallback to launchd's Listeners socket from env or launchctl.
+    for p in [inputs.env_sock.as_deref(), inputs.launchctl_sock.as_deref()].into_iter().flatten() {
+        if is_live(p) {
+            push_unique(p);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+fn resolve_ssh_auth_sock(
+    inputs: &SshAuthInputs,
+    is_live: impl Fn(&std::path::Path) -> bool,
+) -> Option<std::path::PathBuf> {
+    resolve_ssh_auth_sock_candidates(inputs, is_live).into_iter().next()
+}
+
+fn gather_ssh_auth_inputs(include_preferred: bool) -> SshAuthInputs {
+    let preferred = if include_preferred {
+        PREFERRED_SSH_AUTH_SOCK.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    } else {
+        None
+    };
+    let env_sock = std::env::var_os("SSH_AUTH_SOCK")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from);
+    if !cfg!(target_os = "macos") {
+        return SshAuthInputs {
+            preferred: None,
+            env_sock,
+            launchctl_sock: None,
+            gpg_ssh_enabled: false,
+            gpg_sockets: Vec::new(),
+        };
+    }
+    let launchctl_sock = launchctl_getenv("SSH_AUTH_SOCK");
+    let home = std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from);
+    let gnupg_home = std::env::var_os("GNUPGHOME")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| launchctl_getenv("GNUPGHOME"));
+    let (gpg_ssh_enabled, gpg_sockets) = gather_gpg_ssh_info(
+        gnupg_home.as_deref(),
+        home.as_deref(),
+        gpgconf_agent_ssh_socket,
+    );
+    SshAuthInputs {
+        preferred,
+        env_sock,
+        launchctl_sock,
+        gpg_ssh_enabled,
+        gpg_sockets,
+    }
+}
+
+fn ssh_auth_sock_candidates_for(include_preferred: bool) -> Vec<std::path::PathBuf> {
+    let inputs = gather_ssh_auth_inputs(include_preferred);
+    if cfg!(target_os = "macos") {
+        resolve_ssh_auth_sock_candidates(&inputs, is_owned_unix_socket)
+    } else {
+        // On Linux the daemon may run as root while $SSH_AUTH_SOCK belongs
+        // to a non-root user, so keep the existing env behavior.
+        inputs.env_sock.into_iter().collect()
+    }
+}
+
+/// The host's discovered SSH agent socket, ignoring any previously recorded
+/// bind-mount preference (so bind-mount validation cannot bootstrap itself).
+pub(crate) fn default_ssh_auth_sock() -> Option<std::path::PathBuf> {
+    ssh_auth_sock_candidates_for(false).into_iter().next()
+}
+
+/// Whether `canon` (already canonicalized) matches the daemon's discovered
+/// host SSH agent socket (`default_ssh_auth_sock()`).
+pub(crate) fn matches_default_ssh_auth_sock(canon: &std::path::Path) -> bool {
+    let Some(default) = default_ssh_auth_sock() else { return false };
+    let default_canon = std::fs::canonicalize(&default).unwrap_or(default);
+    canon == default_canon
+}
+
+fn set_preferred_ssh_auth_sock_inner(path: &std::path::Path, strict: bool) -> bool {
+    let Ok(canon) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    if !is_owned_unix_socket(&canon) || is_kiri_socket_path(&canon) {
+        return false;
+    }
+    let allowed = if strict {
+        let home = std::env::var_os("HOME")
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from);
+        let gnupg_home = std::env::var_os("GNUPGHOME")
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from)
+            .or_else(|| launchctl_getenv("GNUPGHOME"));
+        let gpgconf_sock = canon
+            .file_name()
+            .is_some_and(|n| n == "S.gpg-agent.ssh")
+            .then(|| gpgconf_agent_ssh_socket(gnupg_home.as_deref()))
+            .flatten();
+        is_strict_mac_ssh_agent_sock_path_for(&canon, home.as_deref(), gnupg_home.as_deref(), gpgconf_sock.as_deref())
+            || matches_default_ssh_auth_sock(&canon)
+    } else {
+        is_known_mac_ssh_agent_sock_path(&canon) || matches_default_ssh_auth_sock(&canon)
+    };
+    if !allowed {
+        return false;
+    }
+    *PREFERRED_SSH_AUTH_SOCK.lock().unwrap_or_else(|e| e.into_inner()) = Some(canon);
+    true
+}
+
+/// Records an explicitly bind-mounted Mac SSH agent socket (from a host
+/// caller) as the preferred upstream for `serve_ssh_agent`, after verifying
+/// canonical path, Unix socket type, current-UID ownership, allowlist, and
+/// that it is never Kiri's own daemon socket.
+pub(crate) fn set_preferred_ssh_auth_sock(path: &std::path::Path) -> bool {
+    set_preferred_ssh_auth_sock_inner(path, false)
+}
+
+/// Strict variant used on container start (when caller identity is no longer
+/// present): only records sockets under the user's own GPG/1Password/launchd
+/// locations or matching `default_ssh_auth_sock()`.
+pub(crate) fn set_preferred_ssh_auth_sock_strict(path: &std::path::Path) -> bool {
+    set_preferred_ssh_auth_sock_inner(path, true)
+}
+
+#[cfg(test)]
+pub(crate) static PREFERRED_SSH_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn current_preferred_ssh_auth_sock() -> Option<std::path::PathBuf> {
+    PREFERRED_SSH_AUTH_SOCK.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+#[cfg(test)]
+pub(crate) fn clear_preferred_ssh_auth_sock() {
+    *PREFERRED_SSH_AUTH_SOCK.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// One container connection to the SSH agent, relayed to the Mac's agent.
 pub fn serve_ssh_agent(stream: kiri_vmm::VsockStream) {
     let _ = std::thread::Builder::new().name("kiri-ssh-agent".into()).spawn(move || {
-        let Some(path) = ssh_auth_sock() else { return };
-        let Ok(agent) = std::os::unix::net::UnixStream::connect(path) else {
+        let Some(agent) = ssh_auth_sock_candidates_for(true)
+            .into_iter()
+            .find_map(|path| std::os::unix::net::UnixStream::connect(path).ok())
+        else {
             return;
         };
         let (Ok(mut agent_read), Ok(from_guest), Ok(to_guest)) = (agent.try_clone(), stream.fd.try_clone(), stream.fd.try_clone()) else {
@@ -2238,71 +3137,292 @@ pub fn serve_engine_api(stream: kiri_vmm::VsockStream, engine: std::sync::Weak<s
     });
 }
 
+fn set_nonblocking_cloexec(fd: std::os::fd::RawFd) -> io::Result<()> {
+    // SAFETY: fcntl on a descriptor we own.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: F_GETFL takes no extra args on a descriptor we own.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if flags & libc::O_NONBLOCK == 0 {
+        // SAFETY: F_SETFL with O_NONBLOCK on a descriptor we own.
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let one: libc::c_int = 1;
+        // SAFETY: best-effort SO_NOSIGPIPE on a descriptor we own.
+        unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_NOSIGPIPE, (&one as *const libc::c_int).cast(), std::mem::size_of::<libc::c_int>() as libc::socklen_t) };
+    }
+    Ok(())
+}
+
+fn shutdown_fd(fd: std::os::fd::RawFd, how: libc::c_int) {
+    // SAFETY: caller owns or keeps `fd` alive for the duration of the relay.
+    unsafe { libc::shutdown(fd, how) };
+}
+
+/// Non-blocking drain into `buf` up to `cap`; returns `Ok(true)` on EOF.
+fn drain_nonblock(fd: std::os::fd::RawFd, buf: &mut VecDeque<u8>, cap: usize, tmp: &mut [u8]) -> io::Result<bool> {
+    while buf.len() < cap {
+        let want = (cap - buf.len()).min(tmp.len());
+        // SAFETY: `tmp` has at least `want` writable bytes and `fd` is open.
+        let n = unsafe { libc::read(fd, tmp.as_mut_ptr().cast(), want) };
+        if n > 0 {
+            buf.extend(&tmp[..n as usize]);
+        } else if n == 0 {
+            return Ok(true);
+        } else {
+            let e = io::Error::last_os_error();
+            match e.raw_os_error() {
+                Some(libc::EINTR) => continue,
+                Some(c) if c == libc::EAGAIN || c == libc::EWOULDBLOCK => return Ok(false),
+                _ => return Err(e),
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Non-blocking flush from `buf` (`<= chunk_cap` per write); returns bytes written.
+fn flush_nonblock(fd: std::os::fd::RawFd, buf: &mut VecDeque<u8>, chunk_cap: usize) -> io::Result<usize> {
+    let mut wrote = 0;
+    while !buf.is_empty() {
+        let (head, _) = buf.as_slices();
+        if head.is_empty() {
+            buf.make_contiguous();
+            continue;
+        }
+        let want = head.len().min(chunk_cap);
+        // SAFETY: `head` has at least `want` readable bytes and `fd` is open.
+        let n = unsafe { libc::write(fd, head.as_ptr().cast(), want) };
+        if n > 0 {
+            let n = n as usize;
+            buf.drain(..n);
+            wrote += n;
+        } else if n == 0 {
+            return Err(io::Error::from(io::ErrorKind::WriteZero));
+        } else {
+            let e = io::Error::last_os_error();
+            match e.raw_os_error() {
+                Some(libc::EINTR) => continue,
+                Some(c) if c == libc::EAGAIN || c == libc::EWOULDBLOCK => break,
+                _ => return Err(e),
+            }
+        }
+    }
+    Ok(wrote)
+}
+
 /// Relays one guest engine-API stream to `serve` over a local `UnixStream`
-/// pair. Once `serve` exits (after `HEADER_TIMEOUT`, `Connection: close`, 400,
-/// 403, 413, or EOF) and any buffered response has been written to `guest`,
-/// both directions of `guest` are shut down (`SHUT_RDWR`) so a half-open guest
-/// connection can never leave `from_guest` blocked or pin a container permit.
+/// pair using a single-thread `O_NONBLOCK` `poll()` state machine (no `dup()`
+/// of `VZVirtioSocketConnection`, bounded 64 KiB buffers each way). Once
+/// `serve` exits (after `HEADER_TIMEOUT`, `Connection: close`, 400, 403, 413,
+/// or EOF) and any buffered response drains (or stalls past `TCP_STALL`),
+/// both directions of `guest` are shut down (`SHUT_RDWR`) so a half-open
+/// guest connection can never leave a relay blocked or pin a container permit.
 fn relay_engine_api(
     guest: &OwnedFd,
     serve: impl FnOnce(std::os::unix::net::UnixStream) + Send + 'static,
 ) -> io::Result<()> {
-    struct ShutdownWriteOnDrop(std::os::unix::net::UnixStream);
-    impl Drop for ShutdownWriteOnDrop {
+    relay_engine_api_with(guest, TCP_STALL, serve)
+}
+
+fn relay_engine_api_with(
+    guest: &OwnedFd,
+    stall: Duration,
+    serve: impl FnOnce(std::os::unix::net::UnixStream) + Send + 'static,
+) -> io::Result<()> {
+    struct DoneSignal {
+        ours: std::os::unix::net::UnixStream,
+        _done_w: OwnedFd,
+    }
+    impl Drop for DoneSignal {
         fn drop(&mut self) {
-            let _ = self.0.shutdown(Shutdown::Write);
+            let _ = self.ours.shutdown(Shutdown::Write);
         }
     }
 
-    let _ = vsock_stall(guest.as_raw_fd());
+    const CAP: usize = 64 * 1024;
+    let guest_fd = guest.as_raw_fd();
+    set_nonblocking_cloexec(guest_fd)?;
     let (api, ours) = std::os::unix::net::UnixStream::pair()?;
-    let ours_end = ShutdownWriteOnDrop(ours.try_clone()?);
-    let (mut api_read, from_guest, to_guest) = (api.try_clone()?, guest.try_clone()?, guest.try_clone()?);
-    let mut from_guest = std::fs::File::from(from_guest);
-    let mut to_guest = std::fs::File::from(to_guest);
-    let mut api_write = api;
-    let served = std::thread::Builder::new().name("kiri-api".into()).spawn(move || {
-        let _end = ours_end;
+    let api_fd = api.as_raw_fd();
+    set_nonblocking_cloexec(api_fd)?;
+    let (done_r, done_w) = pipe()?;
+    set_nonblocking_cloexec(done_r.as_raw_fd())?;
+    let signal = DoneSignal {
+        ours: ours.try_clone()?,
+        _done_w: done_w,
+    };
+    let served = match std::thread::Builder::new().name("kiri-api".into()).spawn(move || {
+        let _signal = signal;
         serve(ours);
-    })?;
-    let (served_tx, served_rx) = std::sync::mpsc::sync_channel::<JoinHandle<()>>(1);
-    let down = match std::thread::Builder::new().name("kiri-engine-api-down".into()).spawn(move || {
-        let copied = copy(&mut api_read, &mut to_guest);
-        if copied.is_err() {
-            // Guest stopped reading or disconnected: wake `kiri-api` and `from_guest`.
-            let _ = api_read.shutdown(Shutdown::Both);
-            // SAFETY: shutting down both directions on a socket we own.
-            unsafe { libc::shutdown(to_guest.as_raw_fd(), libc::SHUT_RDWR) };
-            if let Ok(served) = served_rx.recv() {
-                let _ = served.join();
-            }
-            return;
-        }
-        // `serve` shut down its write half (clean exit or `http::close`
-        // linger): signal write-EOF to the guest now, wait for `serve` to
-        // finish, then shut down both directions so a half-open guest cannot
-        // pin `from_guest` (and the container connection permit) forever.
-        // SAFETY: shutting down a socket we own.
-        unsafe { libc::shutdown(to_guest.as_raw_fd(), libc::SHUT_WR) };
-        if let Ok(served) = served_rx.recv() {
-            let _ = served.join();
-        }
-        // SAFETY: shutting down both directions wakes `from_guest`.
-        unsafe { libc::shutdown(to_guest.as_raw_fd(), libc::SHUT_RDWR) };
     }) {
         Ok(t) => t,
         Err(e) => {
-            // SAFETY: tear down both ends if the downlink thread could not spawn.
-            unsafe { libc::shutdown(guest.as_raw_fd(), libc::SHUT_RDWR) };
-            let _ = api_write.shutdown(Shutdown::Both);
-            let _ = served.join();
+            shutdown_fd(guest_fd, libc::SHUT_RDWR);
             return Err(e);
         }
     };
-    let _ = served_tx.send(served);
-    let _ = copy(&mut from_guest, &mut api_write);
-    let _ = api_write.shutdown(Shutdown::Write);
-    let _ = down.join();
+
+    let mut g2a: VecDeque<u8> = VecDeque::with_capacity(CAP);
+    let mut a2g: VecDeque<u8> = VecDeque::with_capacity(CAP);
+    let mut g_eof = false;
+    let mut a_eof = false;
+    let mut g_shut_wr = false;
+    let mut a_shut_wr = false;
+    let mut a_write_closed = false;
+    let mut done_closed = false;
+    let mut a2g_stall: Option<Instant> = None;
+    let mut tmp = [0u8; 32 * 1024];
+
+    loop {
+        if a_eof && a2g.is_empty() && done_closed {
+            break;
+        }
+        if !a2g.is_empty()
+            && let Some(since) = a2g_stall
+            && since.elapsed() >= stall
+        {
+            break;
+        }
+
+        let mut g_ev: libc::c_short = 0;
+        if !g_eof && !a_write_closed && g2a.len() < CAP {
+            g_ev |= libc::POLLIN;
+        }
+        if !a2g.is_empty() {
+            g_ev |= libc::POLLOUT;
+        }
+
+        let mut a_ev: libc::c_short = 0;
+        if !a_eof && a2g.len() < CAP {
+            a_ev |= libc::POLLIN;
+        }
+        if !g2a.is_empty() && !a_write_closed {
+            a_ev |= libc::POLLOUT;
+        }
+
+        let timeout_ms: libc::c_int = if !a2g.is_empty()
+            && let Some(since) = a2g_stall
+        {
+            let rem = stall.saturating_sub(since.elapsed());
+            if rem.is_zero() {
+                break;
+            }
+            rem.as_millis().clamp(1, 5_000) as libc::c_int
+        } else {
+            -1
+        };
+
+        let mut fds = [
+            libc::pollfd {
+                fd: if g_ev != 0 { guest_fd } else { -1 },
+                events: g_ev,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: if a_ev != 0 { api_fd } else { -1 },
+                events: a_ev,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: if done_closed { -1 } else { done_r.as_raw_fd() },
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: polling descriptors we own (or -1 to skip).
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+
+        if fds[2].revents != 0 {
+            let mut b = [0u8; 16];
+            // SAFETY: draining `done_r` we own to observe pipe closure.
+            let r = unsafe { libc::read(done_r.as_raw_fd(), b.as_mut_ptr().cast(), b.len()) };
+            if r == 0 || (fds[2].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0) {
+                done_closed = true;
+            }
+        }
+
+        let mut guest_dead = false;
+        let mut pushed_g2a = false;
+        let mut pushed_a2g = false;
+
+        if !g_eof && !a_write_closed && g2a.len() < CAP && fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+            let before = g2a.len();
+            match drain_nonblock(guest_fd, &mut g2a, CAP, &mut tmp) {
+                Ok(eof) => {
+                    g_eof = eof;
+                    pushed_g2a = g2a.len() > before;
+                }
+                Err(_) => guest_dead = true,
+            }
+        }
+
+        if !a_eof && a2g.len() < CAP && fds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+            let before = a2g.len();
+            match drain_nonblock(api_fd, &mut a2g, CAP, &mut tmp) {
+                Ok(eof) => {
+                    a_eof = eof;
+                    pushed_a2g = a2g.len() > before;
+                }
+                Err(_) => a_eof = true,
+            }
+        }
+
+        if !g2a.is_empty() && !a_write_closed && (pushed_g2a || fds[1].revents & (libc::POLLOUT | libc::POLLHUP | libc::POLLERR) != 0) {
+            if flush_nonblock(api_fd, &mut g2a, CAP).is_err() {
+                a_write_closed = true;
+                g2a.clear();
+            }
+        }
+
+        if !guest_dead && !a2g.is_empty() && (pushed_a2g || fds[0].revents & (libc::POLLOUT | libc::POLLHUP | libc::POLLERR) != 0) {
+            match flush_nonblock(guest_fd, &mut a2g, CAP) {
+                Ok(wrote) => {
+                    if a2g.is_empty() {
+                        a2g_stall = None;
+                    } else if wrote > 0 || a2g_stall.is_none() {
+                        a2g_stall = Some(Instant::now());
+                    }
+                }
+                Err(_) => guest_dead = true,
+            }
+        }
+
+        if guest_dead {
+            break;
+        }
+
+        if g_eof && g2a.is_empty() && !a_shut_wr && !a_write_closed {
+            shutdown_fd(api_fd, libc::SHUT_WR);
+            a_shut_wr = true;
+        }
+        if a_eof && a2g.is_empty() && !g_shut_wr {
+            shutdown_fd(guest_fd, libc::SHUT_WR);
+            g_shut_wr = true;
+        }
+    }
+
+    // Close `api` before joining `served`: on macOS XNU, `shutdown(SHUT_RDWR)`
+    // alone does not wake a peer thread blocked writing to `ours`; closing `api`
+    // wakes both blocked reads and blocked writes on `ours` immediately.
+    drop(api);
+    shutdown_fd(guest_fd, libc::SHUT_RDWR);
+    let _ = served.join();
     Ok(())
 }
 
@@ -3001,5 +4121,798 @@ Wireless LAN adapter Wi-Fi:\r\n\
             assert!(text.starts_with("HTTP/1.1 200 OK\r\n") && text.ends_with("\r\n\r\nOK"), "{text}");
             assert_eq!(cap.open(), 0);
         }
+    }
+
+    #[test]
+    fn ssh_auth_sock_resolution_prefers_gpg_over_launchd_and_honors_explicit_overrides() {
+        use std::path::{Path, PathBuf};
+        let p = PathBuf::from;
+        let launchd_tmp = p("/private/tmp/com.apple.launchd.abc123/Listeners");
+        let launchd_var = p("/var/run/com.apple.launchd.xyz789/Listeners");
+        let gpg = p("/Users/alice/.gnupg/S.gpg-agent.ssh");
+        let onepass = p("/Users/alice/.1password/agent.sock");
+        let custom = p("/Users/alice/.ssh/custom-agent.sock");
+        let all_live = |_: &Path| true;
+
+        // 1) GPG with enable-ssh-support wins over launchd Listeners (both /private/tmp and /var/run forms).
+        for launchd in [&launchd_tmp, &launchd_var] {
+            let inputs = super::SshAuthInputs {
+                preferred: None,
+                env_sock: Some(launchd.clone()),
+                launchctl_sock: Some(launchd.clone()),
+                gpg_ssh_enabled: true,
+                gpg_sockets: vec![gpg.clone()],
+            };
+            assert_eq!(super::resolve_ssh_auth_sock(&inputs, all_live), Some(gpg.clone()), "{launchd:?}");
+            // Launchd remains as fallback candidate behind GPG if GPG's socket is stale.
+            assert_eq!(super::resolve_ssh_auth_sock_candidates(&inputs, all_live), vec![gpg.clone(), launchd.clone()]);
+        }
+
+        // 2) Without enable-ssh-support, launchd stays selected even if S.gpg-agent.ssh exists.
+        let disabled_gpg = super::SshAuthInputs {
+            preferred: None,
+            env_sock: Some(launchd_tmp.clone()),
+            launchctl_sock: Some(launchd_tmp.clone()),
+            gpg_ssh_enabled: false,
+            gpg_sockets: vec![gpg.clone()],
+        };
+        assert_eq!(super::resolve_ssh_auth_sock(&disabled_gpg, all_live), Some(launchd_tmp.clone()));
+
+        // 3) Explicit non-launchd `launchctl getenv SSH_AUTH_SOCK` wins over launchd env and GPG.
+        let launchctl_override = super::SshAuthInputs {
+            preferred: None,
+            env_sock: Some(launchd_var.clone()),
+            launchctl_sock: Some(onepass.clone()),
+            gpg_ssh_enabled: true,
+            gpg_sockets: vec![gpg.clone()],
+        };
+        assert_eq!(super::resolve_ssh_auth_sock(&launchctl_override, all_live), Some(onepass.clone()));
+
+        // 4) Explicit non-launchd process env `$SSH_AUTH_SOCK` wins over launchctl and GPG.
+        let env_override = super::SshAuthInputs {
+            preferred: None,
+            env_sock: Some(custom.clone()),
+            launchctl_sock: Some(onepass.clone()),
+            gpg_ssh_enabled: true,
+            gpg_sockets: vec![gpg.clone()],
+        };
+        assert_eq!(super::resolve_ssh_auth_sock(&env_override, all_live), Some(custom.clone()));
+
+        // 5) Recorded bind-mount `preferred` wins over everything when live,
+        //    and falls through cleanly when missing/dead.
+        let with_preferred = super::SshAuthInputs {
+            preferred: Some(gpg.clone()),
+            env_sock: Some(custom.clone()),
+            launchctl_sock: Some(onepass.clone()),
+            gpg_ssh_enabled: true,
+            gpg_sockets: vec![gpg.clone()],
+        };
+        assert_eq!(super::resolve_ssh_auth_sock(&with_preferred, all_live), Some(gpg.clone()));
+        assert_eq!(
+            super::resolve_ssh_auth_sock(&with_preferred, |cand| cand != gpg.as_path()),
+            Some(custom.clone())
+        );
+
+        // 6) Dead explicit env_sock falls through to live GPG socket.
+        let dead_env = super::SshAuthInputs {
+            preferred: None,
+            env_sock: Some(custom.clone()),
+            launchctl_sock: Some(launchd_tmp.clone()),
+            gpg_ssh_enabled: true,
+            gpg_sockets: vec![gpg.clone()],
+        };
+        assert_eq!(
+            super::resolve_ssh_auth_sock(&dead_env, |cand| cand != custom.as_path()),
+            Some(gpg)
+        );
+    }
+
+    #[test]
+    fn gpg_agent_conf_parsing_and_socket_discovery() {
+        use std::path::PathBuf;
+        assert!(super::gpg_agent_ssh_enabled("enable-ssh-support\n"));
+        assert!(super::gpg_agent_ssh_enabled("  enable-ssh-support  # for git\n"));
+        assert!(super::gpg_agent_ssh_enabled("default-cache-ttl 600\nenable-ssh-support\n"));
+        assert!(!super::gpg_agent_ssh_enabled("# enable-ssh-support\n"));
+        assert!(!super::gpg_agent_ssh_enabled("#enable-ssh-support\n"));
+        assert!(!super::gpg_agent_ssh_enabled("   # enable-ssh-support\n"));
+        assert!(!super::gpg_agent_ssh_enabled("enable-ssh-support-extra\n"));
+        assert!(!super::gpg_agent_ssh_enabled("enable-ssh-support\nno-enable-ssh-support\n"));
+        assert!(!super::gpg_agent_ssh_enabled(""));
+
+        let root = std::env::temp_dir().join(format!("kiri-gpg-conf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let custom_gnupg = root.join("custom-gnupg");
+        std::fs::create_dir_all(home.join(".gnupg")).unwrap();
+        std::fs::create_dir_all(&custom_gnupg).unwrap();
+
+        // Commented-out enable-ssh-support does NOT enable GPG discovery or run gpgconf.
+        std::fs::write(home.join(".gnupg/gpg-agent.conf"), "# enable-ssh-support\n").unwrap();
+        let (enabled, socks) = super::gather_gpg_ssh_info(None, Some(&home), |_| panic!("gpgconf must not be called when disabled"));
+        assert!(!enabled);
+        assert!(socks.is_empty());
+
+        // Uncommented enable-ssh-support under ~/.gnupg discovers gpgconf socket then ~/.gnupg/S.gpg-agent.ssh.
+        std::fs::write(home.join(".gnupg/gpg-agent.conf"), "default-cache-ttl 300\nenable-ssh-support # on\n").unwrap();
+        let gpgconf_path = PathBuf::from("/private/var/folders/aa/bb/T/gnupg/S.gpg-agent.ssh");
+        let (enabled, socks) = super::gather_gpg_ssh_info(None, Some(&home), |_| Some(gpgconf_path.clone()));
+        assert!(enabled);
+        assert_eq!(socks, vec![gpgconf_path.clone(), home.join(".gnupg/S.gpg-agent.ssh")]);
+
+        // Custom GNUPGHOME takes precedence over ~/.gnupg and orders $GNUPGHOME -> gpgconf -> ~/.gnupg.
+        std::fs::write(custom_gnupg.join("gpg-agent.conf"), "enable-ssh-support\n").unwrap();
+        let (enabled, socks) = super::gather_gpg_ssh_info(Some(&custom_gnupg), Some(&home), |dir| {
+            assert_eq!(dir, Some(custom_gnupg.as_path()));
+            Some(gpgconf_path.clone())
+        });
+        assert!(enabled);
+        assert_eq!(socks, vec![custom_gnupg.join("S.gpg-agent.ssh"), gpgconf_path, home.join(".gnupg/S.gpg-agent.ssh")]);
+
+        // Custom GNUPGHOME without enable-ssh-support does NOT silently inherit ~/.gnupg/gpg-agent.conf.
+        std::fs::write(custom_gnupg.join("gpg-agent.conf"), "# enable-ssh-support\n").unwrap();
+        let (enabled, socks) = super::gather_gpg_ssh_info(Some(&custom_gnupg), Some(&home), |_| panic!("should not run gpgconf"));
+        assert!(!enabled);
+        assert!(socks.is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mac_ssh_agent_socket_allowlist_and_preferred_security() {
+        use std::os::unix::net::UnixListener;
+        use std::path::Path;
+
+        // Launchd detection covers both /tmp and /var/run (+ /private/*) layouts.
+        for ok in [
+            "/private/tmp/com.apple.launchd.abc123/Listeners",
+            "/tmp/com.apple.launchd.abc123/Listeners",
+            "/private/var/run/com.apple.launchd.oQTvCAtcQS/Listeners",
+            "/var/run/com.apple.launchd.oQTvCAtcQS/Listeners",
+            "/var/run//com.apple.launchd.abc/Listeners",
+        ] {
+            assert!(super::is_launchd_ssh_sock(Path::new(ok)), "{ok}");
+            assert!(super::is_known_mac_ssh_agent_sock_path(Path::new(ok)), "{ok}");
+        }
+        for bad in [
+            "/tmp/com.apple.launchd./Listeners",
+            "/tmp/com.apple.launchd.abc/sub/Listeners",
+            "/Users/alice/com.apple.launchd.abc/Listeners",
+            "/var/run/docker.sock",
+            "tmp/com.apple.launchd.abc/Listeners",
+        ] {
+            assert!(!super::is_launchd_ssh_sock(Path::new(bad)), "{bad}");
+        }
+
+        // Known Mac agent socket paths vs rejected non-SSH paths.
+        for ok in [
+            "/Users/alice/.gnupg/S.gpg-agent.ssh",
+            "/Users/alice/.config/gnupg/S.gpg-agent.ssh",
+            "/Users/alice/.1password/agent.sock",
+            "/Users/alice/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock",
+        ] {
+            assert!(super::is_known_mac_ssh_agent_sock_path(Path::new(ok)), "{ok}");
+        }
+        for bad in [
+            "/Users/alice/.kiri/run/docker.sock",
+            "/var/run/docker.sock",
+            "/tmp/postgres.sock",
+            "/etc/S.gpg-agent.ssh",
+            "/Users/alice/S.gpg-agent",
+        ] {
+            assert!(!super::is_known_mac_ssh_agent_sock_path(Path::new(bad)), "{bad}");
+        }
+
+        // Strict path allowlist only permits user's own GPG/1Password/launchd paths.
+        let fake_home = Path::new("/Users/alice");
+        let fake_gnupg = Path::new("/Users/alice/.config/gnupg");
+        let fake_gpgconf = Path::new("/private/var/folders/aa/bb/T/d.1234/S.gpg-agent.ssh");
+        assert!(super::is_strict_mac_ssh_agent_sock_path_for(Path::new("/Users/alice/.gnupg/S.gpg-agent.ssh"), Some(fake_home), None, None));
+        assert!(super::is_strict_mac_ssh_agent_sock_path_for(Path::new("/Users/alice/.config/gnupg/S.gpg-agent.ssh"), Some(fake_home), Some(fake_gnupg), None));
+        assert!(super::is_strict_mac_ssh_agent_sock_path_for(fake_gpgconf, Some(fake_home), None, Some(fake_gpgconf)));
+        assert!(super::is_strict_mac_ssh_agent_sock_path_for(Path::new("/Users/alice/.1password/agent.sock"), Some(fake_home), None, None));
+        assert!(!super::is_strict_mac_ssh_agent_sock_path_for(Path::new("/tmp/untrusted/S.gpg-agent.ssh"), Some(fake_home), None, None));
+        assert!(!super::is_strict_mac_ssh_agent_sock_path_for(Path::new("/Users/alice/.kiri/run/docker.sock"), Some(fake_home), None, None));
+
+        // Live Unix socket security checks for set_preferred_ssh_auth_sock.
+        let _guard = super::PREFERRED_SSH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        super::clear_preferred_ssh_auth_sock();
+
+        let dir = std::env::temp_dir().join(format!("kiri-ssh-pref-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Regular file named S.gpg-agent.ssh is rejected (not a socket).
+        let reg = dir.join("reg");
+        std::fs::create_dir_all(&reg).unwrap();
+        let reg_file = reg.join("S.gpg-agent.ssh");
+        std::fs::write(&reg_file, b"not a socket").unwrap();
+        assert!(!super::set_preferred_ssh_auth_sock(&reg_file));
+        assert!(super::current_preferred_ssh_auth_sock().is_none());
+
+        // Arbitrary socket named docker.sock is rejected, AND a symlink named
+        // S.gpg-agent.ssh pointing to docker.sock is ALSO rejected after canonicalize.
+        let docker_sock = dir.join("docker.sock");
+        let _docker_listener = UnixListener::bind(&docker_sock).unwrap();
+        assert!(!super::set_preferred_ssh_auth_sock(&docker_sock));
+        let evil_link_dir = dir.join("evil");
+        std::fs::create_dir_all(&evil_link_dir).unwrap();
+        let evil_link = evil_link_dir.join("S.gpg-agent.ssh");
+        std::os::unix::fs::symlink(&docker_sock, &evil_link).unwrap();
+        assert!(!super::set_preferred_ssh_auth_sock(&evil_link), "symlink to docker.sock must be rejected");
+        assert!(super::current_preferred_ssh_auth_sock().is_none());
+
+        // A real owned S.gpg-agent.ssh Unix socket is accepted by set_preferred_ssh_auth_sock
+        // (for host callers), while set_preferred_ssh_auth_sock_strict rejects temp paths
+        // outside ~/.gnupg / $GNUPGHOME / gpgconf.
+        let gpg_sock = dir.join("S.gpg-agent.ssh");
+        let _gpg_listener = UnixListener::bind(&gpg_sock).unwrap();
+        assert!(!super::set_preferred_ssh_auth_sock_strict(&gpg_sock));
+        assert!(super::current_preferred_ssh_auth_sock().is_none());
+        assert!(super::set_preferred_ssh_auth_sock(&gpg_sock));
+        assert_eq!(super::current_preferred_ssh_auth_sock(), Some(std::fs::canonicalize(&gpg_sock).unwrap()));
+
+        super::clear_preferred_ssh_auth_sock();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn macos_low_loopback_fallback_and_step_aside() {
+        use std::io;
+        use std::net::SocketAddr;
+
+        let eacces = || io::Error::from(io::ErrorKind::PermissionDenied);
+        let eaddrinuse = || io::Error::from(io::ErrorKind::AddrInUse);
+
+        // 1. macOS 127.0.0.1:80 EACCES -> falls back to 0.0.0.0:80 with loopback_only = true.
+        let mut tried = Vec::new();
+        let (bound, lo_only) = super::bind_with_macos_low_loopback_with(
+            "127.0.0.1:80".parse().unwrap(),
+            80,
+            false,
+            true,
+            |a, udp| {
+                tried.push((a, udp));
+                if a == "127.0.0.1:80".parse::<SocketAddr>().unwrap() { Err(eacces()) } else { Ok(a) }
+            },
+            |_| panic!("should not step aside when wildcard is free"),
+        )
+        .unwrap();
+        assert_eq!(bound, "0.0.0.0:80".parse().unwrap());
+        assert!(lo_only);
+        assert_eq!(tried, vec![("127.0.0.1:80".parse().unwrap(), false), ("0.0.0.0:80".parse().unwrap(), false)]);
+
+        // 2. macOS 127.0.0.1:80 EACCES, then 0.0.0.0:80 EADDRINUSE (domain router) ->
+        //    steps router aside and retries 0.0.0.0:80 cleanly.
+        let mut stepped = Vec::new();
+        let mut wildcard_attempts = 0usize;
+        let (bound, lo_only) = super::bind_with_macos_low_loopback_with(
+            "127.0.0.1:80".parse().unwrap(),
+            80,
+            false,
+            true,
+            |a, _| {
+                if a.ip().is_loopback() {
+                    Err(eacces())
+                } else {
+                    wildcard_attempts += 1;
+                    if wildcard_attempts == 1 { Err(eaddrinuse()) } else { Ok(a) }
+                }
+            },
+            |p| {
+                stepped.push(p);
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(bound, "0.0.0.0:80".parse().unwrap());
+        assert!(lo_only);
+        assert_eq!(stepped, vec![80]);
+        assert_eq!(wildcard_attempts, 2);
+
+        // 3. macOS [::1]:443 EACCES -> falls back to [::]:443 with loopback_only = true.
+        let (bound, lo_only) = super::bind_with_macos_low_loopback_with(
+            "[::1]:443".parse().unwrap(),
+            443,
+            false,
+            true,
+            |a, _| if a.ip().is_loopback() { Err(eacces()) } else { Ok(a) },
+            |_| false,
+        )
+        .unwrap();
+        assert_eq!(bound, "[::]:443".parse().unwrap());
+        assert!(lo_only);
+
+        // 4. macOS 127.0.0.1:53 UDP EACCES -> falls back to 0.0.0.0:53 UDP.
+        let (bound, lo_only) = super::bind_with_macos_low_loopback_with(
+            "127.0.0.1:53".parse().unwrap(),
+            53,
+            true,
+            true,
+            |a, udp| {
+                assert!(udp);
+                if a.ip().is_loopback() { Err(eacces()) } else { Ok(a) }
+            },
+            |_| panic!("UDP must never step aside TCP domain router"),
+        )
+        .unwrap();
+        assert_eq!(bound, "0.0.0.0:53".parse().unwrap());
+        assert!(lo_only);
+
+        // 5. High port (>= 1024), non-loopback IP, port 0, and non-macOS do NOT fall back.
+        for (addr, port, is_macos) in [
+            ("127.0.0.1:1024", 1024, true),
+            ("127.0.0.1:8080", 8080, true),
+            ("127.0.0.1:0", 0, true),
+            ("192.168.1.5:80", 80, true),
+            ("127.0.0.1:80", 80, false),
+        ] {
+            let mut calls = 0usize;
+            let err = super::bind_with_macos_low_loopback_with(
+                addr.parse().unwrap(),
+                port,
+                false,
+                is_macos,
+                |_, _| {
+                    calls += 1;
+                    Err::<SocketAddr, _>(eacces())
+                },
+                |_| false,
+            )
+            .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{addr} mac={is_macos}");
+            assert_eq!(calls, 1, "must not retry wildcard for {addr} mac={is_macos}");
+        }
+
+        // 6. Direct bind succeeding keeps loopback_only = false.
+        let (bound, lo_only) = super::bind_with_macos_low_loopback_with(
+            "127.0.0.1:81".parse().unwrap(),
+            81,
+            false,
+            true,
+            |a, _| Ok(a),
+            |_| false,
+        )
+        .unwrap();
+        assert_eq!(bound, "127.0.0.1:81".parse().unwrap());
+        assert!(!lo_only);
+    }
+
+    #[test]
+    fn peer_allowed_enforces_loopback_only_when_fallback_active() {
+        for lo in ["127.0.0.1", "127.0.0.2", "::1", "::ffff:127.0.0.1", "::ffff:127.0.0.2"] {
+            let ip: IpAddr = lo.parse().unwrap();
+            assert!(super::peer_allowed(ip, true), "loopback {lo} must be allowed");
+            assert!(super::peer_allowed(ip, false), "loopback {lo} must be allowed without filter");
+        }
+        for remote in ["192.168.1.10", "10.0.0.5", "0.0.0.0", "2001:db8::1", "fe80::1", "::", "::ffff:192.168.1.10", "::ffff:10.0.0.1"] {
+            let ip: IpAddr = remote.parse().unwrap();
+            assert!(!super::peer_allowed(ip, true), "non-loopback {remote} must be rejected under loopback_only");
+            assert!(super::peer_allowed(ip, false), "non-loopback {remote} must be allowed when not loopback_only");
+        }
+    }
+
+    #[test]
+    fn shared_nat_disabled_forces_full_host_egress_and_tracks_state() {
+        use super::super::engine::{parse_bool_env, shared_nat_for};
+
+        for t in ["1", "on", "ON", "true", "True", "yes", " yes "] {
+            assert_eq!(parse_bool_env(t), Some(true), "{t}");
+        }
+        for f in ["0", "off", "OFF", "false", "False", "no", " no "] {
+            assert_eq!(parse_bool_env(f), Some(false), "{f}");
+        }
+        for bad in ["", "maybe", "2", "auto"] {
+            assert_eq!(parse_bool_env(bad), None, "{bad}");
+        }
+
+        // Env overrides vm.json, vm.json overrides default (true), invalid env falls back.
+        assert!(shared_nat_for(None, None));
+        assert!(!shared_nat_for(None, Some(false)));
+        assert!(shared_nat_for(None, Some(true)));
+        assert!(!shared_nat_for(Some("0"), Some(true)));
+        assert!(shared_nat_for(Some("on"), Some(false)));
+        assert!(!shared_nat_for(Some("bogus"), Some(false)));
+        assert!(shared_nat_for(Some("bogus"), None));
+
+        // When shared_nat is false on macOS, auto mode routes all IPv4 TCP through host egress.
+        assert_eq!(
+            super::host_egress_routes_with_nat(None, false, false, &[], true),
+            vec!["0.0.0.0/0"]
+        );
+        assert_eq!(
+            super::host_egress_routes_with_nat(Some("auto"), false, false, &[([10, 0, 5, 0], 24)], true),
+            vec!["0.0.0.0/0"]
+        );
+        assert_eq!(
+            super::host_egress_routes_with_nat(Some("auto"), true, false, &[([10, 0, 5, 0], 24)], true),
+            vec!["198.18.0.0/15", "10.0.5.0/24"]
+        );
+        assert!(super::host_egress_routes_with_nat(Some("off"), false, false, &[], true).is_empty());
+        assert!(super::host_egress_routes_with_nat(None, false, false, &[], false).is_empty());
+
+        super::set_shared_nat_active(Some(false));
+        assert!(!super::shared_nat_active());
+        super::set_shared_nat_active(Some(true));
+        assert!(super::shared_nat_active());
+        super::set_shared_nat_active(None);
+    }
+
+    #[test]
+    fn engine_api_relay_bidirectional_saturation_never_deadlocks_and_releases_permit() {
+        use std::io::{Read, Write};
+        use std::os::fd::{AsRawFd, OwnedFd};
+        use std::os::unix::net::UnixStream;
+        use std::time::{Duration, Instant};
+
+        const UP_BYTES: usize = 4 << 20;
+        const DOWN_BYTES: usize = 16 << 20;
+
+        let shrink_bufs = |fd: std::os::fd::RawFd| {
+            let small: libc::c_int = 4096;
+            for opt in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+                // SAFETY: shrinking socket buffer on a descriptor we own for saturation testing.
+                unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, opt, (&small as *const libc::c_int).cast(), std::mem::size_of::<libc::c_int>() as libc::socklen_t) };
+            }
+        };
+
+        let cap = super::super::ConnCap::for_test(1);
+        let permit = cap.try_acquire_for_test().unwrap();
+        let (mut guest_client_r, guest_server) = UnixStream::pair().unwrap();
+        shrink_bufs(guest_client_r.as_raw_fd());
+        shrink_bufs(guest_server.as_raw_fd());
+        guest_client_r.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        guest_client_r.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut guest_client_w = guest_client_r.try_clone().unwrap();
+
+        let guest_fd = OwnedFd::from(guest_server);
+        let t0 = Instant::now();
+        let relay = std::thread::spawn(move || {
+            let _permit = permit;
+            super::relay_engine_api(&guest_fd, move |mut ours_w| {
+                shrink_bufs(ours_w.as_raw_fd());
+                let mut ours_r = ours_w.try_clone().unwrap();
+                let reader = std::thread::spawn(move || {
+                    let mut buf = vec![0u8; 32 * 1024];
+                    let mut got = 0usize;
+                    loop {
+                        let n = ours_r.read(&mut buf).unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        for &b in &buf[..n] {
+                            assert_eq!(b, ((got % 251) as u8), "upload byte mismatch at {got}");
+                            got += 1;
+                        }
+                    }
+                    assert_eq!(got, UP_BYTES);
+                });
+                let down_chunk: Vec<u8> = (0..(64 * 1024)).map(|i| ((i * 7) % 253) as u8).collect();
+                let mut sent = 0usize;
+                while sent < DOWN_BYTES {
+                    let take = (DOWN_BYTES - sent).min(down_chunk.len());
+                    ours_w.write_all(&down_chunk[..take]).unwrap();
+                    sent += take;
+                }
+                let _ = ours_w.shutdown(std::net::Shutdown::Write);
+                reader.join().unwrap();
+            })
+            .unwrap();
+        });
+
+        let uploader = std::thread::spawn(move || {
+            let mut chunk = vec![0u8; 32 * 1024];
+            let mut sent = 0usize;
+            while sent < UP_BYTES {
+                let take = (UP_BYTES - sent).min(chunk.len());
+                for (i, b) in chunk[..take].iter_mut().enumerate() {
+                    *b = ((sent + i) % 251) as u8;
+                }
+                guest_client_w.write_all(&chunk[..take]).unwrap();
+                sent += take;
+            }
+            guest_client_w.shutdown(std::net::Shutdown::Write).unwrap();
+        });
+
+        let mut buf = vec![0u8; 32 * 1024];
+        let mut got_down = 0usize;
+        loop {
+            let n = guest_client_r.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            for &b in &buf[..n] {
+                let expected = (((got_down % (64 * 1024)) * 7) % 253) as u8;
+                assert_eq!(b, expected, "download byte mismatch at {got_down}");
+                got_down += 1;
+            }
+        }
+        assert_eq!(got_down, DOWN_BYTES);
+        uploader.join().unwrap();
+        relay.join().unwrap();
+        assert!(t0.elapsed() < Duration::from_secs(10), "bidirectional saturation took {:?}", t0.elapsed());
+        assert_eq!(cap.open(), 0, "container permit must be released after bidirectional saturation");
+    }
+
+    #[test]
+    fn engine_api_relay_tears_down_stalled_half_open_guest() {
+        use std::io::Write;
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+        use std::time::{Duration, Instant};
+
+        let cap = super::super::ConnCap::for_test(1);
+        let permit = cap.try_acquire_for_test().unwrap();
+        let (guest_client, guest_server) = UnixStream::pair().unwrap();
+        let guest_fd = OwnedFd::from(guest_server);
+        let t0 = Instant::now();
+        let t = std::thread::spawn(move || {
+            let _permit = permit;
+            super::relay_engine_api_with(&guest_fd, Duration::from_millis(80), |mut ours| {
+                // Flood past socket + 64 KiB relay buffers while guest never reads.
+                let payload = vec![0x41u8; 512 * 1024];
+                for _ in 0..8 {
+                    if ours.write_all(&payload).is_err() {
+                        break;
+                    }
+                }
+            })
+            .unwrap();
+        });
+        t.join().unwrap();
+        assert!(t0.elapsed() < Duration::from_secs(2), "stalled guest relay hung for {:?}", t0.elapsed());
+        assert_eq!(cap.open(), 0, "container permit must be released after stall teardown");
+        drop(guest_client);
+    }
+
+    #[test]
+    fn netstat_holder_fallback_and_port53_bind_guidance() {
+        use std::io;
+
+        let udp_netstat = "\
+Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)     rhiwat shiwat process:pid state\n\
+udp4       0      0  *.5353                 *.*                                786896   9216 mDNSResponder:111 0x0000\n\
+udp4       0      0  *.53                   *.*                                786896   9216 kiri-daemon:222 0x0000\n\
+udp4       0      0  192.168.64.1.53        *.*                                786896   9216 mDNSResponder:333 0x0000\n";
+        assert_eq!(super::holder_in_netstat(udp_netstat, 53, true, 999, |_| None).as_deref(), Some("mDNSResponder"));
+        assert_eq!(super::holder_in_netstat(udp_netstat, 53, true, 333, |_| None), None, "skips self pid and kiri*");
+
+        let tcp_netstat = "\
+Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)     rhiwat shiwat    pid   epid  state\n\
+tcp4       0      0  127.0.0.1.53           127.0.0.1.51234        ESTABLISHED 131072 131072    444      0 0x0102\n\
+tcp4       0      0  *.53                   *.*                    LISTEN      131072 131072    555      0 0x0100\n";
+        assert_eq!(
+            super::holder_in_netstat(tcp_netstat, 53, false, 999, |pid| (pid == 555).then(|| "mDNSResponder".to_owned())).as_deref(),
+            Some("mDNSResponder")
+        );
+
+        let e_in_use = || io::Error::from(io::ErrorKind::AddrInUse);
+        let msg_shared = super::format_bind_error(e_in_use(), "0.0.0.0", "0.0.0.0", 53, None, true, true).to_string();
+        assert!(msg_shared.contains("kiri vm set --shared-nat off"), "{msg_shared}");
+        assert!(msg_shared.contains("/etc/resolver/<domain>"), "{msg_shared}");
+
+        let msg_mdns = super::format_bind_error(e_in_use(), "127.0.0.1", "127.0.0.1", 53, Some("mDNSResponder"), true, false).to_string();
+        assert!(msg_mdns.contains("(in use by mDNSResponder)"), "{msg_mdns}");
+        assert!(msg_mdns.contains("kiri vm set --shared-nat off"), "{msg_mdns}");
+
+        let msg_other = super::format_bind_error(e_in_use(), "127.0.0.1", "127.0.0.1", 53, Some("dnsmasq"), true, false).to_string();
+        assert!(msg_other.contains("(in use by dnsmasq)"), "{msg_other}");
+        assert!(!msg_other.contains("--shared-nat off"), "{msg_other}");
+
+        let msg_linux = super::format_bind_error(e_in_use(), "0.0.0.0", "0.0.0.0", 53, None, false, true).to_string();
+        assert!(!msg_linux.contains("--shared-nat off"), "{msg_linux}");
+
+        let e_notavail = || io::Error::from_raw_os_error(libc::EADDRNOTAVAIL);
+        let msg_alias = super::format_bind_error(e_notavail(), "127.0.0.53", "127.0.0.53", 53, None, true, false).to_string();
+        assert!(msg_alias.contains("sudo ifconfig lo0 alias 127.0.0.53"), "{msg_alias}");
+        assert!(msg_alias.contains("127.0.0.1"), "{msg_alias}");
+
+        let err_plain = super::format_bind_error(e_notavail(), "192.168.1.99", "192.168.1.99", 53, None, true, false);
+        assert_eq!(err_plain.raw_os_error(), Some(libc::EADDRNOTAVAIL));
+    }
+
+    #[test]
+    fn macos_loopback_only_udp_binds_lo0_interface_and_uses_short_dns_idle() {
+        use std::time::Duration;
+
+        assert_eq!(super::udp_idle_timeout(53, 53), Duration::from_secs(10));
+        assert_eq!(super::udp_idle_timeout(53, 8053), Duration::from_secs(10));
+        assert_eq!(super::udp_idle_timeout(5353, 53), Duration::from_secs(10));
+        assert_eq!(super::udp_idle_timeout(8080, 80), Duration::from_secs(60));
+
+        assert!(super::binds_host_dns_port(&[(super::Binding { host_ip: String::new(), host_port: 53, container_port: 53, proto: "udp".into() }, "0.0.0.0".into(), 53)]));
+        assert!(super::binds_host_dns_port(&[(super::Binding { host_ip: "127.0.0.1".into(), host_port: 53, container_port: 53, proto: "udp".into() }, "127.0.0.1".into(), 53)]));
+        assert!(super::binds_host_dns_port(&[(super::Binding { host_ip: "::1".into(), host_port: 53, container_port: 53, proto: "udp".into() }, "::1".into(), 53)]));
+        assert!(!super::binds_host_dns_port(&[(super::Binding { host_ip: "192.168.1.5".into(), host_port: 53, container_port: 53, proto: "udp".into() }, "192.168.1.5".into(), 53)]));
+        assert!(!super::binds_host_dns_port(&[(super::Binding { host_ip: "127.0.0.1".into(), host_port: 5353, container_port: 53, proto: "udp".into() }, "127.0.0.1".into(), 5353)]));
+
+        let before = super::HOST_PORT_53_BINDS.load(Ordering::Relaxed);
+        let guard = super::HostPort53Guard::acquire();
+        assert!(super::host_port_53_published());
+        assert_eq!(super::HOST_PORT_53_BINDS.load(Ordering::Relaxed), before + 1);
+        drop(guard);
+        assert_eq!(super::HOST_PORT_53_BINDS.load(Ordering::Relaxed), before);
+
+        #[cfg(target_os = "macos")]
+        {
+            use std::net::UdpSocket;
+            use std::os::fd::AsRawFd;
+
+            let lo0 = unsafe { libc::if_nametoindex(c"lo0".as_ptr()) };
+            assert_ne!(lo0, 0);
+
+            let bound_if = |fd: std::os::fd::RawFd, is_v6: bool| -> libc::c_uint {
+                let mut val: libc::c_uint = 0;
+                let mut len = std::mem::size_of::<libc::c_uint>() as libc::socklen_t;
+                let (lvl, opt) = if is_v6 { (libc::IPPROTO_IPV6, libc::IPV6_BOUND_IF) } else { (libc::IPPROTO_IP, libc::IP_BOUND_IF) };
+                // SAFETY: reading an int socket option from a descriptor we own.
+                assert_eq!(unsafe { libc::getsockopt(fd, lvl, opt, (&mut val as *mut libc::c_uint).cast(), &mut len) }, 0);
+                val
+            };
+
+            let fd_lo = super::bind_socket_on_if("0.0.0.0:0".parse().unwrap(), true, true).unwrap();
+            assert_eq!(bound_if(fd_lo.as_raw_fd(), false), lo0);
+            drop(fd_lo);
+
+            let fd_any = super::bind_socket_on_if("0.0.0.0:0".parse().unwrap(), true, false).unwrap();
+            assert_eq!(bound_if(fd_any.as_raw_fd(), false), 0);
+            drop(fd_any);
+
+            if let Ok(fd_v6) = super::bind_socket_on_if("[::]:0".parse().unwrap(), true, true) {
+                assert_eq!(bound_if(fd_v6.as_raw_fd(), true), lo0);
+            }
+
+            // Calling `udp_loop_with` with `loopback_only = true` also enforces `IP_BOUND_IF = lo0`,
+            // serves loopback peers, and reaps idle DNS sessions after `idle`.
+            let sock = UdpSocket::bind("0.0.0.0:0").unwrap();
+            sock.set_nonblocking(true).unwrap();
+            let port = sock.local_addr().unwrap().port();
+            assert_eq!(bound_if(sock.as_raw_fd(), false), 0);
+            let (wake_r, wake_w) = super::pipe().unwrap();
+            let sock_ref = sock.try_clone().unwrap();
+            let (closed_tx, closed_rx) = std::sync::mpsc::channel::<()>();
+            let t = std::thread::spawn(move || {
+                super::udp_loop_with(&sock_ref, &wake_r, true, Duration::from_millis(120), |s, peer| {
+                    use std::os::unix::net::UnixStream;
+                    let (a, b) = UnixStream::pair()?;
+                    let to_guest = std::fs::File::from(std::os::fd::OwnedFd::from(a));
+                    let mut from_guest = std::fs::File::from(std::os::fd::OwnedFd::from(b));
+                    let reply = s.try_clone()?;
+                    let closed_tx = closed_tx.clone();
+                    let reader = std::thread::spawn(move || {
+                        use std::io::Read as _;
+                        let mut len = [0u8; 2];
+                        let mut data = vec![0u8; 65_536];
+                        while from_guest.read_exact(&mut len).is_ok() {
+                            let n = u16::from_be_bytes(len) as usize;
+                            if from_guest.read_exact(&mut data[..n]).is_err() {
+                                break;
+                            }
+                            let _ = reply.send_to(&data[..n], peer);
+                        }
+                        let _ = closed_tx.send(());
+                    });
+                    Ok(super::UdpSession {
+                        to_guest,
+                        last: std::time::Instant::now(),
+                        reader,
+                        _guest: None,
+                    })
+                });
+            });
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while bound_if(sock.as_raw_fd(), false) != lo0 && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(bound_if(sock.as_raw_fd(), false), lo0);
+            let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+            client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            client.send_to(b"dns-q", ("127.0.0.1", port)).unwrap();
+            let mut reply_buf = [0u8; 16];
+            let (rn, _) = client.recv_from(&mut reply_buf).unwrap();
+            assert_eq!(&reply_buf[..rn], b"dns-q");
+            closed_rx.recv_timeout(Duration::from_secs(2)).expect("idle DNS UDP session should be reaped");
+            drop(wake_w);
+            t.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn linux_host_publish_falls_back_to_user_space_relay_when_forwarding_blocked() {
+        use super::{Binding, publish_key, publish_linux_host};
+        use std::io;
+
+        let tcp_entry = |host_ip: &str, host_port: u16, container_port: u16, tag: &'static str| {
+            let b = Binding { container_port, proto: "tcp".into(), host_ip: host_ip.into(), host_port };
+            (b, Some(host_ip.to_owned()), host_ip.to_owned(), host_port, false, tag)
+        };
+        let udp_entry = |host_ip: &str, host_port: u16, container_port: u16, tag: &'static str| {
+            let b = Binding { container_port, proto: "udp".into(), host_ip: host_ip.into(), host_port };
+            (b, Some(host_ip.to_owned()), host_ip.to_owned(), host_port, false, tag)
+        };
+
+        // 1. Open forwarding: wildcard stays relayed (for loopback) + published,
+        //    specific LAN IP moves to kernel-only, loopback & IPv6 stay relayed only.
+        let mut published = Vec::new();
+        let mut unpublished = Vec::new();
+        let open = publish_linux_host(
+            "cid:1",
+            [172, 17, 0, 2],
+            vec![
+                tcp_entry("0.0.0.0", 8080, 80, "tcp-any"),
+                tcp_entry("192.168.1.5", 8443, 443, "tcp-lan"),
+                tcp_entry("127.0.0.1", 9000, 90, "tcp-lo"),
+                tcp_entry("::", 8080, 80, "tcp-v6"),
+            ],
+            vec![
+                udp_entry("0.0.0.0", 5353, 53, "udp-any"),
+                udp_entry("192.168.1.5", 5354, 54, "udp-lan"),
+            ],
+            |p| {
+                published.push((p.id.to_owned(), p.udp, p.host_ip, p.host_port, p.to_ip, p.to_port));
+                Ok(())
+            },
+            |id| unpublished.push(id.to_owned()),
+        );
+        assert!(open.fallback_error.is_none());
+        assert!(open.any_published);
+        assert!(unpublished.is_empty());
+        assert_eq!(published.len(), 4, "only non-loopback IPv4 bindings are DNATed");
+        assert!(published.iter().all(|(id, ..)| id == "cid:1"));
+        assert_eq!(open.kernel_tcp, vec!["tcp-lan"]);
+        assert_eq!(open.kernel_udp, vec!["udp-lan"]);
+        assert_eq!(open.relay_tcp.iter().map(|t| t.5).collect::<Vec<_>>(), vec!["tcp-any", "tcp-lo", "tcp-v6"]);
+        assert_eq!(open.relay_udp.iter().map(|u| u.5).collect::<Vec<_>>(), vec!["udp-any"]);
+        assert_eq!(open.kernel_bound.len(), 2);
+
+        // 2. Host firewall blocks kernel FORWARD (#649): agent rejects publish,
+        //    unpublish rolls back, and EVERY socket (including specific LAN IP)
+        //    stays in user-space relay lists (`relay_direct` / `udp_loop`).
+        let mut unpublished = Vec::new();
+        let blocked = publish_linux_host(
+            "cid:2",
+            [172, 17, 0, 2],
+            vec![
+                tcp_entry("0.0.0.0", 8080, 80, "tcp-any"),
+                tcp_entry("192.168.1.5", 8443, 443, "tcp-lan"),
+                tcp_entry("127.0.0.1", 9000, 90, "tcp-lo"),
+            ],
+            vec![udp_entry("192.168.1.5", 5354, 54, "udp-lan")],
+            |_| Err(io::Error::other("kernel forwarding is blocked by host firewall")),
+            |id| unpublished.push(id.to_owned()),
+        );
+        assert!(blocked.fallback_error.is_some());
+        assert!(!blocked.any_published);
+        assert_eq!(unpublished, vec!["cid:2"]);
+        assert!(blocked.kernel_tcp.is_empty());
+        assert!(blocked.kernel_udp.is_empty());
+        assert!(blocked.kernel_bound.is_empty());
+        assert_eq!(blocked.relay_tcp.iter().map(|t| t.5).collect::<Vec<_>>(), vec!["tcp-any", "tcp-lan", "tcp-lo"]);
+        assert_eq!(blocked.relay_udp.iter().map(|u| u.5).collect::<Vec<_>>(), vec!["udp-lan"]);
+
+        // 3. Partial multi-binding failure rolls back the first publish too.
+        let mut calls = 0usize;
+        let mut unpublished = Vec::new();
+        let partial = publish_linux_host(
+            "cid:3",
+            [172, 17, 0, 2],
+            vec![tcp_entry("0.0.0.0", 8080, 80, "tcp-1"), tcp_entry("192.168.1.5", 8443, 443, "tcp-2")],
+            Vec::<(Binding, Option<String>, String, u16, bool, &'static str)>::new(),
+            |_| {
+                calls += 1;
+                if calls == 1 { Ok(()) } else { Err(io::Error::other("nftables error")) }
+            },
+            |id| unpublished.push(id.to_owned()),
+        );
+        assert!(partial.fallback_error.is_some());
+        assert_eq!(unpublished, vec!["cid:3"]);
+        assert_eq!(partial.relay_tcp.iter().map(|t| t.5).collect::<Vec<_>>(), vec!["tcp-1", "tcp-2"]);
+
+        // 4. Restarting the same container gets a distinct publish key so a stale
+        //    `Unpublish` can never wipe the restarted container's DNAT rules.
+        let k1 = publish_key("same-container");
+        let k2 = publish_key("same-container");
+        assert_ne!(k1, k2);
+        assert!(k1.starts_with("same-container:") && k2.starts_with("same-container:"));
     }
 }

@@ -285,6 +285,7 @@ struct Teardown {
     base: PathBuf,
     cgroup: PathBuf,
     remove: bool,
+    loop_mounts: Vec<String>,
 }
 
 /// Everything the child needs, prepared before clone so the child does as
@@ -325,6 +326,8 @@ struct Prepared {
     shm_size: u64,
     /// `--init`: PID 1 supervises the program instead of being it.
     init: bool,
+    /// `--cgroupns host`: no cgroup namespace of its own.
+    cgroupns_host: bool,
     /// Ulimits, groups and device nodes from the `opts` lines.
     host: HostApplied,
     /// The child's end of the pipe that says its root is in place (mounts
@@ -495,12 +498,13 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "no command to run"));
     }
     let layers: Vec<&str> = spec.layers.iter().collect();
-    let rootfs = super::roots::acquire(paths, spec.id, &layers)?;
+    let writable_rootfs = spec.flags & run_flags::READONLY_ROOTFS == 0;
+    let rootfs = super::roots::acquire(paths, spec.id, &layers, writable_rootfs)?;
     let base = paths.containers.join(spec.id);
 
     let cgroup = paths.cgroup.join(spec.id);
     let remove = spec.flags & run_flags::REMOVE != 0;
-    let undo = Teardown { base: base.clone(), cgroup: cgroup.clone(), remove };
+    let undo = Teardown { base: base.clone(), cgroup: cgroup.clone(), remove, loop_mounts: Vec::new() };
     // A restart that fails must not take the stopped container's files with it.
     let cleanup = |e: io::Error| {
         undo_now(&undo, remove);
@@ -566,6 +570,7 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
         pid_join = Some(fs::File::open(format!("/proc/{pid}/ns/pid")).map_err(cleanup)?);
     }
     let (masked, readonly) = (host.masked.take(), host.readonly.take());
+    prepared.cgroupns_host = host.cgroupns_host;
     prepared.host = HostApplied { rlimits: host.rlimits.clone(), groups: host.groups.clone(), nodes, masked, readonly };
     // Small, short-lived files: kept in memory (/run is tmpfs), not on the data disk.
     let etc_dir = PathBuf::from("/run/kiri").join(spec.id);
@@ -573,6 +578,12 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
     let nameserver = embedded_dns.then(|| embedded_address(spec)).or_else(|| host_network_resolver(spec, net.bridges, net.dns));
     prepared.etc_files = write_etc_files(spec, &etc_dir, net.upstream_dns, nameserver).map_err(cleanup)?;
     prepared.mounts = parse_mounts(spec.mounts).map_err(cleanup)?;
+    let loop_mounts: Vec<String> = prepared.mounts.iter().filter_map(|m| m.loop_mount.clone()).collect();
+    let undo = Teardown { base: base.clone(), cgroup: cgroup.clone(), remove, loop_mounts: loop_mounts.clone() };
+    let cleanup = |e: io::Error| {
+        undo_now(&undo, remove);
+        e
+    };
     // A network namespace of its own gets Docker's two defaults: any port
     // and ping without root. Host networking, and `--network container:`
     // (that container already has them), keep what they have.
@@ -611,7 +622,10 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
     let (parent_io, child_io) = stdio(&prepared).map_err(cleanup)?;
     let rootfs_c = sys::cstr(&rootfs).map_err(cleanup)?;
 
-    let mut flags = (libc::CLONE_NEWNS | libc::CLONE_NEWUTS | libc::CLONE_NEWIPC | libc::CLONE_NEWCGROUP) as u64 | CLONE_INTO_CGROUP;
+    let mut flags = (libc::CLONE_NEWNS | libc::CLONE_NEWUTS | libc::CLONE_NEWIPC) as u64 | CLONE_INTO_CGROUP;
+    if !prepared.cgroupns_host {
+        flags |= libc::CLONE_NEWCGROUP as u64;
+    }
     if spec.flags & run_flags::NET_HOST == 0 && prepared.net_join.is_none() {
         flags |= libc::CLONE_NEWNET as u64;
     }
@@ -857,7 +871,7 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
         netns,
         joins_netns: net_opts::values(spec.net.opts, net_opts::NETNS).next().is_some(),
         seccomp: spec.seccomp.to_vec(),
-        teardown: Some(Teardown { base, cgroup, remove }),
+        teardown: Some(Teardown { base, cgroup, remove, loop_mounts }),
         starting: starting.get().then_some(root_ready),
         ended_before_ready: None,
         filling: filling.get(),
@@ -874,7 +888,7 @@ pub(super) const PLAIN_UPPER: &str = "upper-plain";
 /// anything. One written under a kernel's own defaults before Kiri chose
 /// (Arch turns redirects and metacopy on) isn't, and stays readable only
 /// with those defaults.
-fn plain_upper(base: &Path) -> io::Result<bool> {
+fn plain_upper(base: &Path, writable: bool) -> io::Result<bool> {
     let marker = base.join(PLAIN_UPPER);
     if marker.exists() {
         return Ok(true);
@@ -884,8 +898,11 @@ fn plain_upper(base: &Path) -> io::Result<bool> {
         // written into it since this one looked for the marker.
         return Ok(marker.exists());
     }
-    fs::write(marker, b"")?;
-    Ok(true)
+    match fs::write(marker, b"") {
+        Ok(()) => Ok(true),
+        Err(e) if !writable && e.raw_os_error() == Some(libc::EROFS) => Ok(true),
+        Err(e) => Err(e),
+    }
 }
 
 /// Marks a writable layer that `kiri import` brought in whole as plain
@@ -913,16 +930,47 @@ fn overlay_features(plain: bool) -> &'static str {
     if plain { "index=off,redirect_dir=nofollow,metacopy=off" } else { "index=off" }
 }
 
+/// Verifies that a writable container's backing directory and mounted overlay
+/// root are not read-only (`ST_RDONLY` / `emergency_ro`). Linux `overlayfs`
+/// silently falls back to mounting read-only (returning 0 from `mount(2)`)
+/// when `work/work` fails on `EROFS` or `EEXIST` (#768).
+pub(super) fn ensure_writable_rootfs(base: &Path, rootfs: &Path) -> io::Result<()> {
+    let kind = match (sys::detect_readonly_fs(base), sys::detect_readonly_fs(rootfs)) {
+        (Some(a), Some(b)) => Some(a.merge(b)),
+        (Some(a), None) | (None, Some(a)) => Some(a),
+        (None, None) => None,
+    };
+    match kind {
+        Some(k) => Err(sys::readonly_storage_error(k)),
+        None => Ok(()),
+    }
+}
+
+fn map_rofs_error(base: &Path, writable: bool, err: io::Error) -> io::Error {
+    if writable && err.raw_os_error() == Some(libc::EROFS) {
+        let kind = sys::detect_readonly_fs(base).unwrap_or(sys::ReadOnlyKind::ReadOnly);
+        return sys::readonly_storage_error(kind);
+    }
+    err
+}
+
 /// Mounts a container's root: its image layers under its writable layer,
 /// at `<containers>/<id>/rootfs`. Returns that path. Only `roots` calls
 /// this, which keeps it to one mount per container.
-pub(super) fn mount_rootfs(paths: &Paths, id: &str, image_layers: &[&str]) -> io::Result<PathBuf> {
+pub(super) fn mount_rootfs(paths: &Paths, id: &str, image_layers: &[&str], writable: bool) -> io::Result<PathBuf> {
     valid_id(id)?;
     let base = paths.containers.join(id);
+    if writable
+        && let Some(kind) = sys::detect_readonly_fs(&base)
+    {
+        return Err(sys::readonly_storage_error(kind));
+    }
     let (upper, work, rootfs) = (base.join("upper"), base.join("work"), base.join("rootfs"));
     let _ = sys::umount_lazy(&rootfs);
     for d in [&upper, &work, &rootfs] {
-        fs::create_dir_all(d)?;
+        if !d.is_dir() {
+            fs::create_dir_all(d).map_err(|e| map_rofs_error(&base, writable, e))?;
+        }
     }
     // Lower dirs are relative to the agent's working directory (the layer
     // store), which keeps the option string short enough for many layers.
@@ -947,11 +995,20 @@ pub(super) fn mount_rootfs(paths: &Paths, id: &str, image_layers: &[&str]) -> io
     // fails at exec, as Docker's does, instead of failing to mount.
     if lower.is_empty() {
         let empty = base.join("empty");
-        fs::create_dir_all(&empty)?;
+        if !empty.is_dir() {
+            fs::create_dir_all(&empty).map_err(|e| map_rofs_error(&base, writable, e))?;
+        }
         lower.push(empty.to_str().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "container folder is not UTF-8"))?.to_owned());
     }
-    let rest = format!(",upperdir={},workdir={},{}", upper.display(), work.display(), overlay_features(plain_upper(&base)?));
-    sys::mount_overlay(&rootfs, &lower, &rest, 0)?;
+    let plain = plain_upper(&base, writable).map_err(|e| map_rofs_error(&base, writable, e))?;
+    let rest = format!(",upperdir={},workdir={},{}", upper.display(), work.display(), overlay_features(plain));
+    sys::mount_overlay(&rootfs, &lower, &rest, 0).map_err(|e| map_rofs_error(&base, writable, e))?;
+    if writable
+        && let Err(e) = ensure_writable_rootfs(&base, &rootfs)
+    {
+        super::roots::unmount(&rootfs);
+        return Err(e);
+    }
     Ok(rootfs)
 }
 
@@ -1159,6 +1216,13 @@ fn undo_now(t: &Teardown, remove_files: bool) {
         let _ = fs::remove_dir_all(PathBuf::from("/run/kiri").join(id));
     }
     remove_cgroup(&t.cgroup);
+    if t.cgroup.exists() {
+        kill_cgroup(&t.cgroup);
+        remove_cgroup(&t.cgroup);
+    }
+    for path in &t.loop_mounts {
+        super::volmount::release_loop(path);
+    }
     if remove_files {
         super::roots::remove(&t.base);
     }
@@ -1234,6 +1298,9 @@ pub fn sweep(paths: &Paths, cgroup: &std::path::Path) {
             let _ = net::detach(&name);
         }
     }
+    // Detach any loopback ext4 image mounted for `kiri-k8s` on a ZFS host so
+    // the filesystem flushes cleanly and no orphan loop mount remains.
+    super::volmount::release_k8s_ext4_if_mounted();
 }
 
 /// Kills every process in a cgroup and below it, and waits (briefly) until
@@ -1340,6 +1407,7 @@ fn prepare(argv: StrList<'_>, env: StrList<'_>, cwd: &str, user: &str, hostname:
         nodev_root: false,
         shm_size: 64 << 20,
         init: flags & run_flags::INIT != 0,
+        cgroupns_host: false,
         host: HostApplied::default(),
         root_ready: None,
         cgroup_ready: None,
@@ -1629,6 +1697,8 @@ pub(super) struct Mount {
     tmpfs_opts: Option<CString>,
     /// tmpfs mount flags (`noexec`, `nosuid`, `nodev`, `ro`).
     tmpfs_flags: libc::c_ulong,
+    /// Loopback ext4 volume mount acquired for this container (released on stop).
+    loop_mount: Option<String>,
 }
 
 impl Mount {
@@ -1648,50 +1718,85 @@ impl Mount {
 /// at its source first.
 pub(super) fn parse_mounts(list: StrList<'_>) -> io::Result<Vec<Mount>> {
     let mut out = Vec::with_capacity(list.len());
-    for m in list.iter() {
-        let bad = || io::Error::new(io::ErrorKind::InvalidInput, format!("bad mount {m:?}"));
-        // Three fields: source, target, flags. Seven: the same, then a
-        // volume's driver options (`type`, `device`, flags, data). Any other
-        // count is a separator inside a field — a target alone comes from an
-        // image's VOLUME line — and is refused here as well as at the host.
-        let f: Vec<&str> = m.split('\t').collect();
-        if f.len() != 3 && f.len() != 7 {
-            return Err(bad());
+    let release_acquired = |mounts: &[Mount]| {
+        for m in mounts {
+            if let Some(path) = &m.loop_mount {
+                super::volmount::release_loop(path);
+            }
         }
-        let (src, given_target, words) = (f[0], f[1], f[2]);
-        let flags: Vec<&str> = words.split(',').filter(|f| !f.is_empty()).collect();
-        if !given_target.starts_with('/') || given_target.split('/').any(|c| c == "..") {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("bad mount target {given_target}")));
+    };
+    let parsed = (|| -> io::Result<()> {
+        for m in list.iter() {
+            let bad = || io::Error::new(io::ErrorKind::InvalidInput, format!("bad mount {m:?}"));
+            // Three fields: source, target, flags. Seven: the same, then a
+            // volume's driver options (`type`, `device`, flags, data). Any other
+            // count is a separator inside a field — a target alone comes from an
+            // image's VOLUME line — and is refused here as well as at the host.
+            let f: Vec<&str> = m.split('\t').collect();
+            if f.len() != 3 && f.len() != 7 {
+                return Err(bad());
+            }
+            let (src, given_target, words) = (f[0], f[1], f[2]);
+            let flags: Vec<&str> = words.split(',').filter(|f| !f.is_empty()).collect();
+            if !given_target.starts_with('/') || given_target.split('/').any(|c| c == "..") {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("bad mount target {given_target}")));
+            }
+            let rel = given_target.trim_start_matches('/');
+            let target = CString::new(if rel.is_empty() { "." } else { rel })?;
+            let ro = flags.contains(&"ro");
+            if flags.contains(&"tmpfs") {
+                let opts: Vec<&str> = flags.iter().copied().filter(|f| f.contains('=')).collect();
+                let opts = if opts.is_empty() { "mode=1777".to_owned() } else { opts.join(",") };
+                let tmpfs_flags = tmpfs_flags(&flags);
+                let ro = tmpfs_flags & libc::MS_RDONLY != 0;
+                out.push(Mount { source: None, target, ro, dir: true, copy_up: false, tmpfs_opts: Some(CString::new(opts)?), tmpfs_flags, loop_mount: None });
+                continue;
+            }
+            // A missing source becomes a directory, as Docker does; one that is
+            // there already (a file such as /etc/hostname, too) is used as it is.
+            if flags.contains(&"create") && fs::symlink_metadata(src).is_err() {
+                fs::create_dir_all(src)?;
+            }
+            let mut loop_mount = None;
+            if f.len() == 7 && !f[3].is_empty() {
+                super::volmount::ensure(src, f[3], f[4], f[5], f[6])?;
+            } else if super::volmount::ensure_k8s_ext4(src)? {
+                loop_mount = Some(src.to_owned());
+            }
+            let meta = match fs::metadata(src) {
+                Ok(meta) => meta,
+                Err(e) => {
+                    if let Some(path) = &loop_mount {
+                        super::volmount::release_loop(path);
+                    }
+                    return Err(io::Error::new(e.kind(), format!("mount source {src}: {e}")));
+                }
+            };
+            let source = match sys::cstr(src) {
+                Ok(s) => s,
+                Err(e) => {
+                    if let Some(path) = &loop_mount {
+                        super::volmount::release_loop(path);
+                    }
+                    return Err(e);
+                }
+            };
+            out.push(Mount {
+                source: Some(source),
+                target,
+                ro,
+                dir: meta.is_dir(),
+                copy_up: flags.contains(&"copyup"),
+                tmpfs_opts: None,
+                tmpfs_flags: 0,
+                loop_mount,
+            });
         }
-        let rel = given_target.trim_start_matches('/');
-        let target = CString::new(if rel.is_empty() { "." } else { rel })?;
-        let ro = flags.contains(&"ro");
-        if flags.contains(&"tmpfs") {
-            let opts: Vec<&str> = flags.iter().copied().filter(|f| f.contains('=')).collect();
-            let opts = if opts.is_empty() { "mode=1777".to_owned() } else { opts.join(",") };
-            let tmpfs_flags = tmpfs_flags(&flags);
-            let ro = tmpfs_flags & libc::MS_RDONLY != 0;
-            out.push(Mount { source: None, target, ro, dir: true, copy_up: false, tmpfs_opts: Some(CString::new(opts)?), tmpfs_flags });
-            continue;
-        }
-        // A missing source becomes a directory, as Docker does; one that is
-        // there already (a file such as /etc/hostname, too) is used as it is.
-        if flags.contains(&"create") && fs::symlink_metadata(src).is_err() {
-            fs::create_dir_all(src)?;
-        }
-        if f.len() == 7 && !f[3].is_empty() {
-            super::volmount::ensure(src, f[3], f[4], f[5], f[6])?;
-        }
-        let meta = fs::metadata(src).map_err(|e| io::Error::new(e.kind(), format!("mount source {src}: {e}")))?;
-        out.push(Mount {
-            source: Some(sys::cstr(src)?),
-            target,
-            ro,
-            dir: meta.is_dir(),
-            copy_up: flags.contains(&"copyup"),
-            tmpfs_opts: None,
-            tmpfs_flags: 0,
-        });
+        Ok(())
+    })();
+    if let Err(e) = parsed {
+        release_acquired(&out);
+        return Err(e);
     }
     // Parents before what's under them, as Docker sorts mounts: the CLI sends
     // `-v` in no set order, and `/app/node_modules` mounted before `/app`
@@ -1728,17 +1833,264 @@ pub(super) fn tmpfs_flags(words: &[&str]) -> libc::c_ulong {
     f
 }
 
+const CGROUP_RO_ATTRS: u64 = sys::MOUNT_ATTR_RDONLY | sys::MOUNT_ATTR_NOSUID | sys::MOUNT_ATTR_NODEV | sys::MOUNT_ATTR_NOEXEC;
+const CGROUP_RO_FLAGS: libc::c_ulong = libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC;
+
+/// Normalizes `path` lexically by collapsing `//`, `.`, and `..`.
+fn lexical_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut parts: Vec<Component<'_>> = Vec::new();
+    let mut is_abs = false;
+    for c in path.components() {
+        match c {
+            Component::RootDir => {
+                is_abs = true;
+                parts.clear();
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(parts.last(), Some(Component::Normal(_))) {
+                    parts.pop();
+                } else if !is_abs {
+                    parts.push(c);
+                }
+            }
+            Component::Normal(_) | Component::Prefix(_) => parts.push(c),
+        }
+    }
+    let mut out = PathBuf::new();
+    if is_abs {
+        out.push("/");
+    }
+    for p in parts {
+        out.push(p.as_os_str());
+    }
+    out
+}
+
+/// Resolves symlinks via `fs::canonicalize` when `path` exists, falling back
+/// to lexical normalization so `.`, `..`, and `//` are still collapsed.
+fn canonical_path(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| lexical_normalize(path))
+}
+
+/// Normalizes a container-relative target path (stripping leading `/`, `.`, and
+/// collapsing `//` and `..` within the container root).
+fn normalize_rel_target(target: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in target.components() {
+        match c {
+            Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(n) => out.push(n),
+        }
+    }
+    out
+}
+
+/// Pure path check for whether `(src, target)` is a self-bind of
+/// `/sys/fs/cgroup` onto `/sys/fs/cgroup`.
+fn is_cgroup_self_bind_paths(src: &Path, target: &Path) -> bool {
+    canonical_path(src) == Path::new("/sys/fs/cgroup") && normalize_rel_target(target) == Path::new("sys/fs/cgroup")
+}
+
+/// Whether `src` and `target` (relative to `root`) are a bind of
+/// `/sys/fs/cgroup` onto `/sys/fs/cgroup`, including symlinks on `src` or
+/// inside `root`. `mount_container_filesystems` has already mounted `cgroup2`
+/// there, rooted at the container's cgroup namespace (the host's for
+/// `--cgroupns host`, the container's own cgroup otherwise) and read-only
+/// unless `--privileged`.
+fn is_cgroup_self_bind(root: BorrowedFd<'_>, src: &Path, target: &Path) -> bool {
+    if canonical_path(src) != Path::new("/sys/fs/cgroup") {
+        return false;
+    }
+    if normalize_rel_target(target) == Path::new("sys/fs/cgroup") {
+        return true;
+    }
+    matches!(
+        (inroot::open(root, target, Last::Exists), inroot::open(root, Path::new("sys/fs/cgroup"), Last::Exists)),
+        (Ok(at_t), Ok(at_cg)) if same_dir(&at_t, &at_cg)
+    )
+}
+
+/// Whether canonicalized `src` names the cgroup tree (v1 or v2, or a path
+/// under `/sys/fs/cgroup` such as a hybrid `tmpfs`), which an unprivileged
+/// container may only ever mount read-only.
+fn is_cgroup_source(src: &Path) -> bool {
+    let real = canonical_path(src);
+    real.starts_with("/sys/fs/cgroup") || sys::is_cgroup(&real) || sys::is_cgroup(src)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MountInfoEntry {
+    mount_point: PathBuf,
+    fstype: String,
+    options: String,
+}
+
+fn unescape_mount_bytes(raw: &str) -> Vec<u8> {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\'
+            && i + 3 < bytes.len()
+            && bytes[i + 1..i + 4].iter().all(|b| (b'0'..=b'7').contains(b))
+        {
+            let val = ((bytes[i + 1] - b'0') << 6) | ((bytes[i + 2] - b'0') << 3) | (bytes[i + 3] - b'0');
+            out.push(val);
+            i += 4;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Parses `/proc/self/mountinfo` keeping only the topmost active mount for each
+/// mountpoint path, ordered parents-first.
+fn parse_mountinfo(mountinfo: &str) -> Vec<MountInfoEntry> {
+    use std::os::unix::ffi::OsStringExt;
+    let mut active = std::collections::BTreeMap::<PathBuf, MountInfoEntry>::new();
+    for line in mountinfo.lines() {
+        let Some((before, after)) = line.split_once(" - ") else { continue };
+        let mut b = before.split_whitespace();
+        let (Some(_id), Some(_parent), Some(_dev), Some(_root), Some(mp), Some(mopts)) =
+            (b.next(), b.next(), b.next(), b.next(), b.next(), b.next())
+        else {
+            continue;
+        };
+        let Some(fstype) = after.split_whitespace().next() else { continue };
+        let mount_point = PathBuf::from(std::ffi::OsString::from_vec(unescape_mount_bytes(mp)));
+        active.insert(
+            mount_point.clone(),
+            MountInfoEntry { mount_point, fstype: fstype.to_owned(), options: mopts.to_owned() },
+        );
+    }
+    active.into_values().collect()
+}
+
+/// Active mountpoints in `mountinfo` at or beneath `target`.
+fn submounts_under(mountinfo: &str, target: &Path) -> Vec<MountInfoEntry> {
+    parse_mountinfo(mountinfo)
+        .into_iter()
+        .filter(|e| e.mount_point == target || e.mount_point.starts_with(target))
+        .collect()
+}
+
+/// Active `cgroup` or `cgroup2` mountpoints in `mountinfo` at or beneath `target`.
+fn cgroup_mounts_under(mountinfo: &str, target: &Path) -> Vec<MountInfoEntry> {
+    submounts_under(mountinfo, target)
+        .into_iter()
+        .filter(|e| e.fstype == "cgroup" || e.fstype == "cgroup2")
+        .collect()
+}
+
+/// Translates mountinfo per-mount option words into `mount(2)` flags so locked
+/// flags in a user namespace are preserved during `MS_BIND | MS_REMOUNT`.
+fn mount_opts_flags(opts: &str) -> libc::c_ulong {
+    let mut f = 0 as libc::c_ulong;
+    for w in opts.split(',') {
+        match w {
+            "nosuid" => f |= libc::MS_NOSUID,
+            "nodev" => f |= libc::MS_NODEV,
+            "noexec" => f |= libc::MS_NOEXEC,
+            "noatime" => f |= libc::MS_NOATIME,
+            "nodiratime" => f |= libc::MS_NODIRATIME,
+            "relatime" => f |= libc::MS_RELATIME,
+            "strictatime" => f |= libc::MS_STRICTATIME,
+            _ => {}
+        }
+    }
+    f
+}
+
+fn remount_single(target: &CStr, extra_flags: libc::c_ulong, mountinfo_opts: Option<&str>) -> io::Result<()> {
+    let mut flags = libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | extra_flags;
+    if let Some(opts) = mountinfo_opts {
+        flags |= mount_opts_flags(opts);
+    } else {
+        // SAFETY: `statvfs` is plain zero-initialized data and `target` is NUL-terminated.
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        // SAFETY: `target` is valid and `st` is writable.
+        if unsafe { libc::statvfs(target.as_ptr(), &mut st) } == 0 {
+            flags |= (st.f_flag & (libc::ST_NOSUID | libc::ST_NODEV | libc::ST_NOEXEC)) as libc::c_ulong;
+        }
+    }
+    sys::mount(c"none", target, c"none", flags, None)
+}
+
+/// Remounts `target` and every submount beneath it read-only using
+/// `mount_setattr(AT_RECURSIVE)`, falling back to `/proc/self/mountinfo` when
+/// `mount_setattr` is unavailable (`ENOSYS`/seccomp) because Linux ignores
+/// `MS_REC` on `MS_BIND | MS_REMOUNT`.
+fn remount_ro_recursive(target: &CStr, attr_set: u64, remount_flags: libc::c_ulong) -> io::Result<()> {
+    if sys::mount_setattr_recursive(target, attr_set).is_ok() {
+        return Ok(());
+    }
+    let target_path = Path::new(std::ffi::OsStr::from_bytes(target.to_bytes()));
+    let real = fs::read_link(target_path).unwrap_or_else(|_| target_path.to_path_buf());
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
+    let subs = submounts_under(&mountinfo, &real);
+    let mut remounted_target = false;
+    for entry in &subs {
+        if entry.mount_point == real {
+            remounted_target = true;
+        }
+        let mp = sys::cstr(&entry.mount_point)?;
+        remount_single(&mp, remount_flags, Some(&entry.options))?;
+    }
+    if !remounted_target {
+        remount_single(target, remount_flags, None)?;
+    }
+    Ok(())
+}
+
+/// Ensures any cgroup v1/v2 mount exposed at or beneath `t` after a bind mount
+/// in an unprivileged container is strictly read-only (`nosuid,nodev,noexec,ro`).
+fn harden_cgroup_mounts(root: BorrowedFd<'_>, t: &Path) -> io::Result<()> {
+    let at = inroot::open(root, t, Last::Exists)?;
+    let proc_path = at.proc_path();
+    let proc_p = Path::new(std::ffi::OsStr::from_bytes(proc_path.to_bytes()));
+    if sys::is_cgroup(proc_p) {
+        remount_ro_recursive(&proc_path, CGROUP_RO_ATTRS, CGROUP_RO_FLAGS)?;
+    }
+    let real = fs::read_link(proc_p)?;
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
+    for entry in cgroup_mounts_under(&mountinfo, &real) {
+        let mp = sys::cstr(&entry.mount_point)?;
+        remount_ro_recursive(&mp, CGROUP_RO_ATTRS, CGROUP_RO_FLAGS)?;
+    }
+    Ok(())
+}
+
 /// Mounts one entry into the container (relative target, before
 /// pivot_root), creating the target as a directory or an empty file. The
 /// target is looked up inside `root`, so an image's symlink cannot point
 /// the mount, the copy-up or the new directory outside the container.
-pub(super) fn apply_mount(root: BorrowedFd<'_>, image: Option<BorrowedFd<'_>>, m: &Mount) -> io::Result<()> {
+pub(super) fn apply_mount(root: BorrowedFd<'_>, image: Option<BorrowedFd<'_>>, m: &Mount, privileged: bool) -> io::Result<()> {
     let t = Path::new(std::ffi::OsStr::from_bytes(m.target.to_bytes()));
     if let Some(opts) = &m.tmpfs_opts {
         let at = inroot::open(root, t, Last::Dir)?;
         return sys::mount(c"tmpfs", &at.proc_path(), c"tmpfs", m.tmpfs_flags, Some(opts));
     }
     let src = m.source.as_ref().expect("bind mounts have a source");
+    let src_path = Path::new(std::ffi::OsStr::from_bytes(src.to_bytes()));
+    if is_cgroup_self_bind(root, src_path, t) {
+        if !privileged || m.ro {
+            if let Ok(at) = inroot::open(root, Path::new("sys/fs/cgroup"), Last::Exists) {
+                let proc_path = at.proc_path();
+                if sys::is_cgroup(Path::new(std::ffi::OsStr::from_bytes(proc_path.to_bytes()))) {
+                    remount_ro_recursive(&proc_path, CGROUP_RO_ATTRS, CGROUP_RO_FLAGS)?;
+                }
+            }
+        }
+        return Ok(());
+    }
     let at = inroot::open(root, t, if m.dir { Last::Dir } else { Last::File })?;
     let target = at.proc_path();
     if m.dir && m.copy_up {
@@ -1769,7 +2121,6 @@ pub(super) fn apply_mount(root: BorrowedFd<'_>, image: Option<BorrowedFd<'_>>, m
             None => None,
         };
         if let Some(from_path) = from_path {
-            let src_path = Path::new(std::ffi::OsStr::from_bytes(src.to_bytes()));
             let image_path = Path::new(std::ffi::OsStr::from_bytes(from_path.to_bytes()));
             let empty = fs::read_dir(src_path).map(|mut d| d.next().is_none()).unwrap_or(false);
             if empty && image_path.is_dir() {
@@ -1778,11 +2129,20 @@ pub(super) fn apply_mount(root: BorrowedFd<'_>, image: Option<BorrowedFd<'_>>, m
         }
     }
     sys::mount(src, &target, c"none", libc::MS_BIND | libc::MS_REC, None)?;
-    if m.ro {
+    let cgroup_src = !privileged && is_cgroup_source(src_path);
+    if m.ro || cgroup_src {
         // The descriptor is the directory under the new mount; look again
         // to reach the mount itself.
         let at = inroot::open(root, t, Last::Exists)?;
-        sys::mount(c"none", &at.proc_path(), c"none", libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_REC, None)?;
+        let (attrs, flags) = if cgroup_src {
+            (CGROUP_RO_ATTRS, CGROUP_RO_FLAGS)
+        } else {
+            (sys::MOUNT_ATTR_RDONLY, libc::MS_RDONLY)
+        };
+        remount_ro_recursive(&at.proc_path(), attrs, flags)?;
+    }
+    if !privileged {
+        harden_cgroup_mounts(root, t)?;
     }
     Ok(())
 }
@@ -1987,7 +2347,7 @@ fn bind_file(root: BorrowedFd<'_>, src: &CStr, target: &CStr) -> io::Result<()> 
 /// image (or an earlier start) has there stays as it is: O_EXCL never
 /// follows a link, so one that points out of the container is not written
 /// through, and a link or directory there does not fail the start.
-fn make_marker(root: BorrowedFd<'_>) -> io::Result<()> {
+fn make_marker(root: BorrowedFd<'_>, readonly_rootfs: bool) -> io::Result<()> {
     // SAFETY: valid directory fd and NUL-terminated name.
     let fd = unsafe { libc::openat(root.as_raw_fd(), MARKER.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC, 0o755) };
     if fd >= 0 {
@@ -2001,6 +2361,7 @@ fn make_marker(root: BorrowedFd<'_>) -> io::Result<()> {
     }
     match io::Error::last_os_error() {
         e if e.raw_os_error() == Some(libc::EEXIST) => Ok(()),
+        e if readonly_rootfs && e.raw_os_error() == Some(libc::EROFS) => Ok(()),
         e => Err(e),
     }
 }
@@ -2048,6 +2409,7 @@ fn child_fds(p: &Prepared, io: &ChildStdio) -> Vec<RawFd> {
         nodev_root: _,
         shm_size: _,
         init: _,
+        cgroupns_host: _,
         // Paths, numbers and names only.
         host: HostApplied { rlimits: _, groups: _, nodes: _, masked: _, readonly: _ },
         root_ready,
@@ -2098,7 +2460,9 @@ fn container_child(p: &Prepared, rootfs: &CStr, io: &ChildStdio, close_first: &[
                 fail("cgroup", io::Error::other("the agent could not move this container into its cgroup"));
             }
         }
-        sys::unshare(libc::CLONE_NEWCGROUP).unwrap_or_else(|e| fail("cgroup namespace", e));
+        if !p.cgroupns_host {
+            sys::unshare(libc::CLONE_NEWCGROUP).unwrap_or_else(|e| fail("cgroup namespace", e));
+        }
     }
 
     // Mount events must not leak back into the agent's namespace.
@@ -2125,7 +2489,7 @@ fn container_child(p: &Prepared, rootfs: &CStr, io: &ChildStdio, close_first: &[
     // SDKs use Docker's marker to detect container execution when cgroup
     // namespaces hide the host's cgroup path. Made before changing user or
     // making the root filesystem read-only.
-    make_marker(root).unwrap_or_else(|e| fail("container marker", e));
+    make_marker(root, p.readonly_rootfs).unwrap_or_else(|e| fail("container marker", e));
     // The image's tree without the mounts made on it, for filling new
     // volumes; closed (and so unmounted) once they are all in place.
     let image = if p.mounts.iter().any(|m| m.copy_up) { image_tree() } else { None };
@@ -2139,7 +2503,7 @@ fn container_child(p: &Prepared, rootfs: &CStr, io: &ChildStdio, close_first: &[
         }
     }
     for m in &p.mounts {
-        apply_mount(root, image.as_ref().map(|f| f.as_fd()), m).unwrap_or_else(|e| fail(&format!("mount {}", m.target.to_string_lossy()), e));
+        apply_mount(root, image.as_ref().map(|f| f.as_fd()), m, p.privileged).unwrap_or_else(|e| fail(&format!("mount {}", m.target.to_string_lossy()), e));
     }
     drop(image);
 
@@ -3173,12 +3537,12 @@ mod tests {
         let base = std::env::temp_dir().join(format!("kiri-plain-upper-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(base.join("upper")).unwrap();
-        assert!(super::plain_upper(&base).unwrap(), "fresh");
+        assert!(super::plain_upper(&base, true).unwrap(), "fresh");
         assert!(base.join(super::PLAIN_UPPER).exists());
         std::fs::write(base.join("upper/written"), b"x").unwrap();
-        assert!(super::plain_upper(&base).unwrap(), "marked, then written to");
+        assert!(super::plain_upper(&base, true).unwrap(), "marked, then written to");
         std::fs::remove_file(base.join(super::PLAIN_UPPER)).unwrap();
-        assert!(!super::plain_upper(&base).unwrap(), "written before the mark existed");
+        assert!(!super::plain_upper(&base, true).unwrap(), "written before the mark existed");
         assert!(!base.join(super::PLAIN_UPPER).exists(), "an old layer is never marked");
         assert_eq!(super::overlay_features(true), "index=off,redirect_dir=nofollow,metacopy=off");
         assert_eq!(super::overlay_features(false), "index=off");
@@ -3668,7 +4032,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         let (plain, linked, linked_existing, dir) = (base.join("plain"), base.join("linked"), base.join("linked-existing"), base.join("dir"));
         let marker = |root: &std::path::Path| root.join(super::MARKER.to_str().unwrap());
-        let make = |root: &std::path::Path| super::make_marker(super::inroot::open_root(root).unwrap().as_fd());
+        let make = |root: &std::path::Path| super::make_marker(super::inroot::open_root(root).unwrap().as_fd(), false);
         for root in [&plain, &linked, &linked_existing, &dir] {
             std::fs::create_dir_all(root).unwrap();
         }
@@ -3705,7 +4069,7 @@ mod tests {
 
     #[test]
     fn mounts_go_parents_first_whatever_order_they_came_in() {
-        let m = |t: &str| super::Mount { source: None, target: std::ffi::CString::new(t).unwrap(), ro: false, dir: true, copy_up: false, tmpfs_opts: None, tmpfs_flags: 0 };
+        let m = |t: &str| super::Mount { source: None, target: std::ffi::CString::new(t).unwrap(), ro: false, dir: true, copy_up: false, tmpfs_opts: None, tmpfs_flags: 0, loop_mount: None };
         let mut mounts = vec![m("app/node_modules"), m("app"), m("data"), m("app/cache/x"), m(".")];
         mounts.sort_by_key(|x| super::depth(&x.target));
         let order: Vec<_> = mounts.iter().map(|x| x.target.to_str().unwrap()).collect();
@@ -4138,5 +4502,127 @@ mod tests {
         assert_eq!(super::host_etc_target(true, true, false, [172, 17, 0, 1]).as_deref(), Some("192.168.65.254"));
         assert_eq!(super::host_etc_target(true, true, false, [172, 18, 0, 1]).as_deref(), Some("192.168.65.254"));
         assert_eq!(super::host_etc_target(true, true, true, [0; 4]).as_deref(), Some("192.168.65.254"));
+    }
+
+    #[test]
+    fn cgroup_self_bind_canonicalization_and_source_checks() {
+        use std::os::fd::AsFd;
+        use std::os::unix::fs::symlink;
+        use std::path::{Path, PathBuf};
+
+        assert!(super::is_cgroup_self_bind_paths(Path::new("/sys/fs/cgroup"), Path::new("sys/fs/cgroup")));
+        assert!(super::is_cgroup_self_bind_paths(Path::new("/sys/fs/cgroup/"), Path::new("/sys/fs/cgroup/")));
+        assert!(super::is_cgroup_self_bind_paths(Path::new("/sys/fs/./cgroup"), Path::new("sys/fs/./cgroup")));
+        assert!(super::is_cgroup_self_bind_paths(Path::new("/sys/fs/x/../cgroup"), Path::new("/sys//fs/cgroup")));
+        assert!(!super::is_cgroup_self_bind_paths(Path::new("/sys/fs/cgroup/sub"), Path::new("sys/fs/cgroup")));
+        assert!(!super::is_cgroup_self_bind_paths(Path::new("/sys/fs/cgroup"), Path::new("sys/fs/cgroup/sub")));
+        assert!(!super::is_cgroup_self_bind_paths(Path::new("/tmp/cgroup"), Path::new("sys/fs/cgroup")));
+        assert!(!super::is_cgroup_self_bind_paths(Path::new("/sys/fs/cgroup"), Path::new("mnt")));
+
+        assert!(super::is_cgroup_source(Path::new("/sys/fs/cgroup")));
+        assert!(super::is_cgroup_source(Path::new("/sys/fs/cgroup/kiri")));
+        assert!(super::is_cgroup_source(Path::new("/sys/fs/./cgroup")));
+        assert!(super::is_cgroup_source(Path::new("/sys/fs/cgroup/kiri/../other")));
+        assert!(!super::is_cgroup_source(Path::new("/sys/fs/cgroup2")));
+        assert!(!super::is_cgroup_source(Path::new("/sys")));
+        assert!(!super::is_cgroup_source(Path::new("/tmp/cgroup")));
+
+        // Canonicalization resolves symlinks on disk and inside container root.
+        let base = std::env::temp_dir().join(format!("kiri-cg-canon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("root");
+        std::fs::create_dir_all(root.join("sys/fs/cgroup")).unwrap();
+        std::fs::create_dir_all(root.join("mnt")).unwrap();
+        symlink("/sys/fs/cgroup", root.join("mycg")).unwrap();
+        let real_dir = base.join("real");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let link_dir = base.join("link");
+        symlink(&real_dir, &link_dir).unwrap();
+        assert_eq!(super::canonical_path(&link_dir), real_dir.canonicalize().unwrap());
+
+        if Path::new("/sys/fs/cgroup").exists() {
+            let sys_cg_link = base.join("cglink");
+            symlink("/sys/fs/cgroup", &sys_cg_link).unwrap();
+            assert!(super::is_cgroup_source(&sys_cg_link));
+            assert!(super::is_cgroup_self_bind_paths(&sys_cg_link, Path::new("sys/fs/cgroup")));
+        }
+
+        let root_fd = super::inroot::open_root(&root).unwrap();
+        if Path::new("/sys/fs/cgroup").canonicalize().is_ok_and(|p| p == Path::new("/sys/fs/cgroup")) {
+            assert!(super::is_cgroup_self_bind(root_fd.as_fd(), Path::new("/sys/fs/cgroup"), Path::new("mycg")));
+            assert!(!super::is_cgroup_self_bind(root_fd.as_fd(), Path::new("/sys/fs/cgroup"), Path::new("mnt")));
+        }
+        assert_eq!(super::normalize_rel_target(Path::new("/sys/fs/./cgroup/")), PathBuf::from("sys/fs/cgroup"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn mountinfo_finds_nested_cgroup_submounts_under_parent_bind() {
+        use std::path::{Path, PathBuf};
+
+        let target = Path::new("/var/lib/kiri/containers/c1/rootfs/hostsys");
+        // Pure cgroup v2 parent bind plus a sibling prefix `/hostsystemd` that must not match.
+        let pure_v2 = "\
+28 24 0:26 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw
+101 24 0:30 / /var/lib/kiri/containers/c1/rootfs/hostsys rw,relatime - sysfs sysfs rw
+102 101 0:26 / /var/lib/kiri/containers/c1/rootfs/hostsys/fs/cgroup rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw
+103 24 0:30 / /var/lib/kiri/containers/c1/rootfs/hostsystemd rw,relatime - sysfs sysfs rw
+104 103 0:26 / /var/lib/kiri/containers/c1/rootfs/hostsystemd/fs/cgroup rw,relatime - cgroup2 cgroup2 rw
+";
+        let cg_v2: Vec<PathBuf> = super::cgroup_mounts_under(pure_v2, target).into_iter().map(|e| e.mount_point).collect();
+        assert_eq!(cg_v2, vec![PathBuf::from("/var/lib/kiri/containers/c1/rootfs/hostsys/fs/cgroup")]);
+        let all_v2: Vec<PathBuf> = super::submounts_under(pure_v2, target).into_iter().map(|e| e.mount_point).collect();
+        assert_eq!(
+            all_v2,
+            vec![
+                PathBuf::from("/var/lib/kiri/containers/c1/rootfs/hostsys"),
+                PathBuf::from("/var/lib/kiri/containers/c1/rootfs/hostsys/fs/cgroup"),
+            ]
+        );
+
+        // Hybrid WSL 2 parent bind: tmpfs overmounts an earlier cgroup2 at `/hostsys/fs/cgroup`,
+        // with `unified` (cgroup2) and v1 controllers (`memory`, `pids`) beneath it, plus an escaped space mount.
+        let hybrid = "\
+101 24 0:30 / /var/lib/kiri/containers/c1/rootfs/hostsys rw,relatime - sysfs sysfs rw
+102 101 0:26 / /var/lib/kiri/containers/c1/rootfs/hostsys/fs/cgroup rw,relatime - cgroup2 cgroup2 rw
+103 102 0:31 / /var/lib/kiri/containers/c1/rootfs/hostsys/fs/cgroup rw,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,mode=755
+104 103 0:26 / /var/lib/kiri/containers/c1/rootfs/hostsys/fs/cgroup/unified rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw
+105 103 0:32 / /var/lib/kiri/containers/c1/rootfs/hostsys/fs/cgroup/memory rw,nosuid,nodev,noexec,relatime - cgroup cgroup rw,memory
+106 103 0:33 / /var/lib/kiri/containers/c1/rootfs/hostsys/fs/cgroup/pids rw,nosuid,nodev,noexec,relatime - cgroup cgroup rw,pids
+107 103 0:34 / /var/lib/kiri/containers/c1/rootfs/hostsys/fs/cgroup/my\\040cg\\134v1 rw,noatime,nodiratime - cgroup cgroup rw
+";
+        let cg_hybrid: Vec<PathBuf> = super::cgroup_mounts_under(hybrid, target).into_iter().map(|e| e.mount_point).collect();
+        assert_eq!(
+            cg_hybrid,
+            vec![
+                PathBuf::from("/var/lib/kiri/containers/c1/rootfs/hostsys/fs/cgroup/memory"),
+                PathBuf::from("/var/lib/kiri/containers/c1/rootfs/hostsys/fs/cgroup/my cg\\v1"),
+                PathBuf::from("/var/lib/kiri/containers/c1/rootfs/hostsys/fs/cgroup/pids"),
+                PathBuf::from("/var/lib/kiri/containers/c1/rootfs/hostsys/fs/cgroup/unified"),
+            ]
+        );
+        let all_hybrid = super::submounts_under(hybrid, target);
+        assert_eq!(all_hybrid.len(), 6);
+        assert_eq!(all_hybrid[1].fstype, "tmpfs");
+
+        let flags = super::mount_opts_flags("rw,nosuid,nodev,noexec,relatime,noatime,nodiratime");
+        assert_eq!(
+            flags,
+            libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC | libc::MS_RELATIME | libc::MS_NOATIME | libc::MS_NODIRATIME
+        );
+    }
+
+    #[test]
+    fn hostopts_cgroupns_host_is_parsed_cleanly() {
+        let mut buf = Vec::new();
+        let net = Net { bridge: "", ip: [0; 4], prefix: 0, gateway: [0; 4], extra_hosts: &[], dns_names: &[], opts: &[] };
+        encode_run(&mut buf, "c1", &[], &["sh"], &[], "/", "", "c1", 0, net, &[], &Limits::default(), 0, &["cgroupns\thost"], &[]);
+        let Ok(Msg::Run(spec)) = decode(&buf) else { panic!() };
+        let parsed = super::super::hostopts::parse(spec.opts).unwrap();
+        assert!(parsed.cgroupns_host);
+        let mut prepared = super::prepare(spec.argv, spec.env, spec.cwd, spec.user, Some(spec.hostname), spec.flags, spec.caps).unwrap();
+        assert!(!prepared.cgroupns_host);
+        prepared.cgroupns_host = parsed.cgroupns_host;
+        assert!(prepared.cgroupns_host);
     }
 }

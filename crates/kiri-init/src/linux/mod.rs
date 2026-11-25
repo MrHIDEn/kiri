@@ -27,7 +27,7 @@ mod volmount;
 
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 
 use kiri_proto::{HOST_PORT, Hello, Msg, PROTOCOL};
@@ -224,6 +224,9 @@ fn host_dirs() -> io::Result<container::Paths> {
     if let Some(data) = std::env::var_os("KIRI_AGENT_DATA").map(PathBuf::from).filter(|p| p.is_absolute() && p != &root) {
         mount_agent_data(&data, &root)?;
     }
+    if let Some(kind) = sys::detect_readonly_fs(&root) {
+        return Err(sys::readonly_storage_error(kind));
+    }
     let mkdir = |p: &std::path::Path, mode: u32| -> io::Result<()> {
         std::fs::create_dir_all(p)?;
         std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode))
@@ -397,23 +400,7 @@ fn cgroup2_rel(proc_cgroup: &str) -> String {
 
 /// Unescapes `/proc/self/mountinfo` octal escapes (`\040`, `\011`, `\012`, `\134`).
 fn unescape_mount_path(raw: &str) -> String {
-    let bytes = raw.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\\'
-            && i + 3 < bytes.len()
-            && bytes[i + 1..i + 4].iter().all(|b| (b'0'..=b'7').contains(b))
-        {
-            let val = ((bytes[i + 1] - b'0') << 6) | ((bytes[i + 2] - b'0') << 3) | (bytes[i + 3] - b'0');
-            out.push(val);
-            i += 4;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
+    sys::unescape_mount_path(raw)
 }
 
 /// Writable `cgroup2` mounts visible in `/proc/self/mountinfo`, ordered by
@@ -645,14 +632,21 @@ fn data_dirs() -> io::Result<container::Paths> {
     if let Err(ref e) = disk {
         eprintln!("kiri-init: no data disk ({e}); keeping images in memory");
         mount(c"kiri", c"/var/lib/kiri", c"tmpfs", libc::MS_NOATIME, Some(c"mode=0755"))?;
-    } else if let Err(e) = disk::grow() {
-        eprintln!("kiri-init: growing data disk: {e}");
+    } else {
+        if let Err(e) = disk::grow() {
+            eprintln!("kiri-init: growing data disk: {e}");
+        }
+        if let Some(kind) = sys::detect_readonly_fs(std::path::Path::new(DATA)) {
+            return Err(sys::readonly_storage_error(kind));
+        }
     }
     // The Mac's filesystem over virtiofs, for bind mounts.
     sys::mkdir(c"/mnt", 0o755);
     sys::mkdir(c"/mnt/mac", 0o755);
     if let Err(e) = mount(c"kiri-mac", c"/mnt/mac", c"virtiofs", libc::MS_NOATIME, None) {
         eprintln!("kiri-init: no Mac file share ({e}); bind mounts of Mac paths will fail");
+    } else if let Err(e) = mac_readahead() {
+        eprintln!("kiri-init: keeping the Mac file share's default read-ahead ({e})");
     }
     // An x86-64 guest (Intel Macs, WSL2) runs amd64 binaries natively.
     #[cfg(target_arch = "aarch64")]
@@ -684,6 +678,15 @@ fn data_dirs() -> io::Result<container::Paths> {
         trim::start(DATA);
     }
     Ok(paths)
+}
+
+/// Batch sequential reads across virtiofs without changing cache coherence.
+/// Only the Mac share's backing device is changed; Rosetta and the data disk
+/// keep their own settings. Older kernels may omit this optional tuning.
+fn mac_readahead() -> io::Result<()> {
+    let device = std::fs::metadata("/mnt/mac")?.dev();
+    let path = format!("/sys/class/bdi/{}:{}/read_ahead_kb", libc::major(device), libc::minor(device));
+    sys::write_file(&path, "1024\n")
 }
 
 /// x86-64 Linux binaries through Rosetta, when the Mac shares it: amd64
@@ -729,23 +732,29 @@ fn dial_host() -> io::Result<File> {
     Err(io::Error::new(last.kind(), format!("dial host: {last}")))
 }
 
-/// MemTotal, MemAvailable and (when the kernel reports it) Balloon in KiB.
-fn meminfo_full() -> (u64, u64, Option<u64>) {
-    let Ok(s) = std::fs::read_to_string("/proc/meminfo") else { return (0, 0, None) };
-    let (total, avail, balloon) = parse_meminfo(&s);
+/// MemTotal, MemAvailable and (when the kernel reports them) Balloon and
+/// Committed_AS in KiB.
+fn meminfo_full() -> (u64, u64, Option<u64>, Option<u64>) {
+    let Ok(s) = std::fs::read_to_string("/proc/meminfo") else { return (0, 0, None, None) };
+    let (total, avail, balloon, committed) = parse_meminfo(&s);
     // Older kernels without `Balloon:` in /proc/meminfo still expose
     // balloon_inflate / balloon_deflate in /proc/vmstat inside the VM.
     let balloon = balloon.or_else(|| (std::process::id() == 1).then(vmstat_balloon_kib).flatten());
-    (total, avail, balloon)
+    (total, avail, balloon, committed)
 }
 
-fn parse_meminfo(s: &str) -> (u64, u64, Option<u64>) {
+fn parse_meminfo(s: &str) -> (u64, u64, Option<u64>, Option<u64>) {
     let field = |name: &str| {
         s.lines()
             .find_map(|l| l.strip_prefix(name))
             .and_then(|rest| rest.trim().trim_end_matches("kB").trim().parse().ok())
     };
-    (field("MemTotal:").unwrap_or(0), field("MemAvailable:").unwrap_or(0), field("Balloon:"))
+    (
+        field("MemTotal:").unwrap_or(0),
+        field("MemAvailable:").unwrap_or(0),
+        field("Balloon:"),
+        field("Committed_AS:"),
+    )
 }
 
 fn vmstat_balloon_kib() -> Option<u64> {
@@ -770,7 +779,7 @@ fn parse_vmstat_balloon_kib(s: &str, page_kib: u64) -> Option<u64> {
 
 /// MemTotal and MemAvailable in KiB.
 fn meminfo() -> (u64, u64) {
-    let (total, avail, _) = meminfo_full();
+    let (total, avail, _, _) = meminfo_full();
     (total, avail)
 }
 
@@ -838,13 +847,15 @@ mod take_over_tests {
 #[cfg(test)]
 mod meminfo_tests {
     #[test]
-    fn meminfo_reads_balloon_when_present() {
-        let with = "MemTotal:       24656160 kB\nMemFree:        24297640 kB\nMemAvailable:   24122580 kB\nBalloon:          262144 kB\n";
-        assert_eq!(super::parse_meminfo(with), (24_656_160, 24_122_580, Some(262_144)));
-        let zero = "MemTotal:       8211244 kB\nMemAvailable:   8000000 kB\nBalloon:              0 kB\n";
-        assert_eq!(super::parse_meminfo(zero), (8_211_244, 8_000_000, Some(0)));
+    fn meminfo_reads_balloon_and_committed_as_when_present() {
+        let with = "MemTotal:       24656160 kB\nMemFree:        24297640 kB\nMemAvailable:   24122580 kB\nCommitLimit:    12328080 kB\nCommitted_AS:    2097152 kB\nBalloon:          262144 kB\n";
+        assert_eq!(super::parse_meminfo(with), (24_656_160, 24_122_580, Some(262_144), Some(2_097_152)));
+        let zero = "MemTotal:       8211244 kB\nMemAvailable:   8000000 kB\nCommitted_AS:         0 kB\nBalloon:              0 kB\n";
+        assert_eq!(super::parse_meminfo(zero), (8_211_244, 8_000_000, Some(0), Some(0)));
+        let only_committed = "MemTotal:       8211244 kB\nMemAvailable:   8000000 kB\nCommitted_AS:   2148352 kB\n";
+        assert_eq!(super::parse_meminfo(only_committed), (8_211_244, 8_000_000, None, Some(2_148_352)));
         let without = "MemTotal:       8211244 kB\nMemAvailable:   8000000 kB\n";
-        assert_eq!(super::parse_meminfo(without), (8_211_244, 8_000_000, None));
+        assert_eq!(super::parse_meminfo(without), (8_211_244, 8_000_000, None, None));
     }
 
     #[test]
