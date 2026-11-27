@@ -328,6 +328,8 @@ struct Prepared {
     init: bool,
     /// `--cgroupns host`: no cgroup namespace of its own.
     cgroupns_host: bool,
+    /// Timer slack in nanoseconds for the container's PID 1 (`timerslack_ns`).
+    timer_slack_ns: Option<u64>,
     /// Ulimits, groups and device nodes from the `opts` lines.
     host: HostApplied,
     /// The child's end of the pipe that says its root is in place (mounts
@@ -475,21 +477,68 @@ fn stdio(p: &Prepared) -> io::Result<(ParentStdio, ChildStdio)> {
     ))
 }
 
+/// Maximum wait for a spawned/exec'd TTY child to open `/dev/ptmx` and send
+/// its master fd back over the control socket. Prevents a child cloned into a
+/// frozen cgroup or wedged before `open_pty` from blocking single-threaded
+/// `kiri-init` forever (#948).
+const TTY_READY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// After clone: collect the agent's ends. For a TTY this waits for the child
 /// to send the pty master, or the reason it could not.
 fn finish_stdio(parent: ParentStdio, child: ChildStdio) -> io::Result<(Option<OwnedFd>, Option<OwnedFd>, Option<OwnedFd>)> {
+    finish_stdio_timeout(parent, child, TTY_READY_WAIT)
+}
+
+fn finish_stdio_timeout(
+    parent: ParentStdio,
+    child: ChildStdio,
+    wait: std::time::Duration,
+) -> io::Result<(Option<OwnedFd>, Option<OwnedFd>, Option<OwnedFd>)> {
     drop(child);
     match parent {
         ParentStdio::Pipes { stdin, stdout, stderr } => Ok((stdin, Some(stdout), Some(stderr))),
-        ParentStdio::Tty { sock } => match sys::recv_fd(sock.as_raw_fd())? {
-            Received::Fd(master) => {
-                sys::set_nonblocking(master.as_raw_fd())?;
-                let input = master.try_clone()?;
-                Ok((Some(input), Some(master), None))
+        ParentStdio::Tty { sock } => {
+            sys::set_nonblocking(sock.as_raw_fd())?;
+            let deadline = std::time::Instant::now() + wait;
+            let received = loop {
+                let timeout = deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_micros()
+                    .div_ceil(1000)
+                    .min(i32::MAX as u128) as i32;
+                let mut pfd = libc::pollfd { fd: sock.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+                // SAFETY: one valid pollfd.
+                let n = unsafe { libc::poll(&mut pfd, 1, timeout) };
+                if n == 0 {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "timed out waiting for container terminal"));
+                }
+                if n < 0 {
+                    let e = io::Error::last_os_error();
+                    if e.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(e);
+                }
+                match sys::recv_fd(sock.as_raw_fd()) {
+                    Ok(r) => break r,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted || e.kind() == io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            return Err(io::Error::new(io::ErrorKind::TimedOut, "timed out waiting for container terminal"));
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
+            match received {
+                Received::Fd(master) => {
+                    sys::set_nonblocking(master.as_raw_fd())?;
+                    let input = master.try_clone()?;
+                    Ok((Some(input), Some(master), None))
+                }
+                Received::Message(m) if m.is_empty() => Err(io::Error::other("container exited before its terminal was ready")),
+                Received::Message(m) => Err(io::Error::other(m)),
             }
-            Received::Message(m) if m.is_empty() => Err(io::Error::other("container exited before its terminal was ready")),
-            Received::Message(m) => Err(io::Error::other(m)),
-        },
+        }
     }
 }
 
@@ -571,6 +620,7 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
     }
     let (masked, readonly) = (host.masked.take(), host.readonly.take());
     prepared.cgroupns_host = host.cgroupns_host;
+    prepared.timer_slack_ns = host.timer_slack_ns;
     prepared.host = HostApplied { rlimits: host.rlimits.clone(), groups: host.groups.clone(), nodes, masked, readonly };
     // Small, short-lived files: kept in memory (/run is tmpfs), not on the data disk.
     let etc_dir = PathBuf::from("/run/kiri").join(spec.id);
@@ -590,10 +640,10 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
     if spec.flags & run_flags::NET_HOST == 0 && prepared.net_join.is_none() {
         let had_ping = host.sysctls.iter().any(|s| s.path == "net/ipv4/ping_group_range");
         super::hostopts::add_net_defaults(&mut host.sysctls);
+        static SELF_PING_MAX: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
         if !had_ping
-            && let Ok(map) = fs::read_to_string("/proc/self/gid_map")
+            && let Some(max) = *SELF_PING_MAX.get_or_init(|| fs::read_to_string("/proc/self/gid_map").ok().map(|m| ping_group_max(&m)))
         {
-            let max = ping_group_max(&map);
             if max < DEFAULT_PING_MAX
                 && let Some(s) = host.sysctls.iter_mut().find(|s| s.path == "net/ipv4/ping_group_range")
             {
@@ -616,9 +666,16 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
     let (root_ready, child_root_ready) = sys::pipe().map_err(cleanup)?;
     prepared.root_ready = Some(child_root_ready);
     // The child waits here until the agent has moved it into its cgroup, for
-    // a start that clone3 could not place there itself.
-    let (child_cgroup_ready, cgroup_go) = sys::pipe().map_err(cleanup)?;
-    prepared.cgroup_ready = Some(child_cgroup_ready);
+    // a start that clone3 could not place there itself. Once `clone3` with
+    // `CLONE_INTO_CGROUP` is confirmed working in this process, skip making
+    // the fallback pipe on every start.
+    let cgroup_go = if sys::clone3_works() {
+        None
+    } else {
+        let (child_cgroup_ready, go_fd) = sys::pipe().map_err(cleanup)?;
+        prepared.cgroup_ready = Some(child_cgroup_ready);
+        Some(go_fd)
+    };
     let (parent_io, child_io) = stdio(&prepared).map_err(cleanup)?;
     let rootfs_c = sys::cstr(&rootfs).map_err(cleanup)?;
 
@@ -674,9 +731,13 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
     // it (the child exiting early) read as EOF here.
     drop(prepared.root_ready.take());
     drop(prepared.cgroup_ready.take());
-    if flags & libc::CLONE_NEWNET as u64 != 0 {
-        netns = fs::File::open(format!("/proc/{pid}/ns/net")).map_or(0, |f| netns_inode(&f));
-    }
+    let child_netns = if flags & libc::CLONE_NEWNET as u64 != 0 {
+        let f = fs::File::open(format!("/proc/{pid}/ns/net")).ok();
+        netns = f.as_ref().map_or(0, netns_inode);
+        f
+    } else {
+        None
+    };
     drop(cgroup_fd);
     // The child makes its mounts before it waits for its network, and a
     // mount that fails ends it with a message of its own. A step here then
@@ -724,9 +785,11 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
         // the pipe until this write is done.
         fs::write(cgroup.join("cgroup.procs"), pid.to_string())
             .map_err(|e| kill_child(io::Error::new(e.kind(), format!("cgroup: {e}"))))?;
-        // SAFETY: one byte to a pipe we own: "you are in your cgroup".
-        if unsafe { libc::write(cgroup_go.as_raw_fd(), b"g".as_ptr().cast(), 1) } != 1 {
-            return Err(kill_child(io::Error::last_os_error()));
+        if let Some(go_fd) = &cgroup_go {
+            // SAFETY: one byte to a pipe we own: "you are in your cgroup".
+            if unsafe { libc::write(go_fd.as_raw_fd(), b"g".as_ptr().cast(), 1) } != 1 {
+                return Err(kill_child(io::Error::last_os_error()));
+            }
         }
     }
     drop(cgroup_go);
@@ -747,11 +810,23 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
     match word {
         Ok(RootWord::Ready) => {}
         Ok(RootWord::Ended) => return Err(kill_child(io::Error::other(NOT_READY))),
-        Ok(RootWord::NotYet) if prepared.tty => match root_word(root_ready.as_raw_fd(), None, &mut began_fill) {
-            Ok(RootWord::Ready) => {}
-            Ok(_) => return Err(kill_child(io::Error::other(NOT_READY))),
-            Err(e) => return Err(kill_child(e)),
-        },
+        Ok(RootWord::NotYet) if prepared.tty => {
+            let word = if began_fill {
+                root_word(root_ready.as_raw_fd(), None, &mut began_fill)
+            } else {
+                match root_word(root_ready.as_raw_fd(), Some(TTY_READY_WAIT), &mut began_fill) {
+                    Ok(RootWord::NotYet) if began_fill => root_word(root_ready.as_raw_fd(), None, &mut began_fill),
+                    other => other,
+                }
+            };
+            filling.set(began_fill);
+            match word {
+                Ok(RootWord::Ready) => {}
+                Ok(RootWord::NotYet) => return Err(kill_child(io::Error::new(io::ErrorKind::TimedOut, "timed out waiting for container root"))),
+                Ok(RootWord::Ended) => return Err(kill_child(io::Error::other(NOT_READY))),
+                Err(e) => return Err(kill_child(e)),
+            }
+        }
         Ok(RootWord::NotYet) => starting.set(true),
         Err(e) => return Err(kill_child(e)),
     }
@@ -765,7 +840,7 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
     // Not bridged, but with sysctls to write: no network to wait for.
     if let Some(go) = go.take_if(|_| !bridged) {
         drop(prepared.net_ready.take());
-        super::hostopts::apply_sysctls(pid, &host.sysctls).map_err(kill_child)?;
+        super::hostopts::apply_sysctls(pid, child_netns.as_ref(), &host.sysctls).map_err(kill_child)?;
         // SAFETY: one byte to a pipe we own: "go on".
         unsafe { libc::write(go.as_raw_fd(), b"g".as_ptr().cast(), 1) };
     }
@@ -780,11 +855,12 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
         let mac = net_opts::values(spec.net.opts, net_opts::MAC).next().and_then(net::parse_mac);
         let v6 = net::Ip6::from_opts(spec.net.opts);
         let plug = net::Plug::from_opts(spec.net.opts);
-        net::attach_container(net.bridges, spec.net.bridge, &host_if, pid, spec.net.ip, spec.net.prefix, spec.net.gateway, mac, v6, plug)
+        net::attach_container(net.bridges, spec.net.bridge, &host_if, pid, child_netns.as_ref(), spec.net.ip, spec.net.prefix, spec.net.gateway, mac, v6, plug)
             .map_err(|e| kill_child(io::Error::new(e.kind(), format!("network: {e}"))))?;
         uplinks.extend(net::Uplink::of(&host_if, "eth0", spec.net.gateway, v6, plug));
         veths.push(("eth0".to_owned(), host_if));
         if embedded_dns {
+            net.dns.set_bridge_ipv6(spec.net.bridge, net.bridges.has_ipv6(spec.net.bridge));
             if let Some(name) = net_opts::values(spec.net.opts, net_opts::NETWORK).next() {
                 net.dns.name_network(spec.net.bridge, name);
             }
@@ -805,15 +881,21 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
                 // waiting for its output to be read (see `admit`): it must
                 // not stand in for this container's own.
                 net.dns.drop_container(pid);
-                std::fs::File::open(format!("/proc/{pid}/ns/net")).and_then(|ns| {
-                    net.dns.serve_in(&ns, pid, spec.net.bridge)?;
-                    // User networks it joins once it runs: their names
-                    // answer from its first lookup (#449).
-                    for b in net_opts::values(spec.net.opts, net_opts::DNS_BRIDGE) {
-                        net.dns.serve_in(&ns, pid, b)?;
+                let opened;
+                let ns = match child_netns.as_ref() {
+                    Some(f) => f,
+                    None => {
+                        opened = std::fs::File::open(format!("/proc/{pid}/ns/net"))?;
+                        &opened
                     }
-                    Ok(())
-                })
+                };
+                net.dns.serve_in(ns, pid, spec.net.bridge)?;
+                // User networks it joins once it runs: their names
+                // answer from its first lookup (#449).
+                for b in net_opts::values(spec.net.opts, net_opts::DNS_BRIDGE) {
+                    net.dns.serve_in(ns, pid, b)?;
+                }
+                Ok(())
             });
             if let Some(e) = in_err {
                 net.dns.drop_container(pid);
@@ -836,7 +918,7 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
             names = Some(Names { v4: !plug.no_ipv4, v6: v6.map(|v| v.ip), servers });
         }
         // Its 127.0.0.11 listener goes with it.
-        super::hostopts::apply_sysctls(pid, &host.sysctls).map_err(|e| {
+        super::hostopts::apply_sysctls(pid, child_netns.as_ref(), &host.sysctls).map_err(|e| {
             net.dns.drop_container(pid);
             kill_child(e)
         })?;
@@ -960,16 +1042,24 @@ fn map_rofs_error(base: &Path, writable: bool, err: io::Error) -> io::Error {
 pub(super) fn mount_rootfs(paths: &Paths, id: &str, image_layers: &[&str], writable: bool) -> io::Result<PathBuf> {
     valid_id(id)?;
     let base = paths.containers.join(id);
-    if writable
+    let fresh_base = !base.exists();
+    if !fresh_base
+        && writable
         && let Some(kind) = sys::detect_readonly_fs(&base)
     {
         return Err(sys::readonly_storage_error(kind));
     }
     let (upper, work, rootfs) = (base.join("upper"), base.join("work"), base.join("rootfs"));
-    let _ = sys::umount_lazy(&rootfs);
-    for d in [&upper, &work, &rootfs] {
-        if !d.is_dir() {
+    if fresh_base {
+        for d in [&upper, &work, &rootfs] {
             fs::create_dir_all(d).map_err(|e| map_rofs_error(&base, writable, e))?;
+        }
+    } else {
+        let _ = sys::umount_lazy(&rootfs);
+        for d in [&upper, &work, &rootfs] {
+            if !d.is_dir() {
+                fs::create_dir_all(d).map_err(|e| map_rofs_error(&base, writable, e))?;
+            }
         }
     }
     // Lower dirs are relative to the agent's working directory (the layer
@@ -1000,14 +1090,33 @@ pub(super) fn mount_rootfs(paths: &Paths, id: &str, image_layers: &[&str], writa
         }
         lower.push(empty.to_str().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "container folder is not UTF-8"))?.to_owned());
     }
-    let plain = plain_upper(&base, writable).map_err(|e| map_rofs_error(&base, writable, e))?;
+    let plain = if fresh_base {
+        match fs::write(base.join(PLAIN_UPPER), b"") {
+            Ok(()) => true,
+            Err(e) if !writable && e.raw_os_error() == Some(libc::EROFS) => true,
+            Err(e) => return Err(map_rofs_error(&base, writable, e)),
+        }
+    } else {
+        plain_upper(&base, writable).map_err(|e| map_rofs_error(&base, writable, e))?
+    };
     let rest = format!(",upperdir={},workdir={},{}", upper.display(), work.display(), overlay_features(plain));
     sys::mount_overlay(&rootfs, &lower, &rest, 0).map_err(|e| map_rofs_error(&base, writable, e))?;
-    if writable
-        && let Err(e) = ensure_writable_rootfs(&base, &rootfs)
-    {
-        super::roots::unmount(&rootfs);
-        return Err(e);
+    if writable {
+        let ro_err = if fresh_base {
+            // `create_dir_all` already verified `base` is writable; one `statvfs`
+            // on `rootfs` catches overlayfs's silent read-only fallback (#768).
+            if sys::is_statvfs_readonly(&rootfs).unwrap_or(false) {
+                ensure_writable_rootfs(&base, &rootfs).err()
+            } else {
+                None
+            }
+        } else {
+            ensure_writable_rootfs(&base, &rootfs).err()
+        };
+        if let Some(e) = ro_err {
+            super::roots::unmount(&rootfs);
+            return Err(e);
+        }
     }
     Ok(rootfs)
 }
@@ -1040,8 +1149,13 @@ pub fn exec(spec: &ExecSpec<'_>, target_pid: libc::pid_t, paths: &Paths, profile
     let (parent_io, child_io) = stdio(&prepared)?;
     // The child waits here until the agent has moved it into its cgroup, for
     // a start that clone3 could not place there itself.
-    let (child_cgroup_ready, cgroup_go) = sys::pipe()?;
-    prepared.cgroup_ready = Some(child_cgroup_ready);
+    let cgroup_go = if sys::clone3_works() {
+        None
+    } else {
+        let (child_cgroup_ready, go_fd) = sys::pipe()?;
+        prepared.cgroup_ready = Some(child_cgroup_ready);
+        Some(go_fd)
+    };
     let args = CloneArgs {
         flags: CLONE_INTO_CGROUP,
         exit_signal: libc::SIGCHLD as u64,
@@ -1092,7 +1206,9 @@ pub fn exec(spec: &ExecSpec<'_>, target_pid: libc::pid_t, paths: &Paths, profile
     if !child.into_cgroup {
         // clone(2) cannot put the exec in the container's cgroup: do it now,
         // then let it join the container's namespaces.
-        if let Err(e) = move_child(&paths.cgroup.join(spec.container_id), &paths.cgroup_root, pid, target_pid, &cgroup_go) {
+        if let Some(go_fd) = &cgroup_go
+            && let Err(e) = move_child(&paths.cgroup.join(spec.container_id), &paths.cgroup_root, pid, target_pid, go_fd)
+        {
             // SAFETY: killing and reaping the child we just cloned.
             unsafe {
                 libc::kill(pid, libc::SIGKILL);
@@ -1104,8 +1220,12 @@ pub fn exec(spec: &ExecSpec<'_>, target_pid: libc::pid_t, paths: &Paths, profile
     drop(cgroup_go);
     drop(cgroup_fd);
     let (stdin, stdout, stderr) = finish_stdio(parent_io, child_io).map_err(|e| {
-        // SAFETY: killing the child we just cloned.
-        unsafe { libc::kill(pid, libc::SIGKILL) };
+        // SAFETY: killing and reaping the child we just cloned so a failed or
+        // timed-out TTY setup never leaks a stuck or zombie process (#948).
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, std::ptr::null_mut(), 0);
+        }
         e
     })?;
     Ok(Process {
@@ -1408,6 +1528,7 @@ fn prepare(argv: StrList<'_>, env: StrList<'_>, cwd: &str, user: &str, hostname:
         shm_size: 64 << 20,
         init: flags & run_flags::INIT != 0,
         cgroupns_host: false,
+        timer_slack_ns: None,
         host: HostApplied::default(),
         root_ready: None,
         cgroup_ready: None,
@@ -1754,7 +1875,21 @@ pub(super) fn parse_mounts(list: StrList<'_>) -> io::Result<Vec<Mount>> {
             }
             // A missing source becomes a directory, as Docker does; one that is
             // there already (a file such as /etc/hostname, too) is used as it is.
-            if flags.contains(&"create") && fs::symlink_metadata(src).is_err() {
+            // Never create a directory at /etc/localtime or /etc/timezone (#938).
+            let norm = lexical_normalize(Path::new(src));
+            if norm == Path::new("/etc/localtime") {
+                if fs::symlink_metadata(src).is_ok_and(|m| m.file_type().is_dir())
+                    || (flags.contains(&"create") && fs::metadata(src).is_err())
+                {
+                    super::localtime::ensure_localtime()?;
+                }
+            } else if norm == Path::new("/etc/timezone") {
+                if fs::symlink_metadata(src).is_ok_and(|m| m.file_type().is_dir())
+                    || (flags.contains(&"create") && fs::metadata(src).is_err())
+                {
+                    super::localtime::ensure_timezone()?;
+                }
+            } else if flags.contains(&"create") && fs::symlink_metadata(src).is_err() {
                 fs::create_dir_all(src)?;
             }
             let mut loop_mount = None;
@@ -2410,6 +2545,7 @@ fn child_fds(p: &Prepared, io: &ChildStdio) -> Vec<RawFd> {
         shm_size: _,
         init: _,
         cgroupns_host: _,
+        timer_slack_ns: _,
         // Paths, numbers and names only.
         host: HostApplied { rlimits: _, groups: _, nodes: _, masked: _, readonly: _ },
         root_ready,
@@ -2648,6 +2784,11 @@ fn finish_child(p: &Prepared, io: &ChildStdio, console: bool) -> ! {
     // While still root with every capability: raising a hard limit needs
     // CAP_SYS_RESOURCE.
     apply_rlimits(&p.host.rlimits).unwrap_or_else(|e| fail("ulimits", e));
+    if console
+        && let Some(ns) = p.timer_slack_ns
+    {
+        apply_timer_slack(ns);
+    }
 
     for cap in 0..=LAST_CAP {
         if !p.privileged && p.caps & (1 << cap) == 0 {
@@ -2748,6 +2889,22 @@ fn finish_child(p: &Prepared, io: &ChildStdio, console: bool) -> ! {
     // SAFETY: NULL-terminated arrays of valid C strings that outlive the call.
     unsafe { libc::execve(exe.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
     sys::exec_fail(2, &exe, io::Error::last_os_error(), false)
+}
+
+/// Applies timer slack (`ns`) to the container's PID 1 before `execve`.
+/// Writing `/proc/self/timerslack_ns` updates both `timer_slack_ns` and
+/// `default_timer_slack_ns` in Linux (`fs/proc/base.c`), so the slack survives
+/// `execve` into `/bin/k3s` and coalesces staggered sub-100 ms tickers (#989).
+fn apply_timer_slack(ns: u64) {
+    let _ = apply_timer_slack_to(Path::new("/proc/self/timerslack_ns"), ns);
+    // SAFETY: `PR_SET_TIMERSLACK` takes the slack in nanoseconds as `arg2`.
+    unsafe {
+        libc::prctl(libc::PR_SET_TIMERSLACK, ns as libc::c_ulong, 0, 0, 0);
+    }
+}
+
+fn apply_timer_slack_to(path: &Path, ns: u64) -> io::Result<()> {
+    fs::write(path, ns.to_string())
 }
 
 /// How the container's root is remounted once it is `/`, if at all:
@@ -4616,13 +4773,88 @@ mod tests {
     fn hostopts_cgroupns_host_is_parsed_cleanly() {
         let mut buf = Vec::new();
         let net = Net { bridge: "", ip: [0; 4], prefix: 0, gateway: [0; 4], extra_hosts: &[], dns_names: &[], opts: &[] };
-        encode_run(&mut buf, "c1", &[], &["sh"], &[], "/", "", "c1", 0, net, &[], &Limits::default(), 0, &["cgroupns\thost"], &[]);
+        encode_run(&mut buf, "c1", &[], &["sh"], &[], "/", "", "c1", 0, net, &[], &Limits::default(), 0, &["cgroupns\thost", "timerslack\t10000000"], &[]);
         let Ok(Msg::Run(spec)) = decode(&buf) else { panic!() };
         let parsed = super::super::hostopts::parse(spec.opts).unwrap();
         assert!(parsed.cgroupns_host);
+        assert_eq!(parsed.timer_slack_ns, Some(10_000_000));
         let mut prepared = super::prepare(spec.argv, spec.env, spec.cwd, spec.user, Some(spec.hostname), spec.flags, spec.caps).unwrap();
         assert!(!prepared.cgroupns_host);
+        assert_eq!(prepared.timer_slack_ns, None);
         prepared.cgroupns_host = parsed.cgroupns_host;
+        prepared.timer_slack_ns = parsed.timer_slack_ns;
         assert!(prepared.cgroupns_host);
+        assert_eq!(prepared.timer_slack_ns, Some(10_000_000));
+        let tmp = std::env::temp_dir().join(format!("kiri-timerslack-{}", std::process::id()));
+        super::apply_timer_slack_to(&tmp, 10_000_000).unwrap();
+        assert_eq!(std::fs::read_to_string(&tmp).unwrap(), "10000000");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn finish_stdio_times_out_when_tty_child_never_sends_pty_and_reaps_child() {
+        use std::os::fd::AsRawFd;
+        use std::time::{Duration, Instant};
+
+        // 1. Stuck child holding its socket end open: times out promptly instead of blocking forever.
+        let (p_sock, hold_child) = super::sys::socketpair().unwrap();
+        let dup_child = hold_child.try_clone().unwrap();
+        let began = Instant::now();
+        let err = super::finish_stdio_timeout(
+            super::ParentStdio::Tty { sock: p_sock },
+            super::ChildStdio::Tty { sock: dup_child },
+            Duration::from_millis(30),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+        assert!(began.elapsed() < Duration::from_secs(2));
+        drop(hold_child);
+
+        // 2. Child exits without sending an fd: reports premature exit.
+        let (p_sock, c_sock) = super::sys::socketpair().unwrap();
+        let err = super::finish_stdio_timeout(
+            super::ParentStdio::Tty { sock: p_sock },
+            super::ChildStdio::Tty { sock: c_sock },
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("exited before its terminal was ready"), "{err}");
+
+        // 3. Child sends a valid fd: returns non-blocking input + master fds.
+        let (p_sock, c_sock) = super::sys::socketpair().unwrap();
+        let (r_pipe, _w_pipe) = super::sys::pipe().unwrap();
+        super::sys::send_fd(c_sock.as_raw_fd(), r_pipe.as_raw_fd()).unwrap();
+        let (stdin, stdout, stderr) = super::finish_stdio_timeout(
+            super::ParentStdio::Tty { sock: p_sock },
+            super::ChildStdio::Tty { sock: c_sock },
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(stdin.is_some() && stdout.is_some() && stderr.is_none());
+
+        // 4. Real forked child that pauses before sending pty: timeout + SIGKILL + waitpid leaves no zombie.
+        let (p_sock, c_sock) = super::sys::socketpair().unwrap();
+        // SAFETY: child only calls pause() and _exit(0), both async-signal-safe.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            unsafe {
+                libc::pause();
+                libc::_exit(0);
+            }
+        }
+        let res = super::finish_stdio_timeout(
+            super::ParentStdio::Tty { sock: p_sock },
+            super::ChildStdio::Tty { sock: c_sock },
+            Duration::from_millis(25),
+        );
+        assert_eq!(res.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        // SAFETY: killing and reaping the child we just forked.
+        unsafe {
+            assert_eq!(libc::kill(pid, libc::SIGKILL), 0);
+            assert_eq!(libc::waitpid(pid, std::ptr::null_mut(), 0), pid);
+            assert_eq!(libc::kill(pid, 0), -1);
+            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+        }
     }
 }

@@ -348,9 +348,9 @@ pub fn get_quick(path: &str) -> io::Result<Value> {
 }
 
 /// A GET marked as the window's own, which doesn't count as use (as the
-/// Mac's `get_background`, for crates/kiri/src/builds.rs).
+/// Mac's `get_background`, for crates/kiri/src/builds.rs), bounded by 120 s.
 pub fn get_background(path: &str) -> io::Result<Value> {
-    let r = request_with("GET", path, None, true)?;
+    let r = request_within("GET", path, None, true, Some(Duration::from_secs(120)))?;
     if !r.ok() {
         return Err(io::Error::other(r.error()));
     }
@@ -424,6 +424,21 @@ pub fn post_lines_closable(path: &str, auth: Option<&str>, opened: impl FnOnce(C
 /// and diagnostic checks never keep an idle VM awake.
 pub fn alive() -> bool {
     alive_within(PING_WAIT)
+}
+
+/// Probes the engine pipe for CLI-shared callers (`import.rs`), surfacing the
+/// pipe's refusal message when Kiri is stopped or setup is unfinished.
+#[allow(dead_code)]
+pub fn check_alive() -> io::Result<()> {
+    match request_within("GET", "/_ping", None, true, Some(PING_WAIT)) {
+        Ok(r) if r.ok() => Ok(()),
+        Ok(r) => {
+            let err = r.error();
+            let msg = if err.trim().is_empty() { "Kiri isn't running. Open Kiri, or start it with `kiri start`" } else { err.trim() };
+            Err(io::Error::new(io::ErrorKind::NotConnected, msg.to_owned()))
+        }
+        Err(_) => Err(io::Error::new(io::ErrorKind::NotConnected, "Kiri isn't running. Open Kiri, or start it with `kiri start`")),
+    }
 }
 
 /// `alive`, for the event watcher: false after QUICK without an answer.

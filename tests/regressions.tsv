@@ -5,6 +5,7 @@
 connection-close-start	#588	a start sent with Connection: close was never closed, so Docker.DotNet hung until its timeout (#520)
 http10-start-closes	#588	an HTTP/1.0 request stayed open after its answer (#479)
 keep-alive-start-stays	#588	the connection-close fix must not close a kept-alive connection
+crates/kiri/src/daemon/ops.rs	#925	docker events --until without --since printed none of the kept events; Docker replays them up to --until
 connection-close-said	#588	the answer to Connection: close did not say Connection: close
 http10-ping-closes	#588	an HTTP/1.0 ping stayed open after its answer (#479)
 pid-mode-inspect	#588	--pid was accepted and ignored; inspect lost HostConfig.PidMode (#347)
@@ -31,6 +32,7 @@ top-eo	#588	docker top -eo did not give the columns asked for (#348)
 top-eo-rss	#588	docker top -eo rss gave no memory column (#348)
 top-ps-args-refused	#588	unsupported ps_args were silently ignored instead of refused (#348)
 ps-limit-latest	#839	docker ps -l and -n ignored the requested limit and skipped stopped containers
+crates/kiri/src/daemon/time.rs	#924	docker ps Status said "Up 1 minutes", "1 hours" and "1 days" instead of Docker's "About a minute", "About an hour", "24 hours", weeks, months and years
 ij-setup	#588	sets up the damaged image list check below (#440)
 ij-info-warns	#588	a repaired images.json gave no docker info warning (#440)
 ij-info-names-lost	#588	the repair warning did not name the images it lost (#440)
@@ -342,11 +344,35 @@ tls-company-root-login	#303	docker login to a registry signed by a root the syst
 tls-unknown-root-refused	#303	a root the system does not trust must still be refused
 crates/kiri-image/src/roots.rs	#303	root store merge, system distrust filtering (macOS Never Trust, Windows Disallowed and disabled Server Auth EKU), cross-cert preservation, caps, and KIRI_TLS_ROOTS=webpki escape hatch
 crates/kiri/src/daemon/hostroots.rs	#303	Windows host roots persistence in WSL must enforce Caller::Host, 0600 atomic writes, non-symlink/non-FIFO reads, and bounded sizes
-crates/kiri/src/setup.rs	#556	opening Kiri.app re-appended the ~/.kiri/bin PATH block to shell profiles on every launch even when removed or when a profile already put ~/.kiri/bin on PATH, with no kiri setup --no-profiles opt-out
+crates/kiri/src/setup.rs	#556	opening Kiri.app re-appended the ~/.kiri/bin PATH block on every launch, and modified shell profiles or replaced /usr/local/bin/kiri even when Homebrew's cask binary stanza already linked kiri directly to the running app (#733)
 crates/kiri/src/k8s.rs	#816	kiri k8s set had no --version or --k3s-arg/--clear-k3s-args options to pin a k3s image tag or pass custom k3s server flags, and kiri k8s start did not sync ~/.kiri/k8s-manifests into k3s
 crates/kiri-win/src/k8s.rs	#816	Windows k8s.json config and container creation did not preserve or apply custom k3s version tags and extra k3s server arguments
+k8s-set-keeps-malformed-config	#926	kiri k8s set replaced a k8s.json it could not parse with defaults, losing every other setting, and reported success
 mac-gpg-ssh-agent-mount	#763	macOS launchd-started daemons used Apple's empty default Listeners SSH socket instead of GnuPG's S.gpg-agent.ssh when enable-ssh-support was set, and direct host SSH agent socket bind mounts failed across virtiofs
 crates/kiri/src/daemon/grpc.rs	#734	docker build run from a Docker CLI inside a socket-mounted container auto-created a buildx docker-container builder without default-load=true and never stored the built image in Kiri's image store
 crates/kiri-image/src/store.rs	#864	an image put under a name another image had dropped the old record without freeing its unreferenced blobs, and Store::pin updated PINNED without BLOB_LOCK
 bind-chown-chmod	#382	chown on a macOS virtiofs bind mount returned 0 while leaving files owned by the caller so chmod by the new owner failed with EPERM, and warm bind-mount reads lacked close-to-open page/dir caching and BDI read-ahead (#415)
 crates/kiri/src/vm_cli.rs	#473	macOS low ports (<1024) on 127.0.0.1/::1 failed without root instead of falling back to dual-stack with strict loopback peer filtering, and macOS VM had no shared_nat=false option (`kiri vm set --shared-nat off`) to omit VZNATNetworkDeviceAttachment and route egress/DNS over vsock under Cloudflare WARP (#383) or non-DF firewall drops (#350)
+finder-mount-nobrowse	#929	Finder showed an automatic < sidebar entry for the local NFS socket mount
+guest-kernel-ext2-vfat	#934	guest kernel lacked CONFIG_EXT4_USE_FOR_EXT2 and CONFIG_VFAT_FS so loop-mounted ext2 and FAT/EFI disk images failed to mount
+guest-kernel-nfs-dmcrypt	#494	guest kernel lacked CONFIG_NFS_FS / NFSv3 / NFSv4 client and CONFIG_DM_CRYPT / device-mapper so type=nfs volumes and LUKS dm-crypt devices failed in the macOS VM
+crates/kiri/src/machine.rs	#935	kiri machine create always pulled --image instead of probing local images first, and --systemd machines mounted /tmp and /run with noexec
+crates/kiri/src/daemon/localtime.rs	#938	Kiri WSL lacked /etc/localtime so `-v /etc/localtime:/etc/localtime:ro` created an empty directory there, breaking timezone bind mounts until self-healed and guarded against directory creation
+crates/kiri-init/src/linux/localtime.rs	#938	kiri-init on WSL did not self-heal a missing or empty-directory /etc/localtime on startup and parse_mounts could create a directory at /etc/localtime or /etc/timezone
+scripts/kiri-linux.sh	#938	Kiri Linux WSL rootfs omitted /usr/share/zoneinfo, /etc/localtime and /etc/timezone, preventing WSL 2 Windows-to-Linux timezone sync and leaving /etc/localtime missing on fresh installs
+crates/kiri-init/src/linux/dns.rs	#932	IPv4-only container networks forwarded external AAAA queries returning unreachable IPv6 addresses, and enterprise macOS packet-tunnel / RTF_IFSCOPE VPNs bypassed host egress relay causing TLS handshake timeouts
+tests/ui/volumes-size.js	#936	Volumes view did not show each volume's disk size, and loading sizes synchronously or via GET /system/df could stall list refreshes or wake a sleeping VM
+crates/kiri/src/builds.rs	#923	a running build's steps were read with `buildx history logs`, which follows the build until it ends: the Builds pane stayed on "Loading the steps..." and each 2 s ask left a docker and buildx process running
+tests/ui/builds-running.js	#923	the Builds view asked for a running build's steps on every tick, not once the last ask was answered
+crates/kiri/src/setup_win.rs	#984	on Windows, `kiri setup`, `kiri import` and `kiri build-with` were missing from `kiri.exe`, uninstalling Docker Desktop wiped `%USERPROFILE%\.docker\config.json` (`cliPluginsExtraDirs`, `kiri` context, dangling `desktop-linux`), and `kiri` subcommands executed side effects or exited 1 on `--help` / `-h` (#982)
+crates/kiri-win/src/engine.rs	#984	Windows `allowed_url` lacked `runkiri.com` and `canestack.com`, so Settings -> About links did not open, and `kiri-win` startup did not self-heal a wiped `~/.docker/config.json`
+vm-swap-as-set	#326	the VM had no swap, so a container that outgrew the VM's memory was killed instead of slowing down
+vm-swap-container-over-memory	#326	a container over its --memory with --memory-swap room left was killed: the VM had no swap for its pages
+crates/kiri-init/src/linux/net.rs	#443	a second Kiri engine starting in a shared Linux/WSL 2 network namespace overwrote nft table ip kiri, claimed existing kiri0 bridges, and tore down the first engine's network on exit
+machine-prune-keeps	#975	docker container prune and docker system prune deleted a stopped kiri machine and everything in its writable layer
+crates/kiri/src/daemon/vmlink.rs	#948	VmLink::call waited without a timeout and Writer::write blocked indefinitely holding the writer mutex when the guest wedged, deadlocking hundreds of kiri-api threads
+crates/kiri-init/src/linux/container.rs	#948	finish_stdio called recv_fd with no timeout on single-threaded kiri-init and exec did not reap a killed child when TTY setup failed
+crates/kiri/src/daemon/engine.rs	#989	kiri-k8s caused mac_bind_sources to watch all of /Users and /Volumes via FSEvents, spawned kubectl every 3s for LoadBalancer polling, and lacked timer coalescing for k3s's 100ms watch_progress tickers
+crates/kiri-init/src/linux/hostopts.rs	#989	kiri-init hostopts lacked timerslack_ns support to coalesce k3s background pollers across execve
+crates/kiri/src/engine_cli.rs	#983	kiri CLI had no `kiri engine start | stop | restart | status [--json]` commands to stop, restart, or inspect the engine without waking a sleeping VM
+crates/kiri-win/src/refuse.rs	#983	Windows pipe gate did not handle `POST /kiri/stop` idempotently while stopped or synchronize `kiri-win` on external CLI stops

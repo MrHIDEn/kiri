@@ -273,11 +273,201 @@ fn update_foreign_bridges() -> bool {
     }
 }
 
-/// On a Linux host: enables IPv4 forwarding, detects foreign local bridges,
-/// installs Kiri's nftables table, and adapts to any host firewall. Does not
-/// require a main-table default route at boot (policy-routed VPNs such as
-/// Tailscale or delayed interfaces work as routes appear).
+/// Abstract Unix-domain socket name guarding Kiri's host networking (`kiri0`
+/// and `nft table ip/ip6 kiri`) within a Linux network namespace (#443).
+/// Abstract socket addresses are scoped per network namespace and released by
+/// the kernel automatically when the agent exits or crashes.
+const HOST_NETNS_LOCK_NAME: &[u8] = b"kiri-engine-netns";
+
+static HOST_NETNS_LOCK: std::sync::OnceLock<OwnedFd> = std::sync::OnceLock::new();
+static HOST_NETNS_CLAIMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn make_abstract_sockaddr(name: &[u8]) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
+    // SAFETY: zeroed `sockaddr_un` is valid; `sun_path[0] = 0` followed by `name`
+    // forms a Linux abstract socket address of length `offsetof(sun_path) + 1 + name.len()`.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    if 1 + name.len() > addr.sun_path.len() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "netns lock name too long"));
+    }
+    for (dst, &src) in addr.sun_path[1..1 + name.len()].iter_mut().zip(name) {
+        *dst = src as libc::c_char;
+    }
+    let addr_len = (std::mem::offset_of!(libc::sockaddr_un, sun_path) + 1 + name.len()) as libc::socklen_t;
+    Ok((addr, addr_len))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockProbe {
+    /// Connected and `SO_PEERCRED.uid == owner`.
+    OwnedByOwner,
+    /// Connected and `SO_PEERCRED.uid != owner` (unprivileged squatter).
+    OwnedByOther,
+    /// `connect()` failed transiently (`EAGAIN` backlog full, `ECONNREFUSED`
+    /// bind-to-listen window or closing holder, `EINTR`, etc.). Never treated
+    /// as an unprivileged squatter.
+    TransientBusy,
+}
+
+/// Probes an active listener on `name` to distinguish a legitimate `owner`
+/// engine from an unprivileged squatter or transient backlog/startup state.
+fn probe_abstract_lock(name: &[u8], owner: u32) -> LockProbe {
+    let Ok((addr, addr_len)) = make_abstract_sockaddr(name) else { return LockProbe::TransientBusy };
+    let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, 0) };
+    if raw < 0 {
+        return LockProbe::TransientBusy;
+    }
+    // SAFETY: `raw` is a freshly created socket descriptor owned here.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    // SAFETY: `addr` is initialized through `addr_len` bytes.
+    if unsafe { libc::connect(fd.as_raw_fd(), (&raw const addr).cast(), addr_len) } != 0 {
+        return LockProbe::TransientBusy;
+    }
+    // SAFETY: zeroed `ucred` is valid for `getsockopt(SO_PEERCRED)`.
+    let mut peer: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&raw mut peer).cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 || len != std::mem::size_of::<libc::ucred>() as libc::socklen_t {
+        return LockProbe::TransientBusy;
+    }
+    if peer.uid == owner {
+        LockProbe::OwnedByOwner
+    } else {
+        LockProbe::OwnedByOther
+    }
+}
+
+fn try_bind_abstract_socket(name: &[u8]) -> Result<OwnedFd, i32> {
+    let (addr, addr_len) = make_abstract_sockaddr(name).map_err(|_| libc::EINVAL)?;
+    let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, 0) };
+    if raw < 0 {
+        return Err(io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
+    }
+    // SAFETY: `raw` is a freshly created socket descriptor owned here.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    // SAFETY: `addr` is initialized through `addr_len` bytes.
+    if unsafe { libc::bind(fd.as_raw_fd(), (&raw const addr).cast(), addr_len) } != 0 {
+        return Err(io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
+    }
+    // SAFETY: `fd` is a bound `SOCK_STREAM` socket owned here.
+    if unsafe { libc::listen(fd.as_raw_fd(), 128) } != 0 {
+        return Err(io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
+    }
+    Ok(fd)
+}
+
+/// Descriptor of the held abstract netns lock socket, polled by the
+/// single-threaded `agent::serve_loop` (`kiri-init` never spawns threads, so
+/// `signalfd` and `clone3` stay single-threaded).
+pub fn netns_lock_fd() -> Option<std::os::fd::RawFd> {
+    HOST_NETNS_LOCK.get().map(AsRawFd::as_raw_fd)
+}
+
+/// Drains up to 64 pending `SO_PEERCRED` probe connections per `poll()` tick so
+/// `sk_max_ack_backlog` does not fill under normal retries while a local
+/// `connect()` flood can never starve `agent::serve_loop`.
+pub fn drain_netns_lock(fd: std::os::fd::RawFd) {
+    for _ in 0..64 {
+        // SAFETY: `fd` is a non-blocking listening `AF_UNIX` socket.
+        let cfd = unsafe { libc::accept4(fd, std::ptr::null_mut(), std::ptr::null_mut(), libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK) };
+        if cfd >= 0 {
+            // SAFETY: `cfd` is a freshly accepted descriptor owned here.
+            unsafe { libc::close(cfd) };
+            continue;
+        }
+        let err = io::Error::last_os_error().raw_os_error().unwrap_or(libc::EAGAIN);
+        if err == libc::EMFILE || err == libc::ENFILE {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        break;
+    }
+}
+
+const NETNS_BUSY_MSG: &str =
+    "another Kiri engine is already running in this network namespace (for example in another WSL 2 distribution): stop it first";
+const MAX_NETNS_LOCK_SLOTS: usize = 64;
+
+fn netns_slot_name(base: &[u8], idx: usize) -> Vec<u8> {
+    if idx == 0 {
+        base.to_vec()
+    } else {
+        let mut v = Vec::with_capacity(base.len() + 8);
+        v.extend_from_slice(base);
+        v.extend_from_slice(format!("-{idx}").as_bytes());
+        v
+    }
+}
+
+/// Claims ownership of Kiri's bridge and firewall tables in the current Linux
+/// network namespace (#443). All WSL 2 distributions share one network
+/// namespace; refusing early prevents a second engine from overwriting
+/// `nft table ip kiri` or deleting `kiri0` when stopping.
+pub fn claim_host_netns() -> io::Result<()> {
+    claim_host_netns_on(HOST_NETNS_LOCK_NAME, &HOST_NETNS_LOCK, &HOST_NETNS_CLAIMED)
+}
+
+fn claim_host_netns_on(
+    base: &[u8],
+    slot: &std::sync::OnceLock<OwnedFd>,
+    claimed: &std::sync::atomic::AtomicBool,
+) -> io::Result<()> {
+    use std::sync::atomic::Ordering;
+    if claimed.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    // SAFETY: `geteuid` has no preconditions.
+    let me = unsafe { libc::geteuid() };
+    let mut idx = 0usize;
+    while idx < MAX_NETNS_LOCK_SLOTS {
+        let candidate = netns_slot_name(base, idx);
+        let start = Instant::now();
+        loop {
+            match try_bind_abstract_socket(&candidate) {
+                Ok(fd) => {
+                    let _ = slot.set(fd);
+                    claimed.store(true, Ordering::Release);
+                    return Ok(());
+                }
+                Err(code) if code == libc::EADDRINUSE => match probe_abstract_lock(&candidate, me) {
+                    LockProbe::OwnedByOther => {
+                        // Unprivileged squatter on `candidate`: advance to the next
+                        // deterministic slot so the first root engine still binds a
+                        // real lock and a second root engine hits that bound slot
+                        // (preventing split-brain without arming `claimed` unlocked).
+                        eprintln!("kiri-init: skipping unprivileged squatter on abstract netns socket slot {idx}");
+                        idx += 1;
+                        break;
+                    }
+                    LockProbe::OwnedByOwner | LockProbe::TransientBusy => {
+                        if start.elapsed() < Duration::from_millis(500) {
+                            std::thread::sleep(Duration::from_millis(25));
+                            continue;
+                        }
+                        return Err(io::Error::new(io::ErrorKind::AddrInUse, NETNS_BUSY_MSG));
+                    }
+                },
+                Err(code) => return Err(io::Error::from_raw_os_error(code)),
+            }
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::AddrInUse, NETNS_BUSY_MSG))
+}
+
+/// On a Linux host: claims the network namespace, enables IPv4 forwarding,
+/// detects foreign local bridges, installs Kiri's nftables table, and adapts
+/// to any host firewall. Does not require a main-table default route at boot
+/// (policy-routed VPNs such as Tailscale or delayed interfaces work as routes
+/// appear).
 pub fn host_uplink() -> io::Result<()> {
+    claim_host_netns()?;
     sys::write_file("/proc/sys/net/ipv4/ip_forward", "1")?;
     // No host.docker.internal loopback redirect on a Linux host: it would
     // let containers reach the real machine's 127.0.0.1 services. host.docker
@@ -920,10 +1110,11 @@ fn mac_of(name: &str) -> io::Result<[u8; 6]> {
 type Bridge6 = Option<([u8; 16], u8)>;
 
 /// Bridges that exist so far: name → (index, gateway (none when
-/// IPv6-only), prefix, IPv6).
+/// IPv6-only), prefix, IPv6), plus a persistent host `NETLINK_ROUTE` socket.
 #[derive(Default)]
 pub struct Bridges {
     made: HashMap<String, (i32, Option<[u8; 4]>, u8, Bridge6)>,
+    route: Option<Netlink>,
 }
 
 /// What `Bridges::ensure` needs to do for a bridge given its cached state.
@@ -941,6 +1132,18 @@ enum BridgePlan {
 }
 
 impl Bridges {
+    fn route_nl(&mut self) -> io::Result<&mut Netlink> {
+        if self.route.is_none() {
+            self.route = Some(Netlink::open(libc::NETLINK_ROUTE)?);
+        }
+        Ok(self.route.as_mut().expect("opened above"))
+    }
+
+    /// Whether `name` currently exists with an IPv6 subnet configured.
+    pub fn has_ipv6(&self, name: &str) -> bool {
+        matches!(self.made.get(name), Some((.., Some(_))))
+    }
+
     fn plan(&self, name: &str, gateway: Option<[u8; 4]>, prefix: u8, want6: Bridge6) -> BridgePlan {
         match self.made.get(name) {
             Some(&(i, g, p, b6)) if (g, p) == (gateway, prefix) => match (b6, want6) {
@@ -971,9 +1174,10 @@ impl Bridges {
             BridgePlan::Recreate => self.remove(name),
             BridgePlan::Create => {}
         }
-        let r = self.bring_up(name, gateway, prefix, v6);
+        let mut created = false;
+        let r = self.bring_up(name, gateway, prefix, v6, &mut created);
         if r.is_err() {
-            if let Ok(mut nl) = Netlink::open(libc::NETLINK_ROUTE) {
+            if created && let Ok(mut nl) = Netlink::open(libc::NETLINK_ROUTE) {
                 let _ = netlink::delete_link(&mut nl, name);
             }
             MADE_BRIDGES.lock().unwrap_or_else(|e| e.into_inner()).retain(|m| m != name);
@@ -998,9 +1202,9 @@ impl Bridges {
         Ok(index)
     }
 
-    fn bring_up(&mut self, name: &str, gateway: Option<[u8; 4]>, prefix: u8, v6: Option<Ip6>) -> io::Result<i32> {
+    fn bring_up(&mut self, name: &str, gateway: Option<[u8; 4]>, prefix: u8, v6: Option<Ip6>, created: &mut bool) -> io::Result<i32> {
         let mut nl = Netlink::open(libc::NETLINK_ROUTE)?;
-        netlink::create_bridge(&mut nl, name)?;
+        *created = netlink::create_bridge(&mut nl, name)?;
         let mut made = MADE_BRIDGES.lock().unwrap_or_else(|e| e.into_inner());
         if !made.iter().any(|m| m == name) {
             made.push(name.to_owned());
@@ -1135,6 +1339,9 @@ static MADE_BRIDGES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::
 /// those: another engine's may share the network namespace) and Kiri's
 /// nftables table, so nothing of the engine is left in the host's network.
 pub fn remove_host_network() {
+    if !HOST_NETNS_CLAIMED.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
     let names = std::mem::take(&mut *MADE_BRIDGES.lock().unwrap_or_else(|e| e.into_inner()));
     BRIDGE_SUBNETS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     EGRESS_ROUTES.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -1160,6 +1367,7 @@ pub fn attach_container(
     bridge: &str,
     host_ifname: &str,
     pid: libc::pid_t,
+    netns: Option<&std::fs::File>,
     ip: [u8; 4],
     prefix: u8,
     gateway: [u8; 4],
@@ -1167,7 +1375,7 @@ pub fn attach_container(
     v6: Option<Ip6>,
     plug: Plug,
 ) -> io::Result<()> {
-    attach(bridges, bridge, host_ifname, pid, 0, ip, prefix, gateway, mac, v6, plug)
+    attach_with_ns(bridges, bridge, host_ifname, pid, netns, 0, ip, prefix, gateway, mac, v6, plug)
 }
 
 /// Plugs the container into `bridge` as `eth{n}`. The first non-internal
@@ -1182,31 +1390,73 @@ pub fn attach_container(
 /// MAC is made from it): neither the interface nor the bridge gets it.
 #[allow(clippy::too_many_arguments)]
 pub fn attach(bridges: &mut Bridges, bridge: &str, host_ifname: &str, pid: libc::pid_t, n: u32, ip: [u8; 4], prefix: u8, gateway: [u8; 4], mac: Option<[u8; 6]>, v6: Option<Ip6>, plug: Plug) -> io::Result<()> {
+    attach_with_ns(bridges, bridge, host_ifname, pid, None, n, ip, prefix, gateway, mac, v6, plug)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attach_with_ns(
+    bridges: &mut Bridges,
+    bridge: &str,
+    host_ifname: &str,
+    pid: libc::pid_t,
+    netns_fd: Option<&std::fs::File>,
+    n: u32,
+    ip: [u8; 4],
+    prefix: u8,
+    gateway: [u8; 4],
+    mac: Option<[u8; 6]>,
+    v6: Option<Ip6>,
+    plug: Plug,
+) -> io::Result<()> {
     let Plug { internal, no_ipv4 } = plug;
     let mac = Some(mac.unwrap_or_else(|| mac_for(ip)));
     let bridge_index = bridges.ensure(bridge, (!no_ipv4).then_some(gateway), prefix, v6)?;
-    let netns = std::fs::File::open(format!("/proc/{pid}/ns/net"))?;
-    let mut host = Netlink::open(libc::NETLINK_ROUTE)?;
-    // A stopped container's veth may still hold this address and MAC.
-    delete_retired(&mut host);
+    let opened_ns;
+    let netns = match netns_fd {
+        Some(f) => f,
+        None => {
+            opened_ns = std::fs::File::open(format!("/proc/{pid}/ns/net"))?;
+            &opened_ns
+        }
+    };
     let ifname = format!("eth{n}");
-    netlink::create_veth(&mut host, host_ifname, bridge_index, &netns, CONTAINER_MTU, &ifname, mac)?;
-    // By name: a new namespace may have tunl0, gre0 … before it.
-    let index = netlink::index_in(&netns, &ifname)?;
-    if v6.is_none() {
-        // Before it is up, so it never gets a link-local address. A kernel
-        // without IPv6 has no such file, and nothing to turn off.
-        let _ = netlink::in_netns(&netns, || sys::write_file(&format!("/proc/sys/net/ipv6/conf/{ifname}/disable_ipv6"), "1"));
+    {
+        let host = bridges.route_nl()?;
+        // A stopped container's veth may still hold this address and MAC.
+        delete_retired(host);
+        netlink::create_veth(host, host_ifname, bridge_index, netns, CONTAINER_MTU, &ifname, mac)?;
     }
-    let mut inner = Netlink::open_in(&netns)?;
-    netlink::set_up(&mut inner, 1)?; // lo
-    if !no_ipv4 {
-        netlink::add_address(&mut inner, index, ip, prefix)?;
+    // Enter the container's network namespace once to resolve the peer index,
+    // disable IPv6 link-local when IPv6 is off, and open the inner route socket.
+    let (index, mut inner) = netlink::in_netns(netns, || {
+        let idx = netlink::index_of(&ifname)?;
+        if v6.is_none() {
+            let _ = sys::write_file(&format!("/proc/sys/net/ipv6/conf/{ifname}/disable_ipv6"), "1");
+        }
+        let nl = Netlink::open(libc::NETLINK_ROUTE)?;
+        Ok((idx, nl))
+    })?;
+    if n == 0 {
+        let mut batch = Vec::with_capacity(4);
+        batch.push(netlink::set_up_msg(1)); // lo
+        if !no_ipv4 {
+            batch.push(netlink::add_address_msg(index, ip, prefix));
+        }
+        if let Some(v) = v6 {
+            batch.push(netlink::add_address6_msg(index, v.ip, v.prefix));
+        }
+        batch.push(netlink::set_up_msg(index));
+        inner.request(&mut batch)?;
+    } else {
+        netlink::set_up(&mut inner, 1)?; // lo
+        if !no_ipv4 {
+            netlink::add_address(&mut inner, index, ip, prefix)?;
+        }
+        if let Some(v) = v6 {
+            netlink::add_address6(&mut inner, index, v.ip, v.prefix)?;
+        }
+        netlink::set_up(&mut inner, index)?;
     }
-    if let Some(v) = v6 {
-        netlink::add_address6(&mut inner, index, v.ip, v.prefix)?;
-    }
-    netlink::set_up(&mut inner, index)?;
     if !internal && !no_ipv4 {
         netlink::add_default_route(&mut inner, index, gateway)?;
     }
@@ -1218,6 +1468,7 @@ pub fn attach(bridges: &mut Bridges, bridge: &str, host_ifname: &str, pid: libc:
 
 /// Host-side veths of stopped containers, deleted by the next `attach`.
 static RETIRED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+static HAS_RETIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Notes a stopped container's host-side veths for the next `attach` to
 /// delete. Deleting one waits out RCU, 15-40 ms that every request after
@@ -1228,12 +1479,19 @@ static RETIRED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new()
 /// to the old namespace, and that answered with resets (a download that
 /// broke mid-TLS or stalled).
 pub fn retire(veths: &[String]) {
+    if veths.is_empty() {
+        return;
+    }
     RETIRED.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(veths);
+    HAS_RETIRED.store(true, std::sync::atomic::Ordering::Release);
 }
 
 /// Deletes the veths `retire` noted. Gone already (the kernel took them
 /// with their namespace) is fine.
 fn delete_retired(nl: &mut Netlink) {
+    if !HAS_RETIRED.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
     for v in std::mem::take(&mut *RETIRED.lock().unwrap_or_else(|e| e.into_inner())) {
         let _ = netlink::delete_link(nl, &v);
     }
@@ -1457,5 +1715,38 @@ mod tests {
         assert!(pid_file_alive(&pid_path, |_| true));
         assert!(!pid_file_alive(&pid_path, |_| false));
         let _ = std::fs::remove_file(&pid_path);
+    }
+
+    #[test]
+    fn abstract_netns_lock_rejects_second_holder_across_full_retry_loop() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::OnceLock;
+        let name = format!("kiri-netns-test-{}", std::process::id());
+        let slot1 = OnceLock::new();
+        let claimed1 = AtomicBool::new(false);
+        claim_host_netns_on(name.as_bytes(), &slot1, &claimed1).expect("first holder claims abstract netns lock");
+
+        // Run 8 full 500ms `claim_host_netns_on` retry loops (> 160 probes,
+        // exceeding `listen(128)` when drained between ticks as `agent::serve_loop`
+        // does) to verify `drain_netns_lock` prevents `EAGAIN` false negatives.
+        for _ in 0..8 {
+            let slot2 = OnceLock::new();
+            let claimed2 = AtomicBool::new(false);
+            let err = claim_host_netns_on(name.as_bytes(), &slot2, &claimed2)
+                .expect_err("second holder in same netns must fail after full retry window");
+            assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+            assert!(!claimed2.load(std::sync::atomic::Ordering::Acquire));
+            drain_netns_lock(slot1.get().unwrap().as_raw_fd());
+        }
+
+        let me = unsafe { libc::geteuid() };
+        assert_eq!(probe_abstract_lock(name.as_bytes(), me), LockProbe::OwnedByOwner);
+        assert_eq!(probe_abstract_lock(name.as_bytes(), me.wrapping_add(1)), LockProbe::OwnedByOther);
+
+        drop(slot1);
+        // Unbound socket returns TransientBusy (`ECONNREFUSED`), never OwnedByOther.
+        assert_eq!(probe_abstract_lock(name.as_bytes(), me), LockProbe::TransientBusy);
+        let rebound = try_bind_abstract_socket(name.as_bytes()).expect("rebind succeeds once first fd closes");
+        drop(rebound);
     }
 }

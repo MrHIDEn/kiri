@@ -55,12 +55,18 @@ type FileStamp = Option<(u64, u64, i64, i64)>;
 #[derive(Default)]
 struct HostDns {
     stamp: Option<[FileStamp; 2]>,
+    checked_at: Option<std::time::Instant>,
     servers: Vec<[u8; 4]>,
 }
 
 impl HostDns {
     fn get(&mut self) -> &[[u8; 4]] {
         use std::os::unix::fs::MetadataExt;
+        let now_inst = std::time::Instant::now();
+        if self.checked_at.is_some_and(|t| now_inst.saturating_duration_since(t) < std::time::Duration::from_millis(250)) {
+            return &self.servers;
+        }
+        self.checked_at = Some(now_inst);
         let stat = |p: &str| std::fs::metadata(p).ok().map(|m| (m.ino(), m.len(), m.mtime(), m.mtime_nsec()));
         let now = [stat("/etc/resolv.conf"), stat("/run/systemd/resolve/resolv.conf")];
         if self.stamp != Some(now) {
@@ -105,9 +111,17 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
     let mut host_dns = HostDns::default();
     if host_process {
         host_dns.get();
+        if super::sys::is_wsl()
+            && let Err(e) = super::localtime::ensure_localtime()
+        {
+            eprintln!("kiri-init: localtime: {e}");
+        }
     }
     let mut dhcp: Option<Dhcp> = if host_process {
         if let Err(e) = net::host_uplink() {
+            if e.kind() == io::ErrorKind::AddrInUse {
+                return Err(e);
+            }
             eprintln!("kiri-init: no uplink: {e}");
         }
         None
@@ -126,6 +140,7 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
     // and interfaces/routes (foreign bridges, default-route bridges, VPNs) may appear or change.
     let firewall = if host_process { net::firewall_events() } else { None };
     let link_events = if host_process { net::link_route_events() } else { None };
+    let netns_lock = if host_process { net::netns_lock_fd() } else { None };
     let mut bridges = Bridges::default();
     // In the VM, lookups the gateway's resolver fails go through the host.
     let mut dns = super::dns::Dns::default();
@@ -190,6 +205,7 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
         fds.push(libc::pollfd { fd: term.as_ref().map_or(-1, |f| f.as_raw_fd()), events: libc::POLLIN, revents: 0 });
         fds.push(libc::pollfd { fd: firewall.as_ref().map_or(-1, |f| f.as_raw_fd()), events: libc::POLLIN, revents: 0 });
         fds.push(libc::pollfd { fd: link_events.as_ref().map_or(-1, |f| f.as_raw_fd()), events: libc::POLLIN, revents: 0 });
+        fds.push(libc::pollfd { fd: netns_lock.unwrap_or(-1), events: libc::POLLIN, revents: 0 });
         fds.push(libc::pollfd { fd: measuring.as_ref().map_or(-1, super::usage::Job::fd), events: libc::POLLIN, revents: 0 });
         super::copy::interest(&mut fds);
         for r in &relays {
@@ -276,6 +292,10 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
             }
             if let Some(l) = link_events.as_ref().filter(|l| l.as_raw_fd() == pfd.fd) {
                 net::link_route_changed(l);
+                continue;
+            }
+            if netns_lock == Some(pfd.fd) {
+                net::drain_netns_lock(pfd.fd);
                 continue;
             }
             if measuring.as_ref().is_some_and(|j| j.fd() == pfd.fd) {
@@ -781,6 +801,7 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                         });
                         match attached {
                             Ok(()) => {
+                                dns.set_bridge_ipv6(n.bridge, bridges.has_ipv6(n.bridge));
                                 if is_user {
                                     if let Some(name) = kiri_proto::net_opts::values(n.opts, kiri_proto::net_opts::NETWORK).next() {
                                         dns.name_network(n.bridge, name);

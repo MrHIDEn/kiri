@@ -474,7 +474,7 @@ $D rm -f cgns-d cgns-p cgns-h cgns-sd >/dev/null 2>&1
 $D create --name cgns-d alpine true >/dev/null
 $D create --name cgns-p --cgroupns private alpine true >/dev/null
 $D create --name cgns-h --cgroupns host alpine true >/dev/null
-t cgroupns-mode-inspect "private private host" $D inspect -f '{{.HostConfig.CgroupnsMode}}' cgns-d cgns-p cgns-h
+t cgroupns-mode-inspect "private private host" bash -c "$D inspect -f '{{.HostConfig.CgroupnsMode}}' cgns-d cgns-p cgns-h | paste -sd' ' -"
 $D rm -f cgns-d cgns-p cgns-h >/dev/null 2>&1
 t cgroupns-mode-invalid "invalid cgroup namespace mode: bogus" curl -s --unix-socket "$SOCK" -H 'Content-Type: application/json' -d '{"Image":"alpine","Cmd":["true"],"HostConfig":{"CgroupnsMode":"bogus"}}' http://d/v1.47/containers/create
 t cgroupns-private-default "0::/" $D run --rm alpine cat /proc/1/cgroup
@@ -1057,6 +1057,7 @@ needs finder t finder-symlink-is-link "link . Alpine Linux" bash -c "$D exec fsv
 needs finder t finder-no-proc-sys "hidden" bash -c "! ls $KFQ/fsv | grep -qxE 'proc|sys' && ! ls $KFQ/fsv/proc >/dev/null 2>&1 && ! ls $KFQ/fsv/sys >/dev/null 2>&1 && echo hidden"
 needs finder code finder-readonly 1 bash -c "echo x > $KFQ/fsv/tmp/written"
 t finder-mounted "nfs" bash -c "mount | grep -F \" on $KF \""
+t finder-mount-nobrowse ", nobrowse" bash -c 'mount | grep -F " on $1 "' _ "$KF"
 # A file rewritten in place (same path, same size) must never read stale.
 needs finder t finder-fresh "match match match" bash -c "for i in 1 2 3; do $D exec fsv sh -c 'head -c 100000 /dev/urandom > /tmp/same.bin'; a=\$($D exec fsv sha256sum /tmp/same.bin | cut -c1-64); b=\$($SHA $KFQ/fsv/tmp/same.bin | cut -c1-64); [ \"\$a\" = \"\$b\" ] && printf 'match '; done"
 needs finder t finder-new-file "late" bash -c "$D exec fsv sh -c 'echo late > /tmp/late.txt'; cat $KFQ/fsv/tmp/late.txt"
@@ -1238,6 +1239,9 @@ t inspect-binds "ok" bash -c "$D inspect -f '{{json .HostConfig.Binds}}' hcm | p
 t inspect-mounts-tmpfs 'ok {"/t2":"size=1m"} {"/anon":{}}' bash -c "m=\$($D inspect -f '{{json .HostConfig.Mounts}}' hcm | python3 -c 'import json, sys; ms = json.load(sys.stdin) or []; ok = len(ms) == 2 and {\"Type\": \"volume\", \"Source\": \"thcmro\", \"Target\": \"/rodata\", \"ReadOnly\": True} in ms and {\"Type\": \"tmpfs\", \"Target\": \"/t\"} in ms; print(\"ok\" if ok else ms)'); echo \"\$m \$($D inspect -f '{{json .HostConfig.Tmpfs}} {{json .Config.Volumes}}' hcm)\""
 t inspect-recreate-mounts "code=201 kept|rokept|from the mac|bro=ro|vro=ro|t1=ok|t2=ok|ds=ok|ss=ok anon=fresh" bash -c "a1=\$($D inspect -f '{{range .Mounts}}{{if eq .Destination \"/anon\"}}{{.Name}}{{end}}{{end}}' hcm); b=\$(curl -s --unix-socket '$SOCK' http://d/v1.47/containers/hcm/json | python3 -c 'import json, sys; c = json.load(sys.stdin); print(json.dumps(dict(c[\"Config\"], HostConfig=c[\"HostConfig\"])))'); code=\$(curl -s -o /dev/null -w '%{http_code}' --unix-socket '$SOCK' -X POST -H 'Content-Type: application/json' -d \"\$b\" 'http://d/v1.47/containers/create?name=hcm2'); out=\$($D start -a hcm2); a2=\$($D inspect -f '{{range .Mounts}}{{if eq .Destination \"/anon\"}}{{.Name}}{{end}}{{end}}' hcm2); [ -n \"\$a1\" ] && [ -n \"\$a2\" ] && [ \"\$a1\" != \"\$a2\" ] && an=fresh || an=\"same:\$a1:\$a2\"; echo \"code=\$code \$out anon=\$an\""
 $D rm -f -v hcm hcm2 >/dev/null 2>&1; $D volume rm thcm thcmro >/dev/null 2>&1
+# The macOS guest kernel builds in the NFSv3/v4 client (#494) and dm-crypt/LUKS
+# device-mapper (#755) in guest/kernel/kiri.config.
+only mac t guest-kernel-nfs-dmcrypt "nfs dm" $D run --rm --privileged alpine sh -c 'grep -qw nfs /proc/filesystems && grep -qw device-mapper /proc/devices && test -c /dev/mapper/control && echo "nfs dm"'
 t anon-from-image "volume:/var/lib/postgresql/data" bash -c "$D run -d --name pgv -e POSTGRES_PASSWORD=x postgres:17-alpine >/dev/null; $D inspect -f '{{range .Mounts}}{{.Type}}:{{.Destination}}{{end}}' pgv"
 # Waits for the entrypoint's "init process complete" and then a working query,
 # not for pg_isready: on first start Postgres runs a temporary server to
@@ -1664,6 +1668,29 @@ os.close(os.open(\"/upper.lock\", os.O_CREAT | os.O_WRONLY, 0o644))
 os.utime(\"/upper.lock\", (1700000001, 1700000001))
 bu = sx(-100, b\"/upper.lock\", 0)
 print(\"btime-ok\" if b1 == b2 == b3 and b1[:3] == (0, (0, 0), (1700000000, 0)) and bu[:3] == (0, (0, 0), (1700000001, 0)) else (b1, b2, b3, bu))'); $D rmi kiri-test/btime:1 >/dev/null 2>&1; echo \"\$out\""
+# Guest kernel supports ext2/ext3 (via ext4) and FAT/vfat for loop-mounted boot
+# and EFI/SD-card disk images (#934).
+only mac t guest-kernel-ext2-vfat "fs=ext2,ext3,ext4,vfat ext2=hello-ext2 vfat=hello-vfat" bash -c "$D run --rm --privileged alpine sh -c '
+  set -e
+  fs=\$(awk \"{print \\\$NF}\" /proc/filesystems | grep -xE \"ext2|ext3|ext4|vfat\" | sort -u | paste -sd, -)
+  apk add -q --no-cache e2fsprogs dosfstools util-linux
+  dd if=/dev/zero of=/tmp/e2.img bs=1M count=4 status=none
+  mkfs.ext2 -q -F /tmp/e2.img
+  mkdir -p /mnt/e2 /mnt/vf
+  l1=\$(losetup -f --show /tmp/e2.img)
+  mount -t ext2 \"\$l1\" /mnt/e2
+  echo hello-ext2 > /mnt/e2/ok
+  e2=\$(cat /mnt/e2/ok)
+  umount /mnt/e2 && losetup -d \"\$l1\"
+  dd if=/dev/zero of=/tmp/vf.img bs=1M count=4 status=none
+  mkfs.vfat /tmp/vf.img >/dev/null
+  l2=\$(losetup -f --show /tmp/vf.img)
+  mount -t vfat \"\$l2\" /mnt/vf
+  echo hello-vfat > /mnt/vf/ok
+  vf=\$(cat /mnt/vf/ok)
+  umount /mnt/vf && losetup -d \"\$l2\"
+  echo \"fs=\$fs ext2=\$e2 vfat=\$vf\"
+'"
 # Images of 59 to 125 layers start, with their top and lowest layers in the
 # container (#253: from 60 the overlay's options did not fit in a page). The
 # 125-layer one is also the next check's.
@@ -1914,6 +1941,18 @@ t limit-memory-swap-refused "nomem=ok small=ok over=ok" bash -c "
   echo \"nomem=\$nm small=\$sm over=\$ov\"
 "
 t oom-kill "137" bash -c "$D run --rm --memory 32m alpine sh -c 'tail /dev/zero' >/dev/null 2>&1; echo \$?"
+# The VM has the swap Settings → Resources names, on its data disk, and a
+# container's --memory-swap reaches it: zswap's shrinker moves the pages on
+# to the file rather than keeping them in the container's memory (#326).
+only mac t vm-swap-as-set "ok" bash -c "
+  want=\$(curl -s --unix-socket '$SOCK' http://d/kiri/resources | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"running_swap_mib\"])')
+  got=\$($D run --rm alpine awk 'NR>1 && \$1==\"/var/lib/kiri/swapfile\" {print int((\$3+4)/1024)}' /proc/swaps)
+  [ \"\${got:-0}\" = \"\$want\" ] && echo ok || echo \"swap \${got:-none} MiB, resources say \$want\"
+"
+only mac t vm-swap-container-over-memory "dd=0 oom_kill=0" bash -c "
+  [ \"\$(curl -s --unix-socket '$SOCK' http://d/kiri/resources | python3 -c 'import json,sys; print(json.load(sys.stdin).get(\"running_swap_mib\", 1024))')\" -ge 256 ] || { echo 'dd=0 oom_kill=0 (the VM has less than 256 MiB of swap: nothing to check)'; exit; }
+  $D run --rm -m 64m --memory-swap 512m --tmpfs /t:size=400m alpine sh -c 'dd if=/dev/urandom of=/t/x bs=1M count=200 2>/dev/null; echo \"dd=\$? oom_kill=\$(grep oom_kill /sys/fs/cgroup/memory.events | cut -d\" \" -f2)\"'
+"
 t stats "128MiB" $D stats --no-stream --format '{{.MemUsage}}' lim
 t stats-pids "PIDS" $D stats --no-stream lim
 t stats-stream "lim" bash -c "perl -e 'alarm 3; exec @ARGV' $D stats --format '{{.Name}}' lim 2>/dev/null | head -1"
@@ -2441,7 +2480,7 @@ code udp-port-free-after 0 bash -c "python3 -c 'import socket; s=socket.socket(s
 
 section "Linux machines"
 # The `kiri` CLI is $KIRI, found at the top.
-MACHINE_TESTS="machine-create machine-list machine-user machine-mac-files machine-cwd machine-hostname machine-sudo machine-stop machine-stop-again machine-start machine-start-again machine-delete machine-bad-name"
+MACHINE_TESTS="machine-create machine-list machine-user machine-mac-files machine-cwd machine-hostname machine-sudo machine-stop machine-prune-keeps machine-stop-again machine-start machine-start-again machine-delete machine-bad-name"
 # The binary as one shell word, for commands passed to bash -c (app paths have spaces).
 KQ=$(printf %q "$KIRI")
 if [ -x "$KIRI" ]; then
@@ -2463,6 +2502,8 @@ needs homes-dir t machine-cwd "$MD" bash -c "cd $MD && $KQ machine shell e2e-m -
 t machine-hostname "e2e-m" bash -c "$KQ machine shell e2e-m -- hostname < /dev/null"
 t machine-sudo "root" bash -c "for i in \$(seq 30); do out=\$($KQ machine shell e2e-m -- sudo -n whoami < /dev/null 2>/dev/null); [ \"\$out\" = root ] && break; sleep 1; done; echo \$out"
 t machine-stop "Exited" bash -c "$KQ machine stop e2e-m && $KQ machine list"
+# A stopped machine survives a prune, even one aimed at its label (#975).
+t machine-prune-keeps "Exited" bash -c "$D container prune -f --filter label=dev.kiri.machine >/dev/null && $KQ machine list"
 # Stopped already, or running already: done, not an empty `kiri: ` and a failure.
 code machine-stop-again 0 "$KIRI" machine stop e2e-m
 t machine-start "Up" bash -c "$KQ machine start e2e-m && $KQ machine list"
@@ -2502,6 +2543,13 @@ if [ "${K8S:-0}" = 1 ]; then
   t k8s-delete "deleted" bash -c "$KK delete"
   t k8s-context-gone "0" bash -c "env HOME=$KH kubectl config get-contexts -o name | grep -c kiri"
   rm -rf "$KH"
+fi
+# A k8s.json that can't be parsed is reported, not replaced with the defaults.
+# The first `set` (no file yet) saves one, which shows where it lives.
+if [ -x "$KIRI" ]; then
+  t k8s-set-keeps-malformed-config "malformed-settings-kept" bash -c 'h=$(mktemp -d); k() { env HOME="$h" KIRI_SOCKET="$2" "$1" k8s set --lan off; }; k "$@" >/dev/null 2>&1 || exit; for f in "$h"/.kiri*/k8s.json; do :; done; [ -f "$f" ] || exit; printf %s "{\"lan\":true,\"port\":6445,\"tls_san\":[" > "$f"; cp "$f" "$h/before"; out=$(k "$@" 2>&1) || case $out in *"$f is not valid Kubernetes settings ("*"); fix or remove it"*) cmp -s "$h/before" "$f" && echo malformed-settings-kept ;; esac; rm -rf "$h"' _ "$KIRI" "$SOCK"
+else
+  skip_setup k8s-set-keeps-malformed-config "no kiri CLI found: set KIRI=/path/to/kiri"
 fi
 
 section "the API's answers, as Docker gives them"

@@ -5,7 +5,7 @@
 //! ps -a` survives a daemon restart. Every state change notifies one
 //! condition variable, which is what `wait` blocks on.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -425,6 +425,20 @@ pub fn shared_nat() -> bool {
     }
     let env = std::env::var("KIRI_SHARED_NAT").ok();
     shared_nat_for(env.as_deref(), vm_shared_nat_config())
+}
+
+/// The most swap Settings → Resources offers, in MiB.
+pub const MAX_SWAP_MIB: u64 = 16 << 10;
+
+/// The VM's swap file on its data disk, in MiB (#326): `KIRI_SWAP_MIB`,
+/// else Settings → Resources (`vm.json`'s `swap_mib`), else 1 GiB, as
+/// Docker Desktop has. 0 is no swap.
+pub fn vm_swap_mib() -> u64 {
+    swap_mib_for(std::env::var("KIRI_SWAP_MIB").ok().as_deref(), resources()["swap_mib"].as_u64())
+}
+
+pub fn swap_mib_for(env: Option<&str>, configured: Option<u64>) -> u64 {
+    env.and_then(|v| v.trim().parse().ok()).or(configured).unwrap_or(1024).min(MAX_SWAP_MIB)
 }
 
 /// Configured `balloon` from `vm.json`, if present.
@@ -1691,6 +1705,8 @@ pub struct Engine {
     cpus: std::sync::atomic::AtomicUsize,
     /// Data disk capacity in GiB the running VM booted with (macOS).
     disk_gb: std::sync::atomic::AtomicU64,
+    /// Swap in MiB the running VM booted with (macOS).
+    swap_mib: std::sync::atomic::AtomicU64,
     /// Whether the running macOS VM booted with `VZNATNetworkDeviceAttachment`.
     shared_nat: std::sync::atomic::AtomicBool,
     /// Whether the running macOS VM dynamically adjusts its memory balloon
@@ -1739,6 +1755,52 @@ pub struct Engine {
     image_labels: Mutex<HashMap<String, serde_json::Value>>,
     /// The running VM's uplink status for `/info` and `kiri diag report` (#435).
     uplink: Mutex<serde_json::Value>,
+    /// Persisted and short-TTL cached volume byte sizes (`GET /kiri/volumes/sizes`
+    /// and `<state_dir>/volume-sizes.json`), tracking volumes dirtied since the
+    /// last guest disk measurement while leaving `GET /system/df` live.
+    volume_sizes_cache: Mutex<VolumeSizesCache>,
+}
+
+struct VolumeSizesCache {
+    path: PathBuf,
+    generation: u64,
+    measured_at: Option<std::time::Instant>,
+    sizes: HashMap<String, u64>,
+    dirty: HashSet<String>,
+}
+
+pub(super) struct VolumeSizesSnapshot {
+    pub generation: u64,
+    pub fresh_ttl: bool,
+    pub sizes: HashMap<String, u64>,
+    pub dirty: HashSet<String>,
+}
+
+impl VolumeSizesCache {
+    fn load(root: &std::path::Path, current: &[super::volumes::Volume]) -> VolumeSizesCache {
+        let path = root.join("volume-sizes.json");
+        let mut sizes: HashMap<String, u64> = match std::fs::read(&path) {
+            Ok(b) => serde_json::from_slice(&b).unwrap_or_default(),
+            Err(_) => HashMap::new(),
+        };
+        sizes.retain(|k, _| current.iter().any(|v| v.name == *k && v.options.is_empty()));
+        VolumeSizesCache {
+            path,
+            generation: 0,
+            measured_at: None,
+            sizes,
+            dirty: HashSet::new(),
+        }
+    }
+
+    fn save(&self) {
+        if let Ok(json) = serde_json::to_vec(&self.sizes) {
+            let tmp = self.path.with_extension("json.tmp");
+            if let Err(e) = std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, &self.path)) {
+                crate::diag::error!("saving volume sizes failed", error = e);
+            }
+        }
+    }
 }
 
 /// k3s's pod and service ranges, which `kiri k8s` leaves at their defaults.
@@ -1827,7 +1889,9 @@ impl Engine {
         let records = store.root().join("containers.json");
         let ceiling = memory_ceiling();
         let networks = Mutex::new(Networks::load(store.root())?);
-        let volumes = Mutex::new(super::volumes::Volumes::load(store.root())?);
+        let loaded_volumes = super::volumes::Volumes::load(store.root())?;
+        let volume_sizes_cache = Mutex::new(VolumeSizesCache::load(store.root(), loaded_volumes.all()));
+        let volumes = Mutex::new(loaded_volumes);
         let engine = Arc::new(Engine {
             volumes,
             link: Mutex::new(None),
@@ -1856,6 +1920,7 @@ impl Engine {
             ceiling: std::sync::atomic::AtomicU64::new(ceiling),
             cpus: std::sync::atomic::AtomicUsize::new(vm_cpus()),
             disk_gb: std::sync::atomic::AtomicU64::new(vm_disk_gb()),
+            swap_mib: std::sync::atomic::AtomicU64::new(vm_swap_mib()),
             shared_nat: std::sync::atomic::AtomicBool::new(shared_nat()),
             balloon_enabled: std::sync::atomic::AtomicBool::new(balloon_enabled()),
             memory_min: std::sync::atomic::AtomicU64::new(memory_min_bytes(ceiling)),
@@ -1873,6 +1938,7 @@ impl Engine {
             k8s_fwd: Mutex::new(HashMap::new()),
             image_labels: Mutex::new(HashMap::new()),
             uplink: Mutex::new(serde_json::Value::Null),
+            volume_sizes_cache,
         });
         let _ = engine.me.set(Arc::downgrade(&engine));
         engine.start_syncer();
@@ -2032,10 +2098,11 @@ impl Engine {
         if recovery && !self.lock().containers.values().any(recover_after_vm_loss) {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "VM recovery was canceled"));
         }
-        let (ceiling, cpus, disk_cfg, shared_nat, balloon) = (memory_ceiling(), vm_cpus(), vm_disk_gb_config(), shared_nat(), balloon_enabled());
+        let (ceiling, cpus, disk_cfg, shared_nat, balloon, swap) = (memory_ceiling(), vm_cpus(), vm_disk_gb_config(), shared_nat(), balloon_enabled(), vm_swap_mib());
         let memory_min = memory_min_bytes(ceiling);
         self.ceiling.store(ceiling, std::sync::atomic::Ordering::Relaxed);
         self.cpus.store(cpus, std::sync::atomic::Ordering::Relaxed);
+        self.swap_mib.store(swap, std::sync::atomic::Ordering::Relaxed);
         self.shared_nat.store(shared_nat, std::sync::atomic::Ordering::Relaxed);
         self.balloon_enabled.store(balloon, std::sync::atomic::Ordering::Relaxed);
         self.memory_min.store(memory_min, std::sync::atomic::Ordering::Relaxed);
@@ -2050,6 +2117,7 @@ impl Engine {
             cpus: Some(cpus),
             disk_gb: disk_cfg,
             shared_nat: Some(shared_nat),
+            swap_mib: Some(swap),
             ..Default::default()
         })
         .map_err(|e| match self.storage_readonly() {
@@ -2262,8 +2330,9 @@ impl Engine {
     /// `kiri k8s`: every LoadBalancer service gets its port on the Mac's
     /// localhost, as OrbStack and Docker Desktop do. k3s's service load
     /// balancer already serves the port on the node, so a forward to the
-    /// node container is all it takes. Checked every few seconds while the
-    /// cluster runs; forwards go when services or the cluster do.
+    /// node container is all it takes. Reconciled once on cluster start and
+    /// then driven by a single `kubectl get svc -A --watch-only` stream so an
+    /// idle cluster never spawns periodic `/bin/k3s` processes (#989).
     fn start_k8s_lb(self: &Arc<Self>) {
         let me = Arc::downgrade(self);
         // `kiri k8s set --lan on` puts them on every interface; a change rebinds them.
@@ -2271,54 +2340,116 @@ impl Engine {
         let _ = std::thread::Builder::new().name("kiri-k8s-lb".into()).spawn(move || loop {
             std::thread::sleep(Duration::from_secs(3));
             let Some(engine) = me.upgrade() else { return };
-            let node = engine.lock().containers.values().find(|c| c.status == Status::Running && c.spec.labels.get("dev.kiri.k8s").is_some()).map(|c| (c.id.clone(), c.ip));
+            let node = engine.lock().containers.values().find(|c| c.status == Status::Running && is_k8s_node(&c.spec)).map(|c| (c.id.clone(), c.ip));
             let Some((id, Some(ip))) = node else {
-                engine.k8s_lb.lock().unwrap_or_else(|e| e.into_inner()).clear();
-                engine.k8s_fwd.lock().unwrap_or_else(|e| e.into_inner()).clear();
-                if let Some((_, via)) = engine.k8s_routes.lock().unwrap_or_else(|e| e.into_inner()).take()
-                    && let Some(vm) = engine.awake()
-                {
-                    for (net, bits) in K8S_RANGES {
-                        let _ = vm.route(net, bits, via, false);
-                    }
-                }
+                engine.clear_k8s_lb();
                 continue;
             };
-            engine.route_k8s(ip);
-            let query = r#"jsonpath={range .items[?(@.spec.type=="LoadBalancer")]}{range .spec.ports[*]}{.port}/{.protocol} {end}{end}"#;
-            let Ok((0, out)) = engine.exec_capture(&id, &["timeout", "-s", "KILL", "20", "kubectl", "get", "svc", "-A", "-o", query]) else { continue };
-            let wanted: Vec<(u16, String)> = out
-                .split_whitespace()
-                .filter_map(|p| {
-                    let (port, proto) = p.split_once('/')?;
-                    Some((port.parse().ok()?, proto.to_ascii_lowercase()))
-                })
-                .collect();
-            let Some(vm) = engine.awake() else { continue };
-            let host_ip = if crate::k8s::config().lan { "0.0.0.0" } else { "127.0.0.1" };
-            let mut lb = engine.k8s_lb.lock().unwrap_or_else(|e| e.into_inner());
-            if vm.is_disconnected() {
+            if !engine.reconcile_k8s_lb(&id, ip, &mut bound_on) {
                 continue;
             }
-            if bound_on != host_ip {
-                lb.clear();
-                bound_on = host_ip.to_owned();
-            }
-            lb.retain(|k, _| wanted.contains(k));
-            for (port, proto) in wanted {
-                if lb.contains_key(&(port, proto.clone())) {
-                    continue;
-                }
-                let b = super::ports::Binding { container_port: port, proto: proto.clone(), host_ip: host_ip.into(), host_port: port };
-                match super::ports::start(vm.clone(), &format!("lb-{port}-{proto}"), &[b], ip) {
-                    Ok(fw) => {
-                        crate::diag::info!("Kubernetes service published", at = format!("{host_ip}:{port}/{proto}"));
-                        lb.insert((port, proto), fw);
+            let watch_cfg = ExecConfig {
+                console_size: None,
+                argv: ["kubectl", "get", "svc", "-A", "--watch-only", "--no-headers"].map(String::from).to_vec(),
+                env: Vec::new(),
+                cwd: "/".into(),
+                user: String::new(),
+                tty: false,
+                stdin: false,
+                privileged: false,
+                internal: true,
+            };
+            let Ok(watch_id) = engine.exec_create(&id, watch_cfg) else { continue };
+            let Ok((_, rx)) = engine.exec_start(&watch_id) else {
+                engine.lock().execs.remove(&watch_id);
+                continue;
+            };
+            loop {
+                match rx.recv_timeout(Duration::from_secs(5)) {
+                    Ok(_) => {
+                        // Coalesce bursts of service updates into a single reconciliation.
+                        while rx.recv_timeout(Duration::from_millis(150)).is_ok() {}
+                        let Some(engine) = me.upgrade() else { return };
+                        let still_up = engine.lock().containers.get(&id).is_some_and(|c| c.status == Status::Running && c.ip == Some(ip));
+                        if !still_up {
+                            engine.clear_k8s_lb();
+                            break;
+                        }
+                        let _ = engine.reconcile_k8s_lb(&id, ip, &mut bound_on);
                     }
-                    Err(e) => crate::diag::warn!("Kubernetes service port not published", port = format!("{port}/{proto}"), error = e),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        let Some(engine) = me.upgrade() else { return };
+                        let still_up = engine.lock().containers.get(&id).is_some_and(|c| c.status == Status::Running && c.ip == Some(ip));
+                        if !still_up {
+                            engine.clear_k8s_lb();
+                            break;
+                        }
+                        let want_ip = if crate::k8s::config().lan { "0.0.0.0" } else { "127.0.0.1" };
+                        if bound_on != want_ip {
+                            let _ = engine.reconcile_k8s_lb(&id, ip, &mut bound_on);
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 }
+            }
+            if let Some(engine) = me.upgrade() {
+                engine.lock().execs.remove(&watch_id);
+            } else {
+                return;
             }
         });
+    }
+
+    fn clear_k8s_lb(&self) {
+        self.k8s_lb.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.k8s_fwd.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        if let Some((_, via)) = self.k8s_routes.lock().unwrap_or_else(|e| e.into_inner()).take()
+            && let Some(vm) = self.awake()
+        {
+            for (net, bits) in K8S_RANGES {
+                let _ = vm.route(net, bits, via, false);
+            }
+        }
+    }
+
+    fn reconcile_k8s_lb(&self, id: &str, ip: [u8; 4], bound_on: &mut String) -> bool {
+        self.route_k8s(ip);
+        let query = r#"jsonpath={range .items[?(@.spec.type=="LoadBalancer")]}{range .spec.ports[*]}{.port}/{.protocol} {end}{end}"#;
+        let Ok((0, out)) = self.exec_capture(id, &["timeout", "-s", "KILL", "20", "kubectl", "get", "svc", "-A", "-o", query]) else {
+            return false;
+        };
+        let wanted: Vec<(u16, String)> = out
+            .split_whitespace()
+            .filter_map(|p| {
+                let (port, proto) = p.split_once('/')?;
+                Some((port.parse().ok()?, proto.to_ascii_lowercase()))
+            })
+            .collect();
+        let Some(vm) = self.awake() else { return false };
+        let host_ip = if crate::k8s::config().lan { "0.0.0.0" } else { "127.0.0.1" };
+        let mut lb = self.k8s_lb.lock().unwrap_or_else(|e| e.into_inner());
+        if vm.is_disconnected() {
+            return false;
+        }
+        if bound_on != host_ip {
+            lb.clear();
+            *bound_on = host_ip.to_owned();
+        }
+        lb.retain(|k, _| wanted.contains(k));
+        for (port, proto) in wanted {
+            if lb.contains_key(&(port, proto.clone())) {
+                continue;
+            }
+            let b = super::ports::Binding { container_port: port, proto: proto.clone(), host_ip: host_ip.into(), host_port: port };
+            match super::ports::start(vm.clone(), &format!("lb-{port}-{proto}"), &[b], ip) {
+                Ok(fw) => {
+                    crate::diag::info!("Kubernetes service published", at = format!("{host_ip}:{port}/{proto}"));
+                    lb.insert((port, proto), fw);
+                }
+                Err(e) => crate::diag::warn!("Kubernetes service port not published", port = format!("{port}/{proto}"), error = e),
+            }
+        }
+        true
     }
 
     /// Routes the cluster's pod and service ranges to the node, so the
@@ -2436,6 +2567,11 @@ impl Engine {
             return false;
         }
         let Some(vm) = self.link.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return false };
+        if self.volume_list().iter().any(|v| v.options.is_empty())
+            && let Some(lines) = vm.usage(Duration::from_secs(15))
+        {
+            self.cache_volume_sizes(None, super::ops::parse_volume_usage(&lines));
+        }
         self.sleeping.store(true, std::sync::atomic::Ordering::SeqCst);
         self.memory_used.store(0, std::sync::atomic::Ordering::Relaxed);
         self.mem_available_kib.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -2668,6 +2804,11 @@ impl Engine {
         self.disk_gb.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Swap in MiB the VM has (or will boot with).
+    pub fn swap_mib(&self) -> u64 {
+        self.swap_mib.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Whether the running macOS VM booted with `VZNATNetworkDeviceAttachment`.
     #[allow(dead_code)]
     pub fn shared_nat(&self) -> bool {
@@ -2675,14 +2816,17 @@ impl Engine {
     }
 
     /// The Mac folders and files that running containers bind-mount, as
-    /// the Mac keeps them (the guest sees them under /mnt/mac).
+    /// the Mac keeps them (the guest sees them under /mnt/mac). Excludes the
+    /// `kiri-k8s` node container (`dev.kiri.k8s`), which mounts `/Users` and
+    /// `/Volumes` whole for pod `hostPath` access and would otherwise attach a
+    /// 50 ms `FSEvents` stream across the entire Mac filesystem (#989).
     #[cfg(target_os = "macos")]
     pub fn mac_bind_sources(&self) -> Vec<String> {
         let mut out: Vec<String> = self
             .lock()
             .containers
             .values()
-            .filter(|c| c.status == Status::Running)
+            .filter(|c| watches_host_binds(c))
             .flat_map(|c| c.spec.mounts.iter())
             .filter_map(|m| m.split('\t').next()?.strip_prefix("/mnt/mac").filter(|p| p.starts_with('/')).map(str::to_owned))
             .collect();
@@ -2715,13 +2859,14 @@ impl Engine {
     }
 
     /// The WSL drive bind sources (`/mnt/<drive>` or `/mnt/<drive>/...`) of
-    /// running containers, under `automount_root` (e.g. `/mnt/`).
+    /// running containers, under `automount_root` (e.g. `/mnt/`). Excludes the
+    /// `kiri-k8s` node container (`dev.kiri.k8s`), which mounts `/mnt` whole.
     pub fn wsl_bind_sources(&self, automount_root: &str) -> Vec<String> {
         let mut out: Vec<String> = self
             .lock()
             .containers
             .values()
-            .filter(|c| c.status == Status::Running)
+            .filter(|c| watches_host_binds(c))
             .flat_map(|c| c.spec.mounts.iter())
             .filter_map(|m| {
                 let src = m.split('\t').next()?;
@@ -2747,9 +2892,108 @@ impl Engine {
     }
 
     /// The VM's link while it runs, without waking it.
-    #[cfg(target_os = "macos")]
     pub fn awake_link(&self) -> Option<Arc<VmLink>> {
         self.awake()
+    }
+
+    /// Snapshot of persisted + cached volume disk usage, TTL freshness, dirty
+    /// set, and generation counter.
+    pub(super) fn volume_sizes_snapshot(&self, ttl: Duration) -> VolumeSizesSnapshot {
+        let c = self.volume_sizes_cache.lock().unwrap_or_else(|e| e.into_inner());
+        VolumeSizesSnapshot {
+            generation: c.generation,
+            fresh_ttl: c.measured_at.is_some_and(|at| at.elapsed() < ttl),
+            sizes: c.sizes.clone(),
+            dirty: c.dirty.clone(),
+        }
+    }
+
+    /// Stores freshly measured volume sizes and persists `<state_dir>/volume-sizes.json`.
+    /// When `expected_gen` is `Some(g)`, skips writing if invalidated since `g`.
+    pub(super) fn cache_volume_sizes(&self, expected_gen: Option<u64>, du_volumes: HashMap<String, u64>) {
+        let volumes = self.volume_list();
+        let mut c = self.volume_sizes_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if expected_gen.is_some_and(|g| g != c.generation) {
+            return;
+        }
+        let mut next = HashMap::with_capacity(volumes.len());
+        for v in &volumes {
+            if v.options.is_empty() {
+                next.insert(v.name.clone(), du_volumes.get(&v.name).copied().unwrap_or(0));
+            }
+        }
+        c.measured_at = Some(std::time::Instant::now());
+        c.sizes = next;
+        c.dirty.clear();
+        c.save();
+    }
+
+    /// Initializes a newly created local volume's persisted size to `0` (unless
+    /// already measured) while bumping generation so an earlier in-flight scan
+    /// cannot clobber it.
+    fn record_new_volume(&self, v: &super::volumes::Volume) {
+        let mut c = self.volume_sizes_cache.lock().unwrap_or_else(|e| e.into_inner());
+        c.generation = c.generation.wrapping_add(1);
+        c.measured_at = None;
+        c.dirty.remove(&v.name);
+        if v.options.is_empty() {
+            c.sizes.entry(v.name.clone()).or_insert(0);
+            c.save();
+        }
+    }
+
+    /// Removes a deleted volume from the persisted size map and bumps generation.
+    fn forget_volume_size(&self, name: &str) {
+        let mut c = self.volume_sizes_cache.lock().unwrap_or_else(|e| e.into_inner());
+        c.generation = c.generation.wrapping_add(1);
+        c.measured_at = None;
+        c.dirty.remove(name);
+        if c.sizes.remove(name).is_some() {
+            c.save();
+        }
+    }
+
+    /// Marks mounted local volumes dirty when a container using them starts,
+    /// exits, is removed, or receives `docker cp` writes.
+    pub(super) fn mark_volumes_dirty<'a>(&self, names: impl IntoIterator<Item = &'a String>) {
+        let names: Vec<String> = names.into_iter().cloned().collect();
+        if names.is_empty() {
+            return;
+        }
+        let local_set: HashSet<String> = self
+            .volume_list()
+            .into_iter()
+            .filter(|v| v.options.is_empty())
+            .map(|v| v.name)
+            .collect();
+        let mut c = self.volume_sizes_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut any = false;
+        for name in names {
+            if local_set.contains(&name) {
+                c.dirty.insert(name);
+                any = true;
+            }
+        }
+        if any {
+            c.generation = c.generation.wrapping_add(1);
+            c.measured_at = None;
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_volume_sizes_cache_at(&self, at: std::time::Instant, du_volumes: HashMap<String, u64>) {
+        let volumes = self.volume_list();
+        let mut c = self.volume_sizes_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut next = HashMap::with_capacity(volumes.len());
+        for v in &volumes {
+            if v.options.is_empty() {
+                next.insert(v.name.clone(), du_volumes.get(&v.name).copied().unwrap_or(0));
+            }
+        }
+        c.measured_at = Some(at);
+        c.sizes = next;
+        c.dirty.clear();
+        c.save();
     }
 
     /// Queries `(in_use, capacity)` of the guest data disk while the VM is
@@ -3071,7 +3315,7 @@ impl Engine {
                 // rules wiped by a delayed `Forwards::drop` -> `Unpublish`
                 // (#649). Loop in case a concurrent `start`/`connect`/
                 // `set_ports` installed forwards while the lock was released.
-                let (restart_in, persist, exited_name, actor, start_owed, remove, anon, removed_log, removed_layers) = loop {
+                let (restart_in, persist, exited_name, actor, start_owed, remove, anon, removed_log, removed_layers, touched_volumes) = loop {
                     let mut st = self.lock();
                     if let Some(e) = st.execs.get_mut(id) {
                         e.running = false;
@@ -3102,8 +3346,10 @@ impl Engine {
                     if let Some(h) = st.health.get_mut(id) {
                         close_monitor(h);
                     }
+                    let mut touched_volumes = Vec::new();
                     let remove = match st.containers.get_mut(id) {
                         Some(c) => {
+                            touched_volumes = c.spec.volumes.iter().chain(&c.spec.anon_volumes).cloned().collect();
                             c.status = Status::Exited;
                             c.exit_code = code;
                             c.pid = 0;
@@ -3159,7 +3405,7 @@ impl Engine {
                         note_removed(&mut st, id, code);
                     }
                     drop(st);
-                    break (restart_in, persist, exited_name, actor, start_owed, remove, anon, removed_log, removed_layers);
+                    break (restart_in, persist, exited_name, actor, start_owed, remove, anon, removed_log, removed_layers, touched_volumes);
                 };
                 // Relieve the balloon and log the exit outside `self.state` so
                 // neither `memory_target`, `link` nor `stopping_ops` is ever
@@ -3186,6 +3432,7 @@ impl Engine {
                 // reader), since that asks the VM, and vm() waits for this
                 // reader when the VM was just lost.
                 let forgotten: Vec<String> = self.unshared(anon).into_iter().filter(|v| self.forget_volume(v)).collect();
+                self.mark_volumes_dirty(&touched_volumes);
                 if !forgotten.is_empty() && let Some(me) = self.me.get().and_then(Weak::upgrade) {
                     let _ = std::thread::Builder::new().name("kiri-volume-rm".into()).spawn(move || {
                         if let Ok(vm) = me.vm() {
@@ -4216,6 +4463,7 @@ impl Engine {
             (out.0, out.1, out.2, out.3, out.4, (out.5.0, out.5.1, earlier, halted))
         };
         self.clear_stopping_op(&id);
+        self.mark_volumes_dirty(spec.volumes.iter().chain(&spec.anon_volumes));
         let (gate, exits, earlier, halted_at_claim) = gate;
         // A bind source that is a link is followed again at every start, as
         // Docker does: re-pointing it between runs (a `current` release
@@ -4402,17 +4650,19 @@ impl Engine {
         let mut opts = net_opts(&spec, joined.as_deref(), &domainname);
         opts.extend(net6_opts);
         opts.extend(pid_joined.map(|t| format!("{}={t}", kiri_proto::net_opts::PIDNS)));
-        let net_args = kiri_proto::Net { bridge: &bridge, ip, prefix, gateway, extra_hosts: &hosts, dns_names: &dns_names, opts: &opts };
         // Joining a host-network container is the host's namespace too: its
         // net.* sysctls would change the whole VM (or Linux host).
         let joined_host = joined_mode.is_some_and(|m| self.lock_networks().find(&m).is_some_and(|n| n.driver == "host"));
-        let host_opts = match spec.guest_opts(flags & run_flags::NET_HOST != 0 || joined_host) {
+        let mut host_opts = match spec.guest_opts(flags & run_flags::NET_HOST != 0 || joined_host) {
             Ok(o) => o,
             Err(e) => {
                 self.fail_start(&id, &spec, &e);
                 return Err(e);
             }
         };
+        if let Some(opt) = k8s_timer_slack_opt(&spec) {
+            host_opts.push(opt);
+        }
         if let Err(e) = self.restore_layers(&vm, &layers) {
             self.fail_start(&id, &spec, &e);
             return Err(e);
@@ -4446,11 +4696,34 @@ impl Engine {
             return Err(e);
         }
         let cancelled = || gate.0.cancel.load(std::sync::atomic::Ordering::SeqCst);
-        let started = if cancelled() {
-            Err(io::Error::other("cancelled before it reached the guest"))
-        } else {
+        let run_once = || {
+            let net_args = kiri_proto::Net { bridge: &bridge, ip, prefix, gateway, extra_hosts: &hosts, dns_names: &dns_names, opts: &opts };
             vm.run(&id, &layers, &argv, &spec.env, &spec.cwd, &spec.user, &hostname, flags, net_args, &spec.mounts, &spec.limits.wire(), spec.caps, &host_opts, &seccomp, &gate.0.cancel)
         };
+        let mut started = if cancelled() {
+            Err(io::Error::other("cancelled before it reached the guest"))
+        } else {
+            run_once()
+        };
+        // `VmLink::layers` avoids redundant `LayerQuery` round-trips on hot starts;
+        // if an unpacked layer was deleted on the guest's disk while the VM stayed
+        // up (`start-restores-layer`), evict its cached digests, re-query/re-send
+        // the missing layer(s), and retry once.
+        if let Err(ref e) = started
+            && !cancelled()
+            && is_missing_unpacked_layer_error(&e.to_string())
+        {
+            vm.forget_layers(&layers);
+            if let Err(restore_err) = self.restore_layers(&vm, &layers) {
+                self.fail_start(&id, &spec, &restore_err);
+                return Err(restore_err);
+            }
+            started = if cancelled() {
+                Err(io::Error::other("cancelled before it reached the guest"))
+            } else {
+                run_once()
+            };
+        }
         if let Ok(pid) = started
             && let Some(c) = self.lock().containers.get_mut(&id).filter(|c| c.status == Status::Running)
         {
@@ -4930,7 +5203,7 @@ impl Engine {
     /// Names are the container name, or `<service>.<project>` for Compose
     /// services.
     pub fn route(&self, host: &str) -> Option<super::domains::Target> {
-        let host = host.split(':').next()?.to_ascii_lowercase();
+        let host = super::domains::parse_host_name(host)?;
         let name = host.strip_suffix(".kiri.localhost").or_else(|| host.strip_suffix(".kiri.local"))?.to_owned();
         let st = self.lock();
         let c = st.containers.values().find(|c| {
@@ -4966,6 +5239,41 @@ impl Engine {
         c.status = Status::Running;
         c.ip = Some(ip);
         c.first_if = Some(0);
+    }
+
+    /// Checks whether a `/proc/<pid>/cgroup` snapshot belongs to one of this
+    /// engine's currently running containers under a root-owned `kiri/<id>`
+    /// cgroup directory (#127). Prevents unprivileged host `unshare -Um` +
+    /// `newuidmap` processes from impersonating containers on `docker.container.sock`.
+    #[cfg(target_os = "linux")]
+    pub fn has_running_container_cgroup(&self, cgroup_text: &str) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        for line in cgroup_text.lines() {
+            let Some((_, rest)) = line.split_once(':') else { continue };
+            let Some((_, rel_path)) = rest.split_once(':') else { continue };
+            if !rel_path.starts_with('/') {
+                continue;
+            }
+            let segs: Vec<&str> = rel_path.split('/').filter(|s| !s.is_empty()).collect();
+            for i in 1..segs.len() {
+                let id = segs[i];
+                if segs[i - 1] != "kiri" || id.len() != 64 || !id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+                    continue;
+                }
+                let is_running = self.lock().containers.get(id).is_some_and(|c| c.status == Status::Running);
+                if !is_running {
+                    continue;
+                }
+                let prefix = format!("/sys/fs/cgroup/{}", segs[..=i].join("/"));
+                let parent = format!("/sys/fs/cgroup/{}", segs[..i].join("/"));
+                if std::fs::symlink_metadata(&prefix).is_ok_and(|m| m.is_dir() && m.uid() == 0)
+                    && std::fs::symlink_metadata(&parent).is_ok_and(|m| m.is_dir() && m.uid() == 0)
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// For the Finder view (macOS).
@@ -5064,6 +5372,9 @@ impl Engine {
         let mut out = Vec::new();
         kiri_proto::encode_copy(&mut out, op, &id, path, flags, &layers, &mounts);
         std::io::Write::write_all(&mut std::fs::File::from(stream.fd.try_clone()?), &out)?;
+        if op == kiri_proto::copy_op::IN {
+            self.mark_volumes_dirty(spec.volumes.iter().chain(&spec.anon_volumes));
+        }
         Ok(stream)
     }
 
@@ -6102,6 +6413,9 @@ impl Engine {
                 self.delete_volume_data(&v);
             }
         }
+        if let Some(c) = &removed {
+            self.mark_volumes_dirty(c.spec.volumes.iter().chain(&c.spec.anon_volumes));
+        }
         Ok(())
     }
 
@@ -6115,6 +6429,7 @@ impl Engine {
         let new = self.volume_get(name).is_none();
         let v = self.lock_volumes().ensure(name, labels, anonymous).map_err(Error::BadRequest)?;
         if new {
+            self.record_new_volume(&v);
             self.emit_volume("create", name);
         }
         Ok(v)
@@ -6126,6 +6441,7 @@ impl Engine {
         let new = self.volume_get(name).is_none();
         let v = self.lock_volumes().ensure_with(name, labels, false, options).map_err(Error::BadRequest)?;
         if new {
+            self.record_new_volume(&v);
             self.emit_volume("create", name);
         }
         Ok(v)
@@ -6190,6 +6506,7 @@ impl Engine {
     fn forget_volume(&self, name: &str) -> bool {
         let forgot = self.lock_volumes().forget(name);
         if forgot {
+            self.forget_volume_size(name);
             self.emit_volume("destroy", name);
         }
         forgot
@@ -6237,14 +6554,26 @@ impl Engine {
         let exec_security;
         let (container_id, config, env) = {
             let mut st = self.lock();
-            let e = st.execs.get_mut(exec_id).ok_or_else(|| Error::NotFound(format!("No such exec instance: {exec_id}")))?;
-            if e.running || e.exit_code.is_some() {
+            let (already_ran, container_id) = {
+                let e = st.execs.get(exec_id).ok_or_else(|| Error::NotFound(format!("No such exec instance: {exec_id}")))?;
+                (e.running || e.exit_code.is_some(), e.container_id.clone())
+            };
+            if already_ran {
                 return Err(Error::Conflict("exec has already run".into()));
             }
+            match st.containers.get(&container_id) {
+                None => return Err(Error::Conflict(format!("container {} is not running", &container_id[..12]))),
+                Some(c) if c.status != Status::Running => return Err(Error::Conflict(format!("container {} is not running", &container_id[..12]))),
+                Some(c) if c.paused && !is_builder(c) => {
+                    return Err(Error::Conflict(format!("Container {} is paused, unpause the container before exec", &container_id[..12])));
+                }
+                _ => {}
+            }
+            let e = st.execs.get_mut(exec_id).expect("checked above");
             e.running = true;
             // Subscribe before the process exists, so no output is missed.
             e.attached.push(tx);
-            let (container_id, config) = (e.container_id.clone(), e.config.clone());
+            let config = e.config.clone();
             let (security, caps) = st.containers.get(&container_id).map(|c| (c.spec.security_flags() & !run_flags::READONLY_ROOTFS, c.spec.caps)).unwrap_or_default();
             // Execs get the container's ulimits and groups, as with runc.
             let opts = st.containers.get(&container_id).map(|c| c.spec.guest_opts(false).unwrap_or_default()).unwrap_or_default();
@@ -6292,6 +6621,25 @@ impl Engine {
         flags |= exec_security.0;
         let console = config.console_size;
         self.wait_for_start(&container_id);
+        let conflict = {
+            let st = self.lock();
+            match st.containers.get(&container_id) {
+                None => Some(format!("container {} is not running", &container_id[..12])),
+                Some(c) if c.status != Status::Running => Some(format!("container {} is not running", &container_id[..12])),
+                Some(c) if c.paused && !is_builder(c) => Some(format!("Container {} is paused, unpause the container before exec", &container_id[..12])),
+                _ => None,
+            }
+        };
+        if let Some(msg) = conflict {
+            let mut st = self.lock();
+            if let Some(x) = st.execs.get_mut(exec_id) {
+                x.running = false;
+                x.attached.clear();
+            }
+            drop(st);
+            self.changed.notify_all();
+            return Err(Error::Conflict(msg));
+        }
         let started = self.vm()?.exec(&container_id, exec_id, &config.argv, &env, &config.cwd, &config.user, flags, exec_security.1, &exec_security.2);
         if let Ok(pid) = started {
             if let Some(x) = self.lock().execs.get_mut(exec_id).filter(|x| x.exit_code.is_none()) {
@@ -6835,7 +7183,7 @@ mod memory_target_tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        balloon_enabled_for, boot_without_vm, estimate_used, memory_floor, memory_headroom, memory_min_bytes_for, next_memory_target, BalloonPolicy,
+        balloon_enabled_for, boot_without_vm, swap_mib_for, MAX_SWAP_MIB, estimate_used, memory_floor, memory_headroom, memory_min_bytes_for, next_memory_target, BalloonPolicy,
         BalloonState, MemorySample, MEMORY_DEADBAND, MEMORY_FLOOR_ACTIVE_MIN, MEMORY_FLOOR_IDLE, MEMORY_GROW, MEMORY_HEADROOM_MAX,
         MEMORY_HEADROOM_MIN, MEMORY_SHRINK_STEP, SHRINK_COOLDOWN, WS_PEAK_DECAY_INTERVAL, WS_PEAK_DECAY_STEP,
     };
@@ -7424,6 +7772,19 @@ mod memory_target_tests {
         assert_eq!(settle_guest_with(pinned_4g, MEM_TOTAL, USED, 200 * MIB, None), 4 * GIB);
         let clamped_ceiling = BalloonPolicy { ceiling: CEILING, active_containers: 0, memory_min: memory_min_bytes_for(Some(16_384), CEILING) };
         assert_eq!(settle_guest_with(clamped_ceiling, MEM_TOTAL, USED, 200 * MIB, None), CEILING);
+    }
+
+    /// The VM's swap (#326): `KIRI_SWAP_MIB`, else `vm.json`, else 1 GiB
+    /// as in Docker Desktop, never above the most Settings offers.
+    #[test]
+    fn swap_is_the_environment_then_the_setting_then_one_gib() {
+        assert_eq!(swap_mib_for(None, None), 1024);
+        assert_eq!(swap_mib_for(None, Some(0)), 0);
+        assert_eq!(swap_mib_for(None, Some(4096)), 4096);
+        assert_eq!(swap_mib_for(Some("512"), Some(4096)), 512);
+        assert_eq!(swap_mib_for(Some(" 0 "), None), 0);
+        assert_eq!(swap_mib_for(Some("lots"), Some(2048)), 2048, "an unreadable variable is ignored");
+        assert_eq!(swap_mib_for(None, Some(1 << 30)), MAX_SWAP_MIB);
     }
 
     /// `"balloon": false` in `vm.json` and `KIRI_NO_BALLOON=1` disable
@@ -10832,4 +11193,159 @@ mod exit_forwards_tests {
         drop(engine);
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    /// Refusing `exec_create` and `exec_start` on a paused non-builder container
+    /// returns 409 Conflict instead of cloning a child into a frozen cgroup (#948).
+    #[test]
+    fn exec_create_and_start_refuse_paused_non_builder_container() {
+        let (engine, id, dir) = engine_running("exec-paused-conflict");
+        let cfg = || ExecConfig {
+            console_size: None,
+            argv: vec!["true".into()],
+            env: Vec::new(),
+            cwd: "/".into(),
+            user: String::new(),
+            tty: true,
+            stdin: false,
+            privileged: false,
+            internal: false,
+        };
+
+        engine.lock().containers.get_mut(&id).unwrap().paused = true;
+        match engine.exec_create(&id, cfg()) {
+            Err(Error::Conflict(msg)) => assert!(msg.contains("is paused, unpause the container before exec"), "{msg}"),
+            other => panic!("expected Conflict on paused exec_create, got {other:?}"),
+        }
+
+        engine.lock().containers.get_mut(&id).unwrap().paused = false;
+        let exec_id = engine.exec_create(&id, cfg()).unwrap();
+        engine.lock().containers.get_mut(&id).unwrap().paused = true;
+        let attempts_before = engine.boot_attempts.load(Ordering::SeqCst);
+        match engine.exec_start(&exec_id) {
+            Err(Error::Conflict(msg)) => assert!(msg.contains("is paused, unpause the container before exec"), "{msg}"),
+            other => panic!("expected Conflict on paused exec_start, got {other:?}"),
+        }
+        assert_eq!(engine.boot_attempts.load(Ordering::SeqCst), attempts_before, "paused exec_start must not touch VM");
+        assert!(engine.with_exec(&exec_id, |e| !e.running && e.exit_code.is_none()).unwrap());
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn detects_guest_missing_unpacked_layer_error() {
+        assert!(super::is_missing_unpacked_layer_error(
+            "run f0991bd92f25: layer sha256:821d9dafb26dc8e4afce2273366520f49e38f8f679a72fc512f2a83e62f442b7 is not unpacked"
+        ));
+        assert!(super::is_missing_unpacked_layer_error("layer sha256:0123 is not unpacked"));
+        assert!(!super::is_missing_unpacked_layer_error("run c1: mount /payload: No space left on device"));
+        assert!(!super::is_missing_unpacked_layer_error("the VM stopped"));
+    }
+
+    /// Regression test for #989: `kiri-k8s` (`dev.kiri.k8s`) bind-mounts `/Users`
+    /// and `/Volumes` on macOS (and `/mnt` on Linux/WSL) for pod `hostPath`
+    /// access, which must NOT cause `mac_bind_sources` or `wsl_bind_sources` to
+    /// watch the entire host filesystem, while ordinary containers keep theirs;
+    /// and `k8s_timer_slack_opt` sets 10 ms timer coalescing only for `kiri-k8s`.
+    #[test]
+    fn k8s_node_skips_host_bind_watchers_and_gets_timer_slack() {
+        let (engine, app_id, dir) = engine_running("k8s-bind-watch");
+        {
+            let mut st = engine.lock();
+            let app = st.containers.get_mut(&app_id).unwrap();
+            app.spec.mounts = vec![
+                "/mnt/mac/Users/alice/app\t/app\t".into(),
+                "/mnt/c/Users/alice/app\t/win\t".into(),
+            ];
+            assert_eq!(super::k8s_timer_slack_opt(&app.spec), None);
+
+            let mut k8s = Container {
+                lifecycle: Arc::new(Mutex::new(0)),
+                names_sync: Arc::default(),
+                start_gate: Arc::default(),
+                id: "k8s00000000000000000000000000000".into(),
+                name: "kiri-k8s".into(),
+                layers: Vec::new(),
+                spec: app.spec.clone(),
+                created: SystemTime::now(),
+                status: Status::Running,
+                started: Some(SystemTime::now()),
+                finished: None,
+                exit_code: 0,
+                oom_killed: false,
+                vm_stopped: false,
+                stopped_by_user: false,
+                restart_count: 0,
+                restart_pending: false,
+                exits: 0,
+                size: None,
+                ip: None,
+                pid: 42,
+                forwards: None,
+                paused: false,
+                extra_ips: Vec::new(),
+                first_if: None,
+                extra_ifs: Vec::new(),
+                ip6: None,
+                extra_ip6s: Vec::new(),
+                live: true,
+                early_input: Vec::new(),
+                early_close: false,
+                start_owed: false,
+                log: Arc::new(Mutex::new(super::super::logfile::Log::new(
+                    super::super::logfile::dir(engine.store.root(), "k8s00000000000000000000000000000"),
+                    &app.spec.log_config,
+                ))),
+                attached: Vec::new(),
+            };
+            k8s.spec.labels = serde_json::json!({"dev.kiri.k8s": "1"});
+            k8s.spec.mounts = vec![
+                "/mnt/mac/Users\t/Users\t".into(),
+                "/mnt/mac/Volumes\t/Volumes\t".into(),
+                "/mnt/c\t/mnt/c\t".into(),
+            ];
+            assert_eq!(
+                super::k8s_timer_slack_opt(&k8s.spec).as_deref(),
+                Some("timerslack\t10000000")
+            );
+            st.containers.insert(k8s.id.clone(), k8s);
+        }
+
+        #[cfg(target_os = "macos")]
+        assert_eq!(engine.mac_bind_sources(), vec!["/Users/alice/app".to_owned()]);
+        assert_eq!(engine.wsl_bind_sources("/mnt/"), vec!["/mnt/c/Users/alice/app".to_owned()]);
+
+        // When only `kiri-k8s` runs, no host bind watcher roots remain at all.
+        engine.lock().containers.get_mut(&app_id).unwrap().status = Status::Exited;
+        #[cfg(target_os = "macos")]
+        assert!(engine.mac_bind_sources().is_empty());
+        assert!(engine.wsl_bind_sources("/mnt/").is_empty());
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// 10 ms timer slack applied to `kiri-k8s` (`dev.kiri.k8s`) so `k3s`'s dozens of
+/// staggered 100 ms `watch_progress` / `kine` / `cAdvisor` timers coalesce
+/// cleanly instead of waking virtual CPUs thousands of times per second (#989).
+const K8S_TIMER_SLACK_NS: u64 = 10_000_000;
+
+fn is_k8s_node(spec: &Spec) -> bool {
+    spec.labels.get("dev.kiri.k8s").is_some()
+}
+
+fn watches_host_binds(c: &Container) -> bool {
+    c.status == Status::Running && !is_k8s_node(&c.spec)
+}
+
+fn k8s_timer_slack_opt(spec: &Spec) -> Option<String> {
+    is_k8s_node(spec).then(|| format!("timerslack\t{K8S_TIMER_SLACK_NS}"))
+}
+
+/// Whether a guest `Run` error reports that an image layer was missing under
+/// `/var/lib/kiri/layers` (`kiri-init`'s `roots::acquire` formats this as
+/// `"layer <digest> is not unpacked"`).
+fn is_missing_unpacked_layer_error(msg: &str) -> bool {
+    msg.contains("layer sha256:") && msg.ends_with(" is not unpacked")
 }
