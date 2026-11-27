@@ -61,7 +61,7 @@ const MAX_K3S_ARGS: usize = 64;
 const MAX_MANIFEST_BYTES: u64 = 4 << 20;
 
 const USAGE_SET: &str = "usage: kiri k8s set [--lan on|off] [--tls-san NAME,…] [--port N] [--version TAG|default] [--k3s-arg ARG]… [--clear-k3s-args]";
-const USAGE_K8S: &str = "usage: kiri k8s start [--use] | stop | status | delete | set [--lan on|off] [--tls-san NAME,…] [--port N] [--version TAG|default] [--k3s-arg ARG]… [--clear-k3s-args]";
+const USAGE_K8S: &str = "usage: kiri k8s start [--use] | stop | status [--json] | delete | set [--lan on|off] [--tls-san NAME,…] [--port N] [--version TAG|default] [--k3s-arg ARG]… [--clear-k3s-args]";
 
 impl Config {
     pub(crate) fn api_port(&self) -> u16 {
@@ -123,6 +123,30 @@ pub(crate) fn manifests_dir() -> io::Result<PathBuf> {
 
 fn load_config_from(path: &std::path::Path) -> Config {
     std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+/// The settings `kiri k8s set` changes and saves back. Only a missing file is
+/// the defaults: one that can't be read or parsed is an error, not replaced.
+fn load_config_for_edit(path: &std::path::Path) -> io::Result<Config> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Config::default()),
+        Err(e) => {
+            return Err(io::Error::new(
+                e.kind(),
+                format!("cannot read {}: {e}", path.display()),
+            ));
+        }
+    };
+    serde_json::from_slice(&bytes).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} is not valid Kubernetes settings ({e}); fix or remove it",
+                path.display()
+            ),
+        )
+    })
 }
 
 fn save_config_to(path: &std::path::Path, cfg: &Config) -> io::Result<()> {
@@ -337,14 +361,7 @@ pub(crate) fn format_status(info: Option<&serde_json::Value>, cfg: &Config) -> S
     let port = bound_port(info).unwrap_or(API_PORT);
     let want = cfg.api_port();
     let moved = if port != want { format!(" ({want} was in use)") } else { String::new() };
-    let version = if state == "running" {
-        info["Config"]["Image"]
-            .as_str()
-            .and_then(|img| img.split_once(':').map(|(_, tag)| tag))
-            .unwrap_or_else(|| cfg.version_tag())
-    } else {
-        cfg.version_tag()
-    };
+    let version = node_version(info, cfg);
     let mut out = format!("Kubernetes: {state}, k3s {version}, API on 127.0.0.1:{port}{moved}");
     if !cfg.k3s_args.is_empty() {
         out.push_str(&format!(", k3s args: {}", cfg.k3s_args.join(" ")));
@@ -352,10 +369,35 @@ pub(crate) fn format_status(info: Option<&serde_json::Value>, cfg: &Config) -> S
     out
 }
 
+/// The k3s a running node runs (its image's tag), else the one a start runs.
+fn node_version<'a>(info: &'a serde_json::Value, cfg: &'a Config) -> &'a str {
+    if info["State"]["Status"] == "running" {
+        info["Config"]["Image"].as_str().and_then(|img| img.split_once(':').map(|(_, tag)| tag)).unwrap_or_else(|| cfg.version_tag())
+    } else {
+        cfg.version_tag()
+    }
+}
+
+/// `kiri k8s status --json`: what `format_status` says, as one object. A
+/// cluster not created has `state` null and no `port` yet.
+pub(crate) fn status_json(info: Option<&serde_json::Value>, cfg: &Config) -> serde_json::Value {
+    serde_json::json!({
+        "state": info.map(|i| i["State"]["Status"].as_str().unwrap_or("unknown")),
+        "version": info.map_or_else(|| cfg.version_tag(), |i| node_version(i, cfg)),
+        "port": info.map(|i| bound_port(i).unwrap_or(API_PORT)),
+        "requested_port": cfg.api_port(),
+        "lan": cfg.lan,
+        "tls_san": cfg.tls_san,
+        "k3s_args": cfg.k3s_args,
+        "context": CONTEXT.get(),
+    })
+}
+
 /// `kiri k8s set [--lan on|off] [--tls-san a,b] [--port N] [--version TAG|default] [--k3s-arg ARG]… [--clear-k3s-args]`:
 /// saves the settings and, if the cluster exists and they changed, recreates its node with them.
 fn set(args: &[String]) -> io::Result<()> {
-    let mut cfg = config();
+    let path = config_path()?;
+    let mut cfg = load_config_for_edit(&path)?;
     let before = cfg.clone();
     apply_set_args(&mut cfg, args)?;
     ensure_daemon()?;
@@ -365,7 +407,6 @@ fn set(args: &[String]) -> io::Result<()> {
     if port != before.api_port() && node.as_ref().and_then(bound_port) != Some(port) && !port_free(port, cfg.lan) {
         return Err(io::Error::other(format!("port {port} is in use on this Mac; choose another")));
     }
-    let path = config_path()?;
     save_config_to(&path, &cfg)?;
     println!("{}", format_settings(&cfg));
     let Some(node) = node else {
@@ -463,6 +504,10 @@ fn ok(r: io::Result<client::Response>) -> io::Result<client::Response> {
 
 pub fn run(args: &[String]) -> io::Result<()> {
     let what = args.first().map(String::as_str).unwrap_or("");
+    if args.iter().any(|a| matches!(a.as_str(), "-h" | "--help")) || what == "help" {
+        println!("{}", if what == "set" { USAGE_SET } else { USAGE_K8S });
+        return Ok(());
+    }
     let logged = matches!(what, "start" | "stop" | "delete" | "set");
     // A recreate from the command line (`kiri k8s set`) is attributed to this
     // op, so the node's stop is logged as `k8s set`, not as a memory kill. A
@@ -493,7 +538,7 @@ fn run_inner(args: &[String]) -> io::Result<()> {
             println!("Kubernetes stopped (its state is kept; `kiri k8s start` resumes it)");
             Ok(())
         }
-        Some("status") => status(),
+        Some("status") => status(flag("--json")),
         Some("delete") => delete(),
         Some("set") => set(&args[1..]),
         _ => Err(io::Error::other(USAGE_K8S)),
@@ -1005,15 +1050,23 @@ pub(crate) fn forget() {
     }
 }
 
-fn status() -> io::Result<()> {
+fn status(json: bool) -> io::Result<()> {
     ensure_daemon()?;
     let cfg = config();
     if !exists()? {
-        println!("{}", format_status(None, &cfg));
+        println!("{}", if json { status_json(None, &cfg).to_string() } else { format_status(None, &cfg) });
         return Ok(());
     }
     let info = client::get(&format!("/containers/{NAME}/json"))?;
     let state = info["State"]["Status"].as_str().unwrap_or("unknown").to_owned();
+    if json {
+        // The context is put right as below, quietly: the line stays JSON.
+        if state == "running" {
+            let _ = sync(Duration::ZERO);
+        }
+        println!("{}", status_json(Some(&info), &cfg));
+        return Ok(());
+    }
     println!("{}", format_status(Some(&info), &cfg));
     if state == "running" {
         // A context missing or out of date (written by an older Kiri, or not at all) is put right.
@@ -1045,6 +1098,41 @@ fn delete() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn editing_rejects_malformed_settings() {
+        let dir = std::env::temp_dir().join(format!("kiri-k8s-edit-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("k8s.json");
+        let bad = br#"{"lan":true,"port":6445,"tls_san":["#;
+        std::fs::write(&path, bad).unwrap();
+        let err = super::load_config_for_edit(&path)
+            .expect_err("malformed settings must not load as defaults");
+        assert!(
+            err.to_string().contains(&path.display().to_string()),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bad);
+
+        // No file yet: the defaults, so a first `kiri k8s set` still saves.
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            super::load_config_for_edit(&path).unwrap(),
+            super::Config::default()
+        );
+
+        std::fs::write(
+            &path,
+            br#"{"lan":true,"port":6445,"tls_san":["k8s.example"]}"#,
+        )
+        .unwrap();
+        let cfg = super::load_config_for_edit(&path).unwrap();
+        assert_eq!(
+            (cfg.port, cfg.tls_san),
+            (Some(6445), vec!["k8s.example".to_owned()])
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn the_port_comes_from_the_binding_then_the_label() {
         let running = serde_json::json!({"NetworkSettings": {"Ports": {"6443/tcp": [{"HostIp": "127.0.0.1", "HostPort": "6444"}]}}, "Config": {"Labels": {"dev.kiri.k8s.port": "6450"}}});
@@ -1289,6 +1377,12 @@ mod tests {
             super::format_status(Some(&running), &cfg),
             "Kubernetes: running, k3s v1.31.4-k3s1, API on 127.0.0.1:6443, k3s args: --flannel-backend=none --disable=traefik"
         );
+        let j = super::status_json(Some(&running), &cfg);
+        assert_eq!((&j["state"], &j["version"], &j["port"], &j["requested_port"]), (&"running".into(), &"v1.31.4-k3s1".into(), &6443.into(), &6443.into()));
+        assert_eq!(j["k3s_args"], serde_json::json!(["--flannel-backend=none", "--disable=traefik"]));
+        let none = super::status_json(None, &super::Config::default());
+        assert!(none["state"].is_null() && none["port"].is_null(), "{none}");
+        assert_eq!(none["version"], super::IMAGE.1);
     }
 
     #[test]

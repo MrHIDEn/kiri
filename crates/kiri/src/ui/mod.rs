@@ -216,11 +216,19 @@ fn json_str(out: &mut String, v: &str) {
     out.push('"');
 }
 
+fn spawn_op(f: impl FnOnce() + Send + 'static) {
+    let op = diag::op();
+    std::thread::spawn(move || {
+        let _op = op.map(diag::enter_op);
+        f();
+    });
+}
+
 /// The engine thread: a client of `kiri daemon`. It answers the window's
 /// commands and sends it the daemon's lists whenever an event says they
 /// changed, so the page never polls.
 fn engine(rx: Receiver<Cmd>, tx: Sender<Cmd>) {
-    watch(tx);
+    watch(tx.clone());
     let mut connected = false;
     // A command that came while a burst of refreshes was being gathered: it's next.
     let mut next = None;
@@ -282,40 +290,43 @@ fn engine(rx: Receiver<Cmd>, tx: Sender<Cmd>) {
                 refresh(&mut connected);
             }
             Ok(Cmd::Pull(name)) => pull(name),
-            Ok(Cmd::Run(name, env)) => {
+            Ok(Cmd::Run(name, env)) => spawn_op(move || {
                 // The page shows Starting… until this says how it went.
                 let result = run_image(&name, &env);
                 emit(serde_json::json!({"type": "ran", "name": name, "error": result.is_err()}).to_string());
-                act("run", result)
-            }
+                act("run", result);
+            }),
             Ok(Cmd::RemoveImage(name, with)) => {
-                // The stopped containers made from it go first, never forced: a
-                // running one refuses, and then the image stays too.
-                let mut blocked = None;
-                for id in &with {
-                    match client::request("DELETE", &format!("/containers/{}", path_escape(id)), None) {
-                        Ok(r) if r.ok() || r.status == 404 => {}
-                        Ok(r) => blocked = Some(trf("Kept {name}: {container} couldn't be removed ({error})", &[("name", &name), ("container", &container_name(id)), ("error", &r.error())])),
-                        Err(e) => blocked = Some(trf("Kept {name}: {error}", &[("name", &name), ("error", &e)])),
-                    }
-                    if blocked.is_some() {
-                        break;
-                    }
-                }
-                match blocked {
-                    Some(why) => emit(notice("error", &why)),
-                    None => match client::request("DELETE", &format!("/images/{}", path_escape(&name)), None) {
-                        Ok(r) if r.ok() => {
-                            // Only untagged when another name still points at it: nothing freed.
-                            let deleted = r.json().as_array().is_some_and(|a| a.iter().any(|v| v.get("Deleted").is_some()));
-                            emit(serde_json::json!({"type": "removed", "name": name, "deleted": deleted}).to_string());
+                let tx = tx.clone();
+                spawn_op(move || {
+                    // The stopped containers made from it go first, never forced: a
+                    // running one refuses, and then the image stays too.
+                    let mut blocked = None;
+                    for id in &with {
+                        match client::request("DELETE", &format!("/containers/{}", path_escape(id)), None) {
+                            Ok(r) if r.ok() || r.status == 404 => {}
+                            Ok(r) => blocked = Some(trf("Kept {name}: {container} couldn't be removed ({error})", &[("name", &name), ("container", &container_name(id)), ("error", &r.error())])),
+                            Err(e) => blocked = Some(trf("Kept {name}: {error}", &[("name", &name), ("error", &e)])),
                         }
-                        Ok(r) => emit(notice("error", &image_refusal(&name, &r.error()))),
-                        Err(e) => emit(notice("error", &e.to_string())),
-                    },
-                }
-                // Older daemons send no image events: refresh by hand.
-                refresh(&mut connected);
+                        if blocked.is_some() {
+                            break;
+                        }
+                    }
+                    match blocked {
+                        Some(why) => emit(notice("error", &why)),
+                        None => match client::request("DELETE", &format!("/images/{}", path_escape(&name)), None) {
+                            Ok(r) if r.ok() => {
+                                // Only untagged when another name still points at it: nothing freed.
+                                let deleted = r.json().as_array().is_some_and(|a| a.iter().any(|v| v.get("Deleted").is_some()));
+                                emit(serde_json::json!({"type": "removed", "name": name, "deleted": deleted}).to_string());
+                            }
+                            Ok(r) => emit(notice("error", &image_refusal(&name, &r.error()))),
+                            Err(e) => emit(notice("error", &e.to_string())),
+                        },
+                    }
+                    // Older daemons send no image events: refresh by hand.
+                    let _ = tx.send(Cmd::Refresh);
+                });
             }
             Ok(Cmd::Container { action, id }) => {
                 let (method, path) = match action.as_str() {
@@ -323,35 +334,40 @@ fn engine(rx: Receiver<Cmd>, tx: Sender<Cmd>) {
                     a @ ("start" | "stop" | "restart" | "pause" | "unpause") => ("POST", format!("/containers/{id}/{a}")),
                     _ => continue,
                 };
-                let result = expect_done(client::request(method, &path, None));
-                // Refused to start (a port taken): the container's page says why.
-                if let (Err(e), "start") = (&result, action.as_str()) {
-                    emit(serde_json::json!({"type": "startfailed", "id": id, "error": e.to_string()}).to_string());
-                }
-                act(&action, result);
+                spawn_op(move || {
+                    let result = expect_done(client::request(method, &path, None));
+                    // Refused to start (a port taken): the container's page says why.
+                    if let (Err(e), "start") = (&result, action.as_str()) {
+                        emit(serde_json::json!({"type": "startfailed", "id": id, "error": e.to_string()}).to_string());
+                    }
+                    act(&action, result);
+                });
             }
-            Ok(Cmd::RemoveVolume(name)) => act("rmvol", expect_ok(client::request("DELETE", &format!("/volumes/{}", path_escape(&name)), None))),
-            Ok(Cmd::Ports { id, ports }) => act("ports", set_ports(&id, ports)),
-            Ok(Cmd::Env { id, env }) => act("env", set_env(&id, env)),
-            Ok(Cmd::About) => about(),
+            Ok(Cmd::RemoveVolume(name)) => spawn_op(move || act("rmvol", expect_ok(client::request("DELETE", &format!("/volumes/{}", path_escape(&name)), None)))),
+            Ok(Cmd::Ports { id, ports }) => spawn_op(move || act("ports", set_ports(&id, ports))),
+            Ok(Cmd::Env { id, env }) => spawn_op(move || act("env", set_env(&id, env))),
+            Ok(Cmd::About) => spawn_op(about),
             Ok(Cmd::Domains(on)) => {
-                let result = if on { setup::domains() } else { setup::remove_domains() };
-                // Cancelling macOS's password prompt is a choice, not an error.
-                match result {
-                    Err(e) if !e.to_string().contains("-128") => emit(notice("error", &trf("Could not change container names: {error}", &[("error", &e)]))),
-                    _ if crate::daemon::dns::installed() => emit(notice("ok", &tr("Containers now answer at <name>.kiri.local"))),
-                    _ if !on => emit(notice("ok", &tr("Containers answer at <name>.kiri.localhost"))),
-                    _ => {}
-                }
-                // /var/run/docker.sock was asked for with the same password.
-                if let Some(note) = setup::docker_socket_note().filter(|_| on) {
-                    emit(notice("ok", &note));
-                }
-                emit(domains_event());
-                emit_docker_state();
-                refresh(&mut connected);
+                let tx = tx.clone();
+                spawn_op(move || {
+                    let result = if on { setup::domains() } else { setup::remove_domains() };
+                    // Cancelling macOS's password prompt is a choice, not an error.
+                    match result {
+                        Err(e) if !e.to_string().contains("-128") => emit(notice("error", &trf("Could not change container names: {error}", &[("error", &e)]))),
+                        _ if crate::daemon::dns::installed() => emit(notice("ok", &tr("Containers now answer at <name>.kiri.local"))),
+                        _ if !on => emit(notice("ok", &tr("Containers answer at <name>.kiri.localhost"))),
+                        _ => {}
+                    }
+                    // /var/run/docker.sock was asked for with the same password.
+                    if let Some(note) = setup::docker_socket_note().filter(|_| on) {
+                        emit(notice("ok", &note));
+                    }
+                    emit(domains_event());
+                    emit_docker_state();
+                    let _ = tx.send(Cmd::Refresh);
+                });
             }
-            Ok(Cmd::TakeSocket) => {
+            Ok(Cmd::TakeSocket) => spawn_op(|| {
                 match setup::docker_socket() {
                     Ok(()) if setup::docker_sock() == crate::dockerctx::Endpoint::Kiri => {
                         emit(notice("ok", &tr("/var/run/docker.sock now points to Kiri")));
@@ -366,8 +382,8 @@ fn engine(rx: Receiver<Cmd>, tx: Sender<Cmd>) {
                     Err(_) => {}
                 }
                 emit_docker_state();
-            }
-            Ok(Cmd::RemoveNetwork(id)) => act("rmnet", expect_ok(client::request("DELETE", &format!("/networks/{id}"), None))),
+            }),
+            Ok(Cmd::RemoveNetwork(id)) => spawn_op(move || act("rmnet", expect_ok(client::request("DELETE", &format!("/networks/{id}"), None)))),
             Ok(Cmd::Quit) | Err(RecvTimeoutError::Disconnected) => {
                 quit_with(
                     stop_on_quit(),
@@ -744,6 +760,40 @@ fn storage_status() {
     }
 }
 
+/// Volumes view: reads each volume's disk usage asynchronously without waking
+/// a sleeping VM or blocking `refresh()`. Single-flight with coalesced re-run
+/// so repeated UI messages never accumulate background threads.
+fn spawn_volume_sizes() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static BUSY: AtomicBool = AtomicBool::new(false);
+    static RERUN: AtomicBool = AtomicBool::new(false);
+
+    if BUSY.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        RERUN.store(true, Ordering::Release);
+        return;
+    }
+    std::thread::spawn(|| {
+        struct Guard<'a>(&'a AtomicBool);
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _guard = Guard(&BUSY);
+        loop {
+            RERUN.store(false, Ordering::Release);
+            let sizes = client::get_background("/kiri/volumes/sizes")
+                .ok()
+                .and_then(|v| v.get("sizes").filter(|s| s.is_object()).cloned())
+                .unwrap_or_else(|| serde_json::json!({}));
+            emit(serde_json::json!({"type": "volumesizes", "sizes": sizes}).to_string());
+            if !RERUN.swap(false, Ordering::AcqRel) {
+                break;
+            }
+        }
+    });
+}
+
 /// Validates a proposed storage folder and emits `storagecheck` to the page.
 fn storage_check(path: Option<String>, fresh: bool, reset: bool) {
     let mut body = serde_json::json!({"fresh": fresh});
@@ -965,20 +1015,19 @@ fn builder_settings(save: Option<serde_json::Value>) {
 
 #[cfg(target_os = "macos")]
 fn vm_net(save: Option<serde_json::Value>) {
-    if let Some(body) = save {
-        if let Some(enabled) = body["shared_nat"].as_bool() {
-            match crate::vm_cli::set_shared_nat(enabled) {
-                Ok(()) => emit(notice("ok", &tr("Outbound VM traffic setting saved. Restart the VM to apply."))),
-                Err(e) => emit(notice("error", &trf("Could not save VM networking setting: {error}", &[("error", &e)]))),
-            }
-        }
-    }
+    let saved = save.and_then(|body| body["shared_nat"].as_bool().map(crate::vm_cli::set_shared_nat));
     let configured = crate::daemon::engine::vm_shared_nat_config();
     let env_override = crate::daemon::engine::shared_nat_env();
     let effective = env_override.or(configured).unwrap_or(true);
     let info = client::get_background("/info").ok();
     let awake = info.as_ref().is_some_and(|i| i["KiriVmAwake"] == true);
+    let running = info.as_ref().is_some_and(|i| awake || i["KiriStopped"] != true);
     let running_shared_nat = awake.then(|| info.as_ref().and_then(|i| i["KiriVmUplink"]["mode"].as_str()).is_none_or(|m| m != "host-egress"));
+    match saved {
+        Some(Ok(())) => emit(serde_json::json!({"type": "notice", "kind": "ok", "text": tr("Outbound VM traffic setting saved. Restart the VM to apply."), "act": if running { "restartvm" } else { "" }}).to_string()),
+        Some(Err(e)) => emit(notice("error", &trf("Could not save VM networking setting: {error}", &[("error", &e)]))),
+        None => {}
+    }
     emit(
         serde_json::json!({
             "type": "vmnet",
@@ -1041,14 +1090,14 @@ fn resources(save: Option<serde_json::Value>) {
     let saved = save.map(|body| client::request("POST", "/kiri/resources", Some(&body)));
     let now = client::get("/kiri/resources");
     match saved {
-        // While the VM runs, the toast offers to restart it now.
+        // While the engine is on (awake or resting), the toast offers to restart it now.
         Some(Ok(r)) if r.ok() => {
-            let awake = now.as_ref().is_ok_and(|v| v["awake"] == true);
+            let running = now.as_ref().is_ok_and(|v| v["awake"] == true || !engine_stopped());
             #[cfg(target_os = "linux")]
             let text = tr("Saved. The engine uses these from its next start");
             #[cfg(not(target_os = "linux"))]
             let text = tr("Saved. The VM uses these from its next start");
-            emit(serde_json::json!({"type": "notice", "kind": "ok", "text": text, "act": if awake { "restartvm" } else { "" }}).to_string());
+            emit(serde_json::json!({"type": "notice", "kind": "ok", "text": text, "act": if running { "restartvm" } else { "" }}).to_string());
         }
         Some(Ok(r)) => emit(notice("error", &r.error())),
         Some(Err(e)) => emit(notice("error", &e.to_string())),
@@ -1144,6 +1193,7 @@ fn restart_engine_now() {
         }
         Err(e) => {
             diag::error!("the engine did not restart", error = e);
+            emit(serde_json::json!({"type": "enginerestarted", "error": e.to_string()}).to_string());
             emit(notice("error", &trf("Could not restart the engine: {error}", &[("error", &e)])));
             if let Some(v) = client::request("GET", "/version", None).ok().filter(|r| r.ok()).and_then(|r| client::kiri_version(&r.json()).map(str::to_owned))
                 && update::newer(env!("CARGO_PKG_VERSION"), &v)
@@ -1496,7 +1546,7 @@ fn ensure_daemon() -> io::Result<()> {
     if client::alive() {
         if stop_on_quit() && engine_stopped() {
             clear_stopped_marker();
-            let _ = client::request("POST", "/kiri/wake", None);
+            expect_ok(client::request("POST", "/kiri/wake", None))?;
         }
         return Ok(());
     }
@@ -2189,16 +2239,18 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
             if msg.name == "theme" {
                 window::set_appearance(msg.value.as_str().unwrap_or("system"));
             }
-            if msg.name == "startAtLogin"
-                && let Some(on) = msg.value.as_bool()
-                && let Err(e) = setup::set_start_at_login(on)
-            {
-                diag::warn!("could not change start at sign-in", on = on, error = e);
-                emit(notice("error", &e.to_string()));
-                emit(serde_json::json!({"type": "prefs", "prefs": prefs()}).to_string());
-                return;
-            }
+            let start_login = (msg.name == "startAtLogin").then(|| msg.value.as_bool()).flatten();
             set_pref(&msg.name, msg.value);
+            if let Some(on) = start_login {
+                std::thread::spawn(move || {
+                    if let Err(e) = setup::set_start_at_login(on) {
+                        diag::warn!("could not change start at sign-in", on = on, error = e);
+                        set_pref("startAtLogin", (!on).into());
+                        emit(notice("error", &e.to_string()));
+                        emit(serde_json::json!({"type": "prefs", "prefs": prefs()}).to_string());
+                    }
+                });
+            }
             Ok(())
         }
         // A language the page doesn't carry yet (it opens with one): its words,
@@ -2308,13 +2360,14 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
             Ok(())
         }
         "savesbom" => {
-            match crate::scan::save_sbom(&msg.name, msg.id.parse().unwrap_or(0), &msg.path) {
+            let (name, at, path) = (msg.name, msg.id.parse().unwrap_or(0), msg.path);
+            std::thread::spawn(move || match crate::scan::save_sbom(&name, at, &path) {
                 Ok(to) => {
                     emit(notice("ok", &trf("Saved the SBOM to Downloads as {file}", &[("file", &to.file_name().unwrap_or_default().to_string_lossy())])));
                     reveal(&to);
                 }
                 Err(e) => emit(notice("error", &trf("Could not save the SBOM: {error}", &[("error", &e)]))),
-            }
+            });
             Ok(())
         }
         // Share: public links for a port or container, and the Share account.
@@ -2456,14 +2509,17 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
         }
         // Which engine plain `docker` uses: Kiri, or back to the one before.
         "usecontext" => {
-            let result = setup::use_context(&msg.name);
-            emit_docker_state();
-            emit(serde_json::json!({"type": "usedcontext", "name": msg.name, "error": result.as_ref().err().map(|e| e.to_string())}).to_string());
+            let name = msg.name;
+            std::thread::spawn(move || {
+                let result = setup::use_context(&name);
+                emit_docker_state();
+                emit(serde_json::json!({"type": "usedcontext", "name": name, "error": result.as_ref().err().map(|e| e.to_string())}).to_string());
+            });
             Ok(())
         }
         // Settings → Network: Docker socket state and taking /var/run/docker.sock when free.
         "dockersock" => {
-            emit_docker_state();
+            std::thread::spawn(emit_docker_state);
             Ok(())
         }
         "takesocket" => tx.send(Cmd::TakeSocket),
@@ -2576,6 +2632,10 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
             std::thread::spawn(storage_status);
             Ok(())
         }
+        "volumesizes" => {
+            spawn_volume_sizes();
+            Ok(())
+        }
         "storagepick" => {
             window::pick_folder(&tr("Choose a storage folder"), |path| {
                 if let Some(p) = path {
@@ -2668,14 +2728,22 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
             Ok(())
         }
         "restartvm" => {
-            std::thread::spawn(|| {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
                 let _op = diag::enter_op(diag::new_op("restartvm"));
-                let result = expect_ok(client::request("POST", "/kiri/sleep", None)).and_then(|()| expect_ok(client::request("POST", "/kiri/wake", None)));
+                emit(state("stopping", None));
+                let result = expect_ok(client::request("POST", "/kiri/sleep", None)).and_then(|()| {
+                    emit(state("booting", None));
+                    expect_ok(client::request("POST", "/kiri/wake", None))
+                });
+                emit(serde_json::json!({"type": "vmrestarted", "ok": result.is_ok()}).to_string());
                 match result {
                     Ok(()) => emit(notice("ok", &tr("The Linux VM restarted with the new resources"))),
                     Err(e) => emit(notice("error", &trf("Could not restart the VM: {error}", &[("error", &e)]))),
                 }
                 resources(None);
+                vm_net(None);
+                let _ = tx.send(Cmd::Refresh);
             });
             Ok(())
         }
@@ -2747,9 +2815,12 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
             Ok(())
         }
         "terminal" => {
-            if let Err(e) = detail::terminal(&msg.name) {
-                emit(notice("error", &trf("Could not open Terminal: {error}", &[("error", &e)])));
-            }
+            let name = msg.name;
+            std::thread::spawn(move || {
+                if let Err(e) = detail::terminal(&name) {
+                    emit(notice("error", &trf("Could not open Terminal: {error}", &[("error", &e)])));
+                }
+            });
             Ok(())
         }
         "files" => {
@@ -2761,19 +2832,23 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
             Ok(())
         }
         "download" => {
-            match detail::download(&msg.name, &msg.path) {
+            let (name, path) = (msg.name, msg.path);
+            std::thread::spawn(move || match detail::download(&name, &path) {
                 Ok(to) => {
                     emit(notice("ok", &trf("Saved to Downloads as {file}", &[("file", &to.file_name().unwrap_or_default().to_string_lossy())])));
                     reveal(&to);
                 }
                 Err(e) => emit(notice("error", &trf("Could not save the file: {error}", &[("error", &e)]))),
-            }
+            });
             Ok(())
         }
         "reveal" => {
-            if let Err(e) = detail::reveal(&msg.name, &msg.path) {
-                emit(notice("error", &e.to_string()));
-            }
+            let (name, path) = (msg.name, msg.path);
+            std::thread::spawn(move || {
+                if let Err(e) = detail::reveal(&name, &path) {
+                    emit(notice("error", &e.to_string()));
+                }
+            });
             Ok(())
         }
         // Only the container's own addresses: a page cannot open arbitrary URLs.
@@ -2781,7 +2856,7 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
             let local = msg.name.strip_prefix("http://").or_else(|| msg.name.strip_prefix("https://")).and_then(|r| r.split(['/', ':']).next()).is_some_and(|h| h == "localhost" || h.ends_with(".kiri.localhost") || h.ends_with(".kiri.local"));
             // A build warning's rule page (docs.docker.com/go/dockerfile/rule/…).
             let docs = msg.name.strip_prefix("https://docs.docker.com/go/").is_some_and(|rest| rest.bytes().all(|b| b.is_ascii_alphanumeric() || b"-/".contains(&b)));
-            if local || docs || msg.name == "https://runkiri.com" || msg.name == "https://runkiri.com/share/notice" || msg.name == "https://canestack.com" || msg.name == "https://github.com/libracoder/kiri/issues/new" || msg.name == "https://github.com/libracoder/kiri" || msg.name == "https://github.com/anchore/grype" || msg.name == "https://login.docker.com/activate" || msg.name == "https://github.com/login/device" {
+            if local || docs || msg.name == "https://runkiri.com" || msg.name == "https://runkiri.com/releases/" || msg.name == "https://runkiri.com/share/notice" || msg.name == "https://canestack.com" || msg.name == "https://discord.gg/K5A8wuqcC" || msg.name == "https://x.com/runkiri" || msg.name == "https://github.com/libracoder/kiri/issues/new" || msg.name == "https://github.com/libracoder/kiri" || msg.name == "https://github.com/anchore/grype" || msg.name == "https://login.docker.com/activate" || msg.name == "https://github.com/login/device" {
                 open(&msg.name);
             }
             Ok(())
@@ -2895,13 +2970,12 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
             if std::env::var_os("KIRI_STAR_PROMPT").is_some() {
                 emit(r#"{"type":"starprompt"}"#.to_owned());
             }
-            // Kiri Lite: fetch the docker CLI, Compose and buildx the
-            // first time, unless this Mac already has a docker CLI.
-            if crate::tools::lite() && !crate::tools::installed() && !other_docker_cli() {
-                setup_tools();
+            ask_language();
+            // The first time the app opens: ask, once, whether to use *.kiri.local (the Mac only, so far).
+            if cfg!(target_os = "macos") && !crate::flavor::dev() && !crate::daemon::dns::installed() && prefs()["domainsAsked"] != true {
+                set_pref("domainsAsked", true.into());
+                emit(r#"{"type":"welcome"}"#.to_owned());
             }
-            emit(domains_event());
-            emit_docker_state();
             std::thread::spawn(storage_status);
             // A crash since the window last opened, for the page to
             // offer a report; crash files go if the person allowed it.
@@ -2916,12 +2990,6 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
             // engine still on an older build.
             std::thread::spawn(|| update_check(false));
             recheck::start(|| feed_check(false));
-            ask_language();
-            // The first time the app opens: ask, once, whether to use *.kiri.local (the Mac only, so far).
-            if cfg!(target_os = "macos") && !crate::flavor::dev() && !crate::daemon::dns::installed() && prefs()["domainsAsked"] != true {
-                set_pref("domainsAsked", true.into());
-                emit(r#"{"type":"welcome"}"#.to_owned());
-            }
             // Another engine is here and nobody has chosen: ask once which
             // builder docker build uses (after the welcome, if that shows).
             std::thread::spawn(|| {
@@ -2930,38 +2998,53 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
                 }
                 emit(crate::buildwith::event());
             });
-            // Linux: Kiri checks it can run containers for this account
-            // first; until it can, the page shows the setup checklist and
-            // nothing starts (its Open Kiri sends "onbopen").
-            #[cfg(target_os = "linux")]
-            {
-                let checks = linux::onboarding::checks();
-                if linux::onboarding::needed(&checks) {
-                    emit(checks.to_string());
-                    return;
+            // Subprocess and socket probes run off the main UI thread so the
+            // window stays responsive from its first frame.
+            let tx = tx.clone();
+            let _ = std::thread::Builder::new().name("kiri-ready".into()).spawn(move || {
+                // Kiri Lite: fetch the docker CLI, Compose and buildx the
+                // first time, unless this Mac already has a docker CLI.
+                if crate::tools::lite() && !crate::tools::installed() && !other_docker_cli() {
+                    setup_tools();
                 }
-            }
-            // The Mac: the first launch's steps that failed wait in the same
-            // checklist, over a window that works (the engine starts anyway).
-            #[cfg(target_os = "macos")]
-            {
-                let checks = macsetup::checks();
-                if macsetup::needed(&checks) {
-                    emit(checks.to_string());
+                emit(domains_event());
+                emit_docker_state();
+                // Linux: Kiri checks it can run containers for this account
+                // first; until it can, the page shows the setup checklist and
+                // nothing starts (its Open Kiri sends "onbopen").
+                #[cfg(target_os = "linux")]
+                {
+                    let checks = linux::onboarding::checks();
+                    if linux::onboarding::needed(&checks) {
+                        emit(checks.to_string());
+                        return;
+                    }
                 }
-            }
-            let _ = tx.send(Cmd::Refresh);
-            // Opening the window reaches the engine (starting its service if it
-            // isn't running) but doesn't wake it: asleep, it reads Ready, and the
-            // next docker command or action wakes it. One someone stopped waits
-            // for Start, unless quitting stopped it (stopOnQuit).
-            if (autostart || cfg!(target_os = "macos") || stop_on_quit()) && (!engine_stopped() || stop_on_quit()) { tx.send(Cmd::Connect) } else { Ok(()) }
+                // The Mac: the first launch's steps that failed wait in the same
+                // checklist, over a window that works (the engine starts anyway).
+                #[cfg(target_os = "macos")]
+                {
+                    let checks = macsetup::checks();
+                    if macsetup::needed(&checks) {
+                        emit(checks.to_string());
+                    }
+                }
+                let _ = tx.send(Cmd::Refresh);
+                // Opening the window reaches the engine (starting its service if it
+                // isn't running) but doesn't wake it: asleep, it reads Ready, and the
+                // next docker command or action wakes it. One someone stopped waits
+                // for Start, unless quitting stopped it (stopOnQuit).
+                if (autostart || cfg!(target_os = "macos") || stop_on_quit()) && (!engine_stopped() || stop_on_quit()) {
+                    let _ = tx.send(Cmd::Connect);
+                }
+            });
+            Ok(())
         }
         // The Linux setup checklist: check again, fix one or "all", open the
         // window once it's ready, or sign in again for the group to apply.
         #[cfg(target_os = "linux")]
         "onbcheck" => {
-            emit(linux::onboarding::checks().to_string());
+            std::thread::spawn(|| emit(linux::onboarding::checks().to_string()));
             Ok(())
         }
         #[cfg(target_os = "linux")]

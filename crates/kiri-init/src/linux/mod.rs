@@ -11,12 +11,14 @@ mod fsview;
 mod hostopts;
 mod inroot;
 mod layers;
+mod localtime;
 mod net;
 mod netlink;
 mod pid1;
 mod relay;
 mod roots;
 mod seccomp;
+mod swap;
 mod sys;
 mod tarnum;
 mod transport;
@@ -220,9 +222,14 @@ fn mount_kernel_filesystems() -> io::Result<()> {
 fn host_dirs() -> io::Result<container::Paths> {
     // SAFETY: umask only changes this process's file-creation mask.
     unsafe { libc::umask(0o022) };
+    // Claim the network namespace BEFORE touching `/var/lib/kiri` mounts so a
+    // second engine never detaches a running engine's mount before failing.
+    net::claim_host_netns()?;
     let root = PathBuf::from(DATA);
     if let Some(data) = std::env::var_os("KIRI_AGENT_DATA").map(PathBuf::from).filter(|p| p.is_absolute() && p != &root) {
         mount_agent_data(&data, &root)?;
+    } else {
+        detach_deleted_bind_mount(&root);
     }
     if let Some(kind) = sys::detect_readonly_fs(&root) {
         return Err(sys::readonly_storage_error(kind));
@@ -294,6 +301,32 @@ fn mount_agent_data(src: &std::path::Path, target: &std::path::Path) -> io::Resu
     let c_src = CString::new(src.as_os_str().as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
     // SAFETY: valid NUL-terminated paths for a bind mount (fstype and data unused).
     check(unsafe { libc::mount(c_src.as_ptr(), c_target.as_ptr(), std::ptr::null(), libc::MS_BIND, std::ptr::null()) } as _, "bind-mount KIRI_AGENT_DATA").map(drop)
+}
+
+/// If `target` (`/var/lib/kiri`) is currently covered by a stale bind mount
+/// whose backing directory was deleted (`st_nlink == 0`), detaches it so
+/// `create_dir_all` can use the underlying `/var/lib/kiri` directory instead
+/// of failing with `ENOENT`. Real filesystem roots always have `st_nlink >= 2`.
+fn detach_deleted_bind_mount(target: &std::path::Path) {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    let Ok(c_target) = CString::new(target.as_os_str().as_bytes()) else { return };
+    for _ in 0..4 {
+        let Ok(md) = std::fs::symlink_metadata(target) else { break };
+        if md.file_type().is_symlink() || md.nlink() != 0 {
+            break;
+        }
+        if !std::fs::read_to_string("/proc/self/mountinfo").is_ok_and(|m| is_mounted_at(&m, target)) {
+            break;
+        }
+        // SAFETY: valid NUL-terminated non-symlink mountpoint; `UMOUNT_NOFOLLOW`
+        // prevents following any racing symlink replacement.
+        if unsafe { libc::umount2(c_target.as_ptr(), libc::MNT_DETACH | libc::UMOUNT_NOFOLLOW) } != 0 {
+            eprintln!("kiri-init: detach deleted bind mount on {}: {}", target.display(), io::Error::last_os_error());
+            break;
+        }
+    }
 }
 
 /// Whether `/proc/self/mountinfo` lists a mount whose target is `target`.
@@ -675,6 +708,8 @@ fn data_dirs() -> io::Result<container::Paths> {
     // Overlay lower dirs are given relative to the layer store.
     std::env::set_current_dir(&paths.layers)?;
     if disk.is_ok() {
+        // On the data disk only: swap in the tmpfs fallback would be memory.
+        swap::start();
         trim::start(DATA);
     }
     Ok(paths)

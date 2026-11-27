@@ -1,5 +1,6 @@
 //! `kiri k8s`, `kiri machine`, `kiri diag`, `kiri usb`, `kiri domains`,
-//! `kiri registry` and `kiri scan` on Windows: the engine's own
+//! `kiri registry`, `kiri scan` and `kiri storage` on Windows (and the
+//! engine's half of `kiri doctor`, doctor.rs): the engine's own
 //! commands, run by the Linux `kiri` in the WSL distro Kiri's engine lives
 //! in, as the engine runs (root, with its HOME), so it finds the daemon's
 //! socket and store. `kiri diag report [--out PATH]` writes the report file
@@ -193,17 +194,33 @@ pub(crate) fn clear_stopped_marker_at(path: &Path) {
     let _ = std::fs::remove_file(path);
 }
 
-fn clear_stopped_marker() {
+pub(crate) fn write_stopped_marker_at(path: &Path) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, b"");
+}
+
+pub(crate) fn clear_stopped_marker() {
     if let Some(dir) = std::env::var_os("LOCALAPPDATA") {
         clear_stopped_marker_at(&stopped_marker_in(&PathBuf::from(dir)));
     }
 }
 
-/// Sends `POST /kiri/wake` over an open pipe/stream so a running `kiri-win.exe`
-/// clears its in-memory `STOPPED` gate, removes `%LOCALAPPDATA%\Kiri\stopped`,
-/// boots WSL, and updates the window/tray immediately.
-pub(crate) fn wake_over_stream(mut stream: impl Read + Write) -> io::Result<()> {
-    stream.write_all(b"POST /kiri/wake HTTP/1.1\r\nHost: kiri\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")?;
+pub(crate) fn write_stopped_marker() {
+    if let Some(dir) = std::env::var_os("LOCALAPPDATA") {
+        write_stopped_marker_at(&stopped_marker_in(&PathBuf::from(dir)));
+    }
+}
+
+/// Sends a control `POST` (`POST /kiri/wake` or `POST /kiri/stop`) over an open
+/// pipe/stream so a running `kiri-win.exe` updates its stopped gate, marker,
+/// WSL distro, and window/tray immediately.
+pub(crate) fn post_over_stream(mut stream: impl Read + Write, endpoint: &str) -> io::Result<()> {
+    write!(
+        stream,
+        "POST {endpoint} HTTP/1.1\r\nHost: kiri\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+    )?;
     stream.flush()?;
     let mut r = BufReader::new(stream);
     let mut status_line = String::new();
@@ -265,8 +282,16 @@ pub(crate) fn wake_over_stream(mut stream: impl Read + Write) -> io::Result<()> 
     Err(io::Error::other(msg))
 }
 
+pub(crate) fn wake_over_stream(stream: impl Read + Write) -> io::Result<()> {
+    post_over_stream(stream, "/kiri/wake")
+}
+
+pub(crate) fn stop_over_stream(stream: impl Read + Write) -> io::Result<()> {
+    post_over_stream(stream, "/kiri/stop")
+}
+
 #[cfg(windows)]
-fn wake_via_pipe(pipe_name: &str) -> Option<io::Result<()>> {
+fn post_via_pipe(pipe_name: &str, endpoint: &str) -> Option<io::Result<()>> {
     use std::os::windows::fs::OpenOptionsExt;
     const ERROR_PIPE_BUSY: i32 = 231;
     const SECURITY_IDENTIFICATION: u32 = 0x0001_0000;
@@ -278,7 +303,7 @@ fn wake_via_pipe(pipe_name: &str) -> Option<io::Result<()>> {
             .security_qos_flags(SECURITY_IDENTIFICATION)
             .open(pipe_name)
         {
-            Ok(file) => return Some(wake_over_stream(file)),
+            Ok(file) => return Some(post_over_stream(file, endpoint)),
             Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
@@ -288,13 +313,83 @@ fn wake_via_pipe(pipe_name: &str) -> Option<io::Result<()>> {
     None
 }
 
+#[cfg(windows)]
+pub(crate) fn wake_via_pipe(pipe_name: &str) -> Option<io::Result<()>> {
+    post_via_pipe(pipe_name, "/kiri/wake")
+}
+
+#[cfg(windows)]
+pub(crate) fn stop_via_pipe(pipe_name: &str) -> Option<io::Result<()>> {
+    post_via_pipe(pipe_name, "/kiri/stop")
+}
+
 #[cfg(not(windows))]
-fn wake_via_pipe(_pipe_name: &str) -> Option<io::Result<()>> {
+pub(crate) fn wake_via_pipe(_pipe_name: &str) -> Option<io::Result<()>> {
     None
+}
+
+#[cfg(not(windows))]
+pub(crate) fn stop_via_pipe(_pipe_name: &str) -> Option<io::Result<()>> {
+    None
+}
+
+/// Usage text for WSL-forwarded commands when `-h` / `--help` is passed on
+/// Windows, so asking for help never wakes WSL or executes side effects (#982).
+/// For `kiri machine shell NAME -- <cmd> --help`, stops scanning at `--` so
+/// `--help` meant for the container command passes through untouched.
+pub(crate) fn help_for(args: &[String]) -> Option<&'static str> {
+    let cmd = args.first()?.as_str();
+    let sub = &args[1..];
+    let scan_end = if cmd == "machine" && sub.first().map(String::as_str) == Some("shell") {
+        sub.iter().position(|a| a == "--").unwrap_or(sub.len())
+    } else {
+        sub.len()
+    };
+    let has_flag = sub[..scan_end].iter().any(|a| matches!(a.as_str(), "-h" | "--help"));
+    let help_word = sub.first().map(String::as_str) == Some("help")
+        && matches!(cmd, "k8s" | "machine" | "diag" | "usb" | "domains" | "registry" | "storage");
+    if !has_flag && !help_word {
+        return None;
+    }
+    match cmd {
+        "start" => Some("usage: kiri start                 start Kiri after a Stop (the window's Start)"),
+        "k8s" if sub.first().map(String::as_str) == Some("set") => Some(
+            "usage: kiri k8s set [--lan on|off] [--tls-san NAME,…] [--port N] [--version TAG|default] [--k3s-arg ARG]… [--clear-k3s-args]",
+        ),
+        "k8s" => Some(
+            "usage: kiri k8s start [--use] | stop | status [--json] | delete | set [--lan on|off] [--tls-san NAME,…] [--port N] [--version TAG|default] [--k3s-arg ARG]… [--clear-k3s-args]",
+        ),
+        "machine" => Some(
+            "usage: kiri machine create NAME [--distro ubuntu|debian|alpine|fedora|arch|rocky|opensuse | --image IMAGE] [--systemd]\n       kiri machine list [--json] | shell NAME [-- CMD...] | start | stop | restart | delete NAME",
+        ),
+        "diag" => Some(
+            "usage: kiri diag logs [-f] [--ui|--engine|--cli] [--errors] [--op ID] [-n N]\n       kiri diag report [--out PATH] [--send]",
+        ),
+        "usb" => Some(
+            "usage: kiri usb [list [--json]] | attach DEVICE | detach DEVICE\n    DEVICE is a location (0x02114000), vendor:product (1532:00d7) or part of the name",
+        ),
+        "domains" => Some(
+            "usage: kiri domains                          the routers' ports, and whether each runs\n       kiri domains set [--http N] [--https N]   move them (no restart)\n       kiri domains reset                    back to the ports a start gives (a test copy's: off)\n       --json, with any of them, prints the engine's answer as one line of JSON",
+        ),
+        "registry" => Some(
+            "usage: kiri registry                                  both lists and the file they are in\n       kiri registry insecure [list] | add HOST... | remove HOST...\n       kiri registry mirror [list] | add URL... | remove URL...\n       --json, with any of them: one line of JSON",
+        ),
+        "scan" => Some(
+            "usage: kiri scan [--json] [--history] <image>\n       --json     the full report, as JSON\n       --history  the image's kept scans, newest first, without scanning again",
+        ),
+        "storage" => Some(
+            "usage: kiri storage [status]   show storage location, disk usage, and reclaimable space\n       kiri storage reclaim    reclaim unused VM disk space back to the host",
+        ),
+        _ => None,
+    }
 }
 
 /// Runs `kiri <args>` in WSL and exits with its exit code.
 pub fn run(args: &[String]) -> io::Result<()> {
+    if let Some(help) = help_for(args) {
+        println!("{help}");
+        return Ok(());
+    }
     if let [m, verb, name, rest @ ..] = args
         && m == "machine"
         && verb == "shell"
@@ -335,7 +430,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
 }
 
 /// The distro setup put the engine in (crates/kiri-win/src/setup.rs).
-fn distro() -> Option<String> {
+pub(crate) fn distro() -> Option<String> {
     let dir = PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("Kiri");
     let v: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("setup.json")).ok()?).ok()?;
     v["distro"].as_str().map(str::to_owned)
@@ -430,6 +525,14 @@ mod tests {
         let err = wake_over_stream(&mut eof).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
 
+        // Stop marker write + POST /kiri/stop over pipe.
+        super::write_stopped_marker_at(&marker);
+        assert!(marker.is_file());
+        let mut stop_pipe = MockPipe::new(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
+        super::stop_over_stream(&mut stop_pipe).unwrap();
+        let stop_wire = String::from_utf8(stop_pipe.sent).unwrap();
+        assert!(stop_wire.starts_with("POST /kiri/stop HTTP/1.1\r\n"), "{stop_wire}");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -506,5 +609,51 @@ mod tests {
         );
         assert_eq!(parse_diag_report_args(&s(&["--out"])), None);
         assert_eq!(parse_diag_report_args(&s(&["--unknown"])), None);
+    }
+
+    #[test]
+    fn help_for_intercepts_wsl_commands_without_intercepting_container_help() {
+        use super::help_for;
+        let s = |list: &[&str]| list.iter().map(|x| (*x).to_owned()).collect::<Vec<String>>();
+        for cmd in [
+            &["start", "--help"][..],
+            &["start", "-h"],
+            &["k8s", "--help"],
+            &["k8s", "-h"],
+            &["k8s", "help"],
+            &["k8s", "set", "--help"],
+            &["machine", "--help"],
+            &["machine", "create", "-h"],
+            &["machine", "shell", "--help"],
+            &["machine", "shell", "dev", "--help"],
+            &["diag", "--help"],
+            &["diag", "report", "--help"],
+            &["diag", "logs", "-h"],
+            &["usb", "--help"],
+            &["usb", "attach", "-h"],
+            &["domains", "--help"],
+            &["registry", "--help"],
+            &["scan", "--help"],
+            &["storage", "--help"],
+            &["storage", "reclaim", "-h"],
+        ] {
+            let text = help_for(&s(cmd)).unwrap_or_else(|| panic!("expected help for {cmd:?}"));
+            assert!(text.starts_with("usage: kiri "), "{cmd:?}: {text}");
+        }
+        assert!(help_for(&s(&["k8s", "set", "--help"])).unwrap().contains("kiri k8s set"));
+
+        // Must NOT intercept container commands after `--` or non-help invocations.
+        for pass_through in [
+            &["start"][..],
+            &["k8s", "status"],
+            &["machine", "list"],
+            &["machine", "shell", "dev", "--", "uname", "--help"],
+            &["machine", "shell", "dev", "--", "-h"],
+            &["scan", "alpine"],
+            &["scan", "help"],
+            &["diag", "report"],
+        ] {
+            assert_eq!(help_for(&s(pass_through)), None, "must not intercept {pass_through:?}");
+        }
     }
 }

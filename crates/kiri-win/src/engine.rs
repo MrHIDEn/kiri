@@ -200,6 +200,16 @@ pub(crate) fn on_external_wake() {
     send(Cmd::Refresh);
 }
 
+/// Called after an external `POST /kiri/stop` (`kiri engine stop`) stops the
+/// WSL daemon through the named pipe: marks `kiri-win` stopped immediately so
+/// subsequent pipe/status checks see the stopped gate without a race, then
+/// tells the engine thread to tear down bridges/relays, terminate Kiri's
+/// dedicated WSL distro, and update the window and tray (#983).
+pub(crate) fn on_external_stop() {
+    crate::serve::set_stopped(true);
+    send(Cmd::Stop);
+}
+
 fn engine(rx: &Receiver<Cmd>, tx: Sender<Cmd>) {
     watch(tx);
     // Windows' proxy and root certificates for the daemon, now and every
@@ -261,38 +271,57 @@ fn engine(rx: &Receiver<Cmd>, tx: Sender<Cmd>) {
             }
             Ok(Cmd::Pull(name)) => pull(name),
             Ok(Cmd::Run(name, env)) => {
-                // The page shows its spinner until this says how it went.
-                let result = run_image(&name, &env);
-                emit(json!({"type": "ran", "name": name, "error": result.is_err()}).to_string());
-                act(result)
+                std::thread::spawn(move || {
+                    // The page shows its spinner until this says how it went.
+                    let result = run_image(&name, &env);
+                    emit(json!({"type": "ran", "name": name, "error": result.is_err()}).to_string());
+                    act(result);
+                });
             }
-            Ok(Cmd::RemoveImage(name)) => match client::request("DELETE", &format!("/images/{}", path_escape(&name)), None) {
-                Ok(r) if r.ok() => {
-                    // Only untagged when another name still points at it: nothing freed.
-                    let deleted = r.json().as_array().is_some_and(|a| a.iter().any(|v| v.get("Deleted").is_some()));
-                    emit(json!({"type": "removed", "name": name, "deleted": deleted}).to_string());
-                }
-                Ok(r) => emit(notice("error", &r.error())),
-                Err(e) => emit(notice("error", &e.to_string())),
-            },
+            Ok(Cmd::RemoveImage(name)) => {
+                std::thread::spawn(move || {
+                    match client::request("DELETE", &format!("/images/{}", path_escape(&name)), None) {
+                        Ok(r) if r.ok() => {
+                            // Only untagged when another name still points at it: nothing freed.
+                            let deleted = r.json().as_array().is_some_and(|a| a.iter().any(|v| v.get("Deleted").is_some()));
+                            emit(json!({"type": "removed", "name": name, "deleted": deleted}).to_string());
+                        }
+                        Ok(r) => emit(notice("error", &r.error())),
+                        Err(e) => emit(notice("error", &e.to_string())),
+                    }
+                    send(Cmd::Refresh);
+                });
+            }
             Ok(Cmd::Container { action, id }) => {
                 let (method, path) = match action.as_str() {
                     "remove" => ("DELETE", format!("/containers/{id}?force=1&v=1")),
                     a @ ("start" | "stop" | "restart" | "pause" | "unpause") => ("POST", format!("/containers/{id}/{a}")),
                     _ => continue,
                 };
-                let result = expect_done(client::request(method, &path, None));
-                // Refused to start (a port taken): the container's page says why.
-                if let (Err(e), "start") = (&result, action.as_str()) {
-                    emit(json!({"type": "startfailed", "id": id, "error": e.to_string()}).to_string());
-                }
-                act(result);
+                std::thread::spawn(move || {
+                    let result = expect_done(client::request(method, &path, None));
+                    // Refused to start (a port taken): the container's page says why.
+                    if let (Err(e), "start") = (&result, action.as_str()) {
+                        emit(json!({"type": "startfailed", "id": id, "error": e.to_string()}).to_string());
+                    }
+                    act(result);
+                });
             }
-            Ok(Cmd::RemoveVolume(name)) => act(expect_ok(client::request("DELETE", &format!("/volumes/{}", path_escape(&name)), None))),
-            Ok(Cmd::RemoveNetwork(id)) => act(expect_ok(client::request("DELETE", &format!("/networks/{id}"), None))),
-            Ok(Cmd::Ports { id, ports }) => act(set_ports(&id, ports)),
-            Ok(Cmd::Env { id, env }) => act(set_env(&id, env)),
-            Ok(Cmd::About) => about(),
+            Ok(Cmd::RemoveVolume(name)) => {
+                std::thread::spawn(move || act(expect_ok(client::request("DELETE", &format!("/volumes/{}", path_escape(&name)), None))));
+            }
+            Ok(Cmd::RemoveNetwork(id)) => {
+                std::thread::spawn(move || act(expect_ok(client::request("DELETE", &format!("/networks/{id}"), None))));
+            }
+            Ok(Cmd::Ports { id, ports }) => {
+                std::thread::spawn(move || act(set_ports(&id, ports)));
+            }
+            Ok(Cmd::Env { id, env }) => {
+                std::thread::spawn(move || act(set_env(&id, env)));
+            }
+            Ok(Cmd::About) => {
+                std::thread::spawn(about);
+            }
             Err(RecvTimeoutError::Disconnected) => return,
             Err(RecvTimeoutError::Timeout) => {
                 emit_docker_state_if_changed();
@@ -943,6 +972,40 @@ fn emit_docker_state_if_changed() {
     }
 }
 
+/// Ensures Kiri's `cliPluginsExtraDirs` and `kiri` context in
+/// `%USERPROFILE%\.docker`, repairing `config.json` if another engine's
+/// uninstaller (such as Docker Desktop's) removed it (#984).
+pub fn heal_docker_config(pipe: &str) {
+    let Some(dir) = crate::dockerctx::docker_dir() else { return };
+    let exe = std::env::current_exe().ok();
+    let local = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from);
+    let plugins = crate::dockerctx::find_windows_cli_plugins(exe.as_deref(), local.as_deref());
+    let desktop = std::env::var_os("ProgramFiles").is_some_and(|p| std::path::Path::new(&p).join(r"Docker\Docker\Docker Desktop.exe").is_file());
+    let host = npipe_host(pipe);
+    match crate::dockerctx::repair_windows_config(
+        &dir,
+        crate::dockerctx::WindowsRepairOpts {
+            ours: crate::flavor::CONTEXT.get(),
+            description: "Kiri (WSL2)",
+            host: &host,
+            plugins_dir: plugins.as_deref(),
+            force_context_write: false,
+            set_current_if_empty: false,
+            force_use: false,
+            desktop_installed: desktop,
+        },
+    ) {
+        Ok(r) if r.context_written || r.plugins_added || r.current_context_set => {
+            crate::serve::log(&format!(
+                "docker config self-healed (context={}, plugins={}, current={})",
+                r.context_written, r.plugins_added, r.current_context_set
+            ));
+        }
+        Ok(_) => {}
+        Err(e) => crate::serve::log(&format!("docker config: could not self-heal ({e})")),
+    }
+}
+
 /// Ensures the `kiri` context exists and is plain `docker`'s current context,
 /// keeping logins, credential helpers and plugin folders untouched (#369).
 pub fn use_kiri_context() -> io::Result<()> {
@@ -1150,7 +1213,29 @@ fn set_pref(name: &str, value: Value) {
 
 /// A page link: only Kiri's own addresses, as on the Mac.
 fn allowed_url(url: &str) -> bool {
-    if url == "https://kiri.canestack.com" || url == "https://learn.microsoft.com/windows/wsl/about" || url == "https://github.com/libracoder/kiri/issues/new" || url == "https://github.com/libracoder/kiri" || url == "https://login.docker.com/activate" || url == "https://github.com/login/device" {
+    if matches!(
+        url,
+        "https://kiri.canestack.com"
+            | "https://runkiri.com"
+            | "https://runkiri.com/releases/"
+            | "https://runkiri.com/share/notice"
+            | "https://canestack.com"
+            | "https://discord.gg/K5A8wuqcC"
+            | "https://x.com/runkiri"
+            | "https://learn.microsoft.com/windows/wsl/about"
+            | "https://github.com/libracoder/kiri/issues/new"
+            | "https://github.com/libracoder/kiri"
+            | "https://github.com/anchore/grype"
+            | "https://login.docker.com/activate"
+            | "https://github.com/login/device"
+    ) {
+        return true;
+    }
+    // A build warning's rule page (docs.docker.com/go/dockerfile/rule/…).
+    if url
+        .strip_prefix("https://docs.docker.com/go/")
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_alphanumeric() || b"-/".contains(&b)))
+    {
         return true;
     }
     let Some(rest) = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://")) else { return false };
@@ -1220,8 +1305,19 @@ mod tests {
         assert!(allowed_url("http://localhost:8080/app"));
         assert!(allowed_url("https://web.kiri.localhost/"));
         assert!(allowed_url("http://api.kiri.local"));
+        assert!(allowed_url("https://runkiri.com"));
+        assert!(allowed_url("https://runkiri.com/releases/"));
+        assert!(allowed_url("https://runkiri.com/share/notice"));
+        assert!(allowed_url("https://canestack.com"));
+        assert!(allowed_url("https://discord.gg/K5A8wuqcC"));
+        assert!(allowed_url("https://x.com/runkiri"));
+        assert!(allowed_url("https://kiri.canestack.com"));
         assert!(allowed_url("https://github.com/libracoder/kiri"));
+        assert!(allowed_url("https://github.com/libracoder/kiri/issues/new"));
+        assert!(allowed_url("https://github.com/anchore/grype"));
+        assert!(allowed_url("https://docs.docker.com/go/dockerfile/rule/from-as-casing/"));
         assert!(!allowed_url("http://evil.example/"));
+        assert!(!allowed_url("https://runkiri.com.evil.com"));
         // Bypass attempts the audit found.
         assert!(!allowed_url("http://localhost:1@evil.example/"));
         assert!(!allowed_url("http://evil.example\\x.kiri.localhost"));
@@ -1516,16 +1612,18 @@ pub fn on_message(msg: &str) {
                 let theme = c.value.as_str().unwrap_or("").to_owned();
                 Handle.run(move |ui| ui.set_theme(&theme));
             }
-            if c.name == "startAtLogin"
-                && let Some(on) = c.value.as_bool()
-                && let Err(e) = crate::setup::set_start_at_login(on)
-            {
-                crate::serve::log(&format!("start at sign-in: {e}"));
-                emit(notice("error", &e.to_string()));
-                emit(json!({"type": "prefs", "prefs": prefs()}).to_string());
-                return;
-            }
+            let start_login = (c.name == "startAtLogin").then(|| c.value.as_bool()).flatten();
             set_pref(&c.name, c.value);
+            if let Some(on) = start_login {
+                std::thread::spawn(move || {
+                    if let Err(e) = crate::setup::set_start_at_login(on) {
+                        crate::serve::log(&format!("start at sign-in: {e}"));
+                        set_pref("startAtLogin", (!on).into());
+                        emit(notice("error", &e.to_string()));
+                        emit(json!({"type": "prefs", "prefs": prefs()}).to_string());
+                    }
+                });
+            }
         }
         // A language the page doesn't carry yet (the main window and setup open
         // with one; setup's langwords comes here too, not being a setup- command):
@@ -1671,10 +1769,14 @@ pub fn on_message(msg: &str) {
         "storage" => {
             std::thread::spawn(crate::storage::emit_report);
         }
+        "volumesizes" => {
+            spawn_volume_sizes();
+        }
         "storagepick" => {
             crate::app::pick_folder(&tr("Choose a storage folder"), |path| {
                 if let Some(p) = path {
-                    crate::storage::check_and_emit(Some(p.to_string_lossy().into_owned()), false, false);
+                    let s = p.to_string_lossy().into_owned();
+                    std::thread::spawn(move || crate::storage::check_and_emit(Some(s), false, false));
                 }
             });
         }
@@ -1950,6 +2052,44 @@ fn builder_settings(save: Option<Value>) {
     let mut ev = client::get_background("/kiri/builder").unwrap_or_else(|e| json!({"error": e.to_string()}));
     ev["type"] = json!("buildersettings");
     emit(ev.to_string());
+}
+
+/// Volumes view: reads each volume's disk usage asynchronously without waking
+/// a sleeping VM or touching WSL while stopped. Single-flight with coalesced
+/// re-run so repeated UI messages never accumulate background threads.
+fn spawn_volume_sizes() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static BUSY: AtomicBool = AtomicBool::new(false);
+    static RERUN: AtomicBool = AtomicBool::new(false);
+
+    if BUSY.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        RERUN.store(true, Ordering::Release);
+        return;
+    }
+    std::thread::spawn(|| {
+        struct Guard<'a>(&'a AtomicBool);
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _guard = Guard(&BUSY);
+        loop {
+            RERUN.store(false, Ordering::Release);
+            let sizes = if crate::serve::is_stopped() {
+                json!({})
+            } else {
+                client::get_background("/kiri/volumes/sizes")
+                    .ok()
+                    .and_then(|v| v.get("sizes").filter(|s| s.is_object()).cloned())
+                    .unwrap_or_else(|| json!({}))
+            };
+            emit(json!({"type": "volumesizes", "sizes": sizes}).to_string());
+            if !RERUN.swap(false, Ordering::AcqRel) {
+                break;
+            }
+        }
+    });
 }
 
 /// The tray's commands.

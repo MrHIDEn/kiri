@@ -27,6 +27,7 @@ pub fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixS
     Some(match (m, p) {
         ("GET", "/events") => events(req, engine, w),
         ("GET", "/system/df") => reply(w, system_df(engine), 200),
+        ("GET", "/kiri/volumes/sizes") => reply(w, volume_sizes(engine), 200),
         ("POST", "/containers/prune") => reply(w, container_prune(req, engine), 200),
         ("POST", "/images/prune") => reply(w, image_prune(req, engine), 200),
         ("GET", "/images/search") => reply(w, search(req), 200),
@@ -382,7 +383,10 @@ fn container_prune(req: &Request, engine: &Engine) -> Result<Value, Error> {
     let doomed = engine.each(|c| {
         let labels = if c.spec.labels.is_object() { c.spec.labels.clone() } else { json!({}) };
         let created = c.created.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
-        (c.status != Status::Running && f.labels(&labels) && before(until, created)).then(|| c.id.clone())
+        // A `kiri machine` keeps its work in its writable layer: a stopped one
+        // stays, as on OrbStack; `kiri machine delete` or `docker rm` removes it.
+        let machine = labels.get(crate::machine::LABEL).is_some();
+        (c.status != Status::Running && !machine && f.labels(&labels) && before(until, created)).then(|| c.id.clone())
     });
     let mut deleted = Vec::new();
     for id in doomed {
@@ -473,6 +477,9 @@ fn system_df(engine: &Engine) -> Result<Value, Error> {
     let used: Vec<String> = engine.each(|c| Some(c.spec.image_id.clone()));
     let measured = engine.vm().ok().and_then(|vm| vm.usage(std::time::Duration::from_secs(120)));
     let du = measured.as_deref().map(DiskUsage::parse);
+    if let Some(d) = &du {
+        engine.cache_volume_sizes(None, d.volumes.clone());
+    }
     let layer_size = |l: &kiri_image::Layer| du.as_ref().and_then(|d| d.layers.get(l.digest.trim_start_matches("sha256:")).copied()).unwrap_or(l.size);
     // How many images use each layer, for each image's shared size.
     let mut users: HashMap<&str, usize> = HashMap::new();
@@ -547,6 +554,98 @@ fn system_df(engine: &Engine) -> Result<Value, Error> {
         })
         .collect();
     Ok(json!({"LayersSize": layers_size, "Images": image_rows, "Containers": containers, "Volumes": volumes, "BuildCache": super::builder::cache(engine)}))
+}
+
+/// How long `GET /kiri/volumes/sizes` reuses guest-measured volume sizes while
+/// the VM is awake so tab switches do not re-walk the guest disk (`GET /system/df`
+/// stays live).
+const VOLUME_SIZES_TTL: Duration = Duration::from_secs(30);
+
+pub(super) fn parse_volume_usage(lines: &[String]) -> HashMap<String, u64> {
+    DiskUsage::parse(lines).volumes
+}
+
+fn volume_sizes_map(
+    volumes: &[super::volumes::Volume],
+    du: &HashMap<String, u64>,
+    dirty: &HashSet<String>,
+    complete_scan: bool,
+) -> serde_json::Map<String, Value> {
+    let mut out = serde_json::Map::with_capacity(volumes.len());
+    for v in volumes {
+        if !v.options.is_empty() {
+            // Backed by driver options (NFS/bind/tmpfs): not on the guest data disk.
+            out.insert(v.name.clone(), json!(-1));
+            continue;
+        }
+        if !complete_scan && dirty.contains(&v.name) {
+            continue;
+        }
+        match du.get(&v.name) {
+            Some(&b) => {
+                out.insert(v.name.clone(), json!(i64::try_from(b).unwrap_or(i64::MAX)));
+            }
+            // A plain local volume never mounted yet has no directory in the
+            // guest and takes 0 bytes.
+            None if complete_scan => {
+                out.insert(v.name.clone(), json!(0));
+            }
+            None => {}
+        }
+    }
+    out
+}
+
+/// Each volume's size in bytes for the Volumes view (`GET /kiri/volumes/sizes`).
+/// Uses persisted `<state_dir>/volume-sizes.json` across VM sleep and daemon
+/// restarts without waking the VM unless an active (`!is_stopped()`) engine has
+/// dirty or unmeasured local volumes.
+fn volume_sizes(engine: &Engine) -> Result<Value, Error> {
+    volume_sizes_with_ttl(engine, VOLUME_SIZES_TTL)
+}
+
+fn volume_sizes_with_ttl(engine: &Engine, ttl: Duration) -> Result<Value, Error> {
+    let volumes = engine.volume_list();
+    if volumes.is_empty() {
+        return Ok(json!({"sizes": {}}));
+    }
+    let snap = engine.volume_sizes_snapshot(ttl);
+    let any_missing_or_dirty = volumes
+        .iter()
+        .any(|v| v.options.is_empty() && (snap.dirty.contains(&v.name) || !snap.sizes.contains_key(&v.name)));
+
+    if let Some(vm) = engine.awake_link() {
+        if snap.fresh_ttl && !any_missing_or_dirty {
+            return Ok(json!({"sizes": volume_sizes_map(&volumes, &snap.sizes, &snap.dirty, false)}));
+        }
+        let Some(measured) = vm.usage(Duration::from_secs(120)) else {
+            return Ok(json!({"sizes": {}}));
+        };
+        let du = DiskUsage::parse(&measured);
+        engine.cache_volume_sizes(Some(snap.generation), du.volumes.clone());
+        let current = engine.volume_list();
+        return Ok(json!({"sizes": volume_sizes_map(&current, &du.volumes, &HashSet::new(), true)}));
+    }
+
+    if !any_missing_or_dirty {
+        return Ok(json!({"sizes": volume_sizes_map(&volumes, &snap.sizes, &snap.dirty, false)}));
+    }
+    if !engine.is_stopped()
+        && let Some(measured) = engine.vm().ok().and_then(|vm| vm.usage(Duration::from_secs(120)))
+    {
+        let du = DiskUsage::parse(&measured);
+        engine.cache_volume_sizes(Some(snap.generation), du.volumes.clone());
+        let current = engine.volume_list();
+        return Ok(json!({"sizes": volume_sizes_map(&current, &du.volumes, &HashSet::new(), true)}));
+    }
+
+    let has_any_clean_local = volumes
+        .iter()
+        .any(|v| v.options.is_empty() && !snap.dirty.contains(&v.name) && snap.sizes.contains_key(&v.name));
+    if has_any_clean_local {
+        return Ok(json!({"sizes": volume_sizes_map(&volumes, &snap.sizes, &snap.dirty, false)}));
+    }
+    Ok(json!({"sizes": {}}))
 }
 
 /// `docker history`: the config's history, newest first, with each
@@ -654,7 +753,31 @@ pub(super) fn gone(w: &UnixStream) -> bool {
     r == 0 || pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0
 }
 
-/// `docker events`: kept events since `since`, then live ones until `until`.
+fn event_time(ev: &Value) -> f64 {
+    ev["timeNano"].as_u64().map_or(0.0, |n| n as f64 / 1e9)
+}
+
+/// The kept events a subscription replays first: those inside the bounds.
+fn replayed<'a>(
+    recent: &'a [Value],
+    f: &super::filters::Filters,
+    since: Option<f64>,
+    until: Option<f64>,
+) -> Vec<&'a Value> {
+    if since.is_none() && until.is_none() {
+        return Vec::new();
+    }
+    recent
+        .iter()
+        .filter(|ev| {
+            since.is_none_or(|s| event_time(ev) >= s)
+                && until.is_none_or(|u| event_time(ev) <= u)
+                && event_matches(f, ev)
+        })
+        .collect()
+}
+
+/// `docker events`: kept events inside the bounds, then live ones until `until`.
 fn events(req: &Request, engine: &Engine, w: &mut UnixStream) -> io::Result<Next> {
     let f = match filters(req, &["type", "event", "container", "image", "network", "volume", "label", "label!", "daemon", "scope"]) {
         Ok(f) => f,
@@ -669,11 +792,8 @@ fn events(req: &Request, engine: &Engine, w: &mut UnixStream) -> io::Result<Next
     let (recent, rx) = engine.subscribe();
     http::begin_stream(w, 200, "application/json")?;
     let send = |w: &mut UnixStream, ev: &Value| -> io::Result<()> { http::chunk(w, format!("{ev}\n").as_bytes()) };
-    let at = |ev: &Value| ev["timeNano"].as_u64().map_or(0.0, |n| n as f64 / 1e9);
-    if let Some(s) = since {
-        for ev in recent.iter().filter(|ev| at(ev) >= s && until.is_none_or(|u| at(ev) <= u) && event_matches(&f, ev)) {
-            send(w, ev)?;
-        }
+    for ev in replayed(&recent, &f, since, until) {
+        send(w, ev)?;
     }
     loop {
         if until.is_some_and(|u| now() >= u) {
@@ -681,7 +801,7 @@ fn events(req: &Request, engine: &Engine, w: &mut UnixStream) -> io::Result<Next
         }
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(ev) => {
-                if until.is_some_and(|u| at(&ev) > u) {
+                if until.is_some_and(|u| event_time(&ev) > u) {
                     break;
                 }
                 if event_matches(&f, &ev) {
@@ -698,6 +818,40 @@ fn events(req: &Request, engine: &Engine, w: &mut UnixStream) -> io::Result<Next
     }
     http::end(w)?;
     Ok(Next::KeepAlive)
+}
+
+#[cfg(test)]
+mod events_tests {
+    use super::super::filters::Filters;
+    use super::replayed;
+    use serde_json::{Value, json};
+
+    fn ev(secs: u64) -> Value {
+        json!({"Type": "container", "Action": "create", "Actor": {"ID": format!("c{secs}"), "Attributes": {}}, "timeNano": secs * 1_000_000_000})
+    }
+
+    fn ids(v: Vec<&Value>) -> Vec<&str> {
+        v.into_iter()
+            .map(|e| e["Actor"]["ID"].as_str().unwrap())
+            .collect()
+    }
+
+    /// `docker events --until` alone replays the kept events up to it, as
+    /// Docker does; both bounds are inclusive and no bounds replays nothing.
+    #[test]
+    fn events_until_without_since_replays_matching_history() {
+        let recent = [ev(1), ev(2), ev(3)];
+        let all = Filters::default();
+        assert_eq!(ids(replayed(&recent, &all, None, Some(2.5))), ["c1", "c2"]);
+        assert_eq!(ids(replayed(&recent, &all, Some(1.5), None)), ["c2", "c3"]);
+        assert_eq!(ids(replayed(&recent, &all, Some(1.5), Some(2.5))), ["c2"]);
+        assert!(replayed(&recent, &all, None, None).is_empty());
+        assert_eq!(ids(replayed(&recent, &all, None, Some(2.0))), ["c1", "c2"]);
+        assert_eq!(ids(replayed(&recent, &all, Some(2.0), Some(2.0))), ["c2"]);
+        let only_c3 = Filters::parse(Some(r#"{"container":["c3"]}"#)).unwrap();
+        assert!(replayed(&recent, &only_c3, None, Some(2.5)).is_empty());
+        assert_eq!(ids(replayed(&recent, &only_c3, None, Some(3.0))), ["c3"]);
+    }
 }
 
 #[cfg(test)]
@@ -724,6 +878,38 @@ mod disk_usage_tests {
             other => panic!("image prune: {other:?}"),
         }
         assert_eq!(engine.store.images().unwrap().len(), 1, "the image is kept");
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `docker container prune` (and `system prune`) keeps a stopped
+    /// `kiri machine` and removes a stopped plain container (#975).
+    #[test]
+    fn container_prune_keeps_machines() {
+        use super::Request;
+        use serde_json::json;
+        let root = std::env::temp_dir().join(format!("kiri-container-prune-machines-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let engine = super::super::engine::boot_without_vm(&root);
+        let image = kiri_image::Image { mirror: None,
+            name: "local:1".into(), digest: "sha256:0123".into(), index_digest: None, config_digest: "sha256:0123".into(),
+            layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(),
+        };
+        let spec = |labels| -> super::super::engine::Spec {
+            serde_json::from_value(json!({
+                "image": "local:1", "image_id": "sha256:0123", "entrypoint": [], "cmd": ["true"],
+                "env": [], "cwd": "/", "user": "", "auto_remove": false, "network_mode": "none", "labels": labels,
+                "restart": {"name": "no", "max_retries": 0}
+            }))
+            .unwrap()
+        };
+        let machine = engine.create(Some("machine-dev".into()), spec(json!({crate::machine::LABEL: "dev"})), &image).unwrap();
+        let plain = engine.create(Some("plain".into()), spec(json!({})), &image).unwrap();
+        let out = super::container_prune(&Request::internal("POST", "/containers/prune", &[], Vec::new()), &engine).unwrap();
+        assert_eq!(out["ContainersDeleted"], json!([plain]));
+        let left: Vec<String> = engine.each(|c| Some(c.id.clone()));
+        assert_eq!(left, [machine]);
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -805,6 +991,74 @@ mod disk_usage_tests {
         assert_eq!(du.containers.get("c1"), Some(&8192));
         assert_eq!(du.volumes.get("data"), Some(&12288));
         assert_eq!((du.layers.len(), du.containers.len(), du.volumes.len()), (1, 1, 1));
+    }
+
+    #[test]
+    fn volume_sizes_persists_across_sleep_and_restart_without_waking_vm() {
+        use serde_json::json;
+        use std::collections::{BTreeMap, HashMap};
+        use std::time::{Duration, Instant};
+
+        let root = std::env::temp_dir().join(format!("kiri-vol-sizes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let engine = super::super::engine::boot_without_vm(&root);
+
+        engine.volume_ensure("pg_data", json!({}), false).unwrap();
+        engine.volume_ensure("empty_vol", json!({}), false).unwrap();
+        let mut nfs_opts = BTreeMap::new();
+        nfs_opts.insert("type".into(), "nfs".into());
+        nfs_opts.insert("device".into(), ":/export".into());
+        engine.volume_ensure_with("nfs_vol", json!({}), nfs_opts).unwrap();
+
+        let initial = super::volume_sizes(&engine).unwrap();
+        assert_eq!(initial, json!({"sizes": {"pg_data": 0, "empty_vol": 0, "nfs_vol": -1}}));
+        assert!(!engine.is_awake());
+
+        let mut measured = HashMap::new();
+        measured.insert("pg_data".into(), 807_700_000u64);
+        let gen_before = engine.volume_sizes_snapshot(Duration::from_secs(30)).generation;
+        engine.cache_volume_sizes(Some(gen_before), measured.clone());
+        assert!(root.join("volume-sizes.json").is_file(), "volume-sizes.json persisted");
+
+        engine.set_volume_sizes_cache_at(Instant::now() - Duration::from_secs(31), measured.clone());
+        let after_ttl = super::volume_sizes_with_ttl(&engine, Duration::from_secs(30)).unwrap();
+        assert_eq!(after_ttl, json!({"sizes": {"pg_data": 807_700_000, "empty_vol": 0, "nfs_vol": -1}}));
+
+        engine.cache_volume_sizes(None, measured.clone());
+        let old_gen = engine.volume_sizes_snapshot(Duration::from_secs(30)).generation;
+        engine.volume_ensure("new_vol", json!({}), false).unwrap();
+        assert!(!engine.volume_sizes_snapshot(Duration::from_secs(30)).fresh_ttl);
+        let mut stale = HashMap::new();
+        stale.insert("pg_data".into(), 1u64);
+        engine.cache_volume_sizes(Some(old_gen), stale);
+        assert_eq!(
+            super::volume_sizes(&engine).unwrap(),
+            json!({"sizes": {"pg_data": 807_700_000, "empty_vol": 0, "new_vol": 0, "nfs_vol": -1}}),
+            "stale generation write ignored and new_vol initialized to 0"
+        );
+
+        engine.volume_remove("new_vol", false).unwrap();
+        let saved_raw: HashMap<String, u64> =
+            serde_json::from_slice(&std::fs::read(root.join("volume-sizes.json")).unwrap()).unwrap();
+        assert!(!saved_raw.contains_key("new_vol"));
+        assert_eq!(saved_raw.get("pg_data"), Some(&807_700_000));
+
+        engine.mark_volumes_dirty([&"pg_data".to_owned()]);
+        assert_eq!(super::volume_sizes(&engine).unwrap(), json!({"sizes": {"empty_vol": 0, "nfs_vol": -1}}));
+
+        engine.cache_volume_sizes(None, measured);
+        drop(engine);
+
+        let asleep_engine = super::super::engine::Engine::boot(kiri_image::store::Store::open(&root).unwrap()).unwrap();
+        assert!(!asleep_engine.is_stopped(), "engine is asleep, not stopped");
+        assert!(!asleep_engine.is_awake(), "VM starts asleep");
+        let asleep_sizes = super::volume_sizes(&asleep_engine).unwrap();
+        assert_eq!(asleep_sizes, json!({"sizes": {"pg_data": 807_700_000, "empty_vol": 0, "nfs_vol": -1}}));
+        assert!(!asleep_engine.is_awake(), "persisted volume sizes returned without waking asleep VM");
+
+        drop(asleep_engine);
+        let _ = std::fs::remove_dir_all(root);
     }
 }
 

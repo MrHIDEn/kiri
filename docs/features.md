@@ -48,7 +48,11 @@ Apple silicon and Intel Macs (macOS 14+), Windows 10 and 11 (x86-64 and Arm, thr
   `kiri domains reset` puts back 80 and 443
 - **Storage**: named and anonymous volumes, bind mounts of Mac paths
   (virtiofs), `--tmpfs`, `--mount`, `volume` commands; local volumes that
-  bind a folder (`driver_opts: {type: none, o: bind, device: /path}`)
+  bind a folder (`driver_opts: {type: none, o: bind, device: /path}`);
+  local-driver volumes with `driver_opts` `type=nfs` mount a remote NFS
+  export — NFSv4 (minorversion 4.0 and 4.1) and NFSv3, honouring `addr=`,
+  `nfsvers=`, `hard`/`soft`, `timeo`, `retrans`, `ro`/`rw` and `noatime`;
+  LUKS / `dm-crypt` in the guest kernel (`CONFIG_DM_CRYPT`)
 - **Images**: `pull` (with `docker login` credentials), `push`, `tag`,
   `save`, `load`, `history`, `search`, `image prune`, `system df`;
   **amd64 images run through Rosetta**, `--platform` honoured
@@ -124,17 +128,21 @@ Apple silicon and Intel Macs (macOS 14+), Windows 10 and 11 (x86-64 and Arm, thr
   a command line (and "Open in Terminal" for a full shell) and its files
   (preview, Save to Downloads, Show in Finder); Settings for fonts, text
   size, starting at sign-in, stopping the engine when Kiri quits, the VM's
-  CPUs, memory and disk image size (`~/.kiri/vm.json`, used from the VM's next
-  start; `KIRI_CPUS`, `KIRI_MEMORY_MIB` and `KIRI_DISK_GB` override it; the
-  disk grows online on boot and never shrinks) and local names
+  CPUs, memory, swap and disk image size (`~/.kiri/vm.json`, used from the VM's
+  next start; `KIRI_CPUS`, `KIRI_MEMORY_MIB`, `KIRI_SWAP_MIB` and `KIRI_DISK_GB`
+  override it; the disk grows online on boot and never shrinks) and local names
 - **Menu bar**: Kiri stays in the menu bar (or the tray on Windows and Linux)
   when its window closes, with the VM's state, running containers (click one
-  to open it) and Start/Stop; Settings → Appearance → Closing the window can
+  to open it) and Start/Stop (`kiri engine start | stop | restart | status [--json]`
+  controls and inspects the engine from the terminal without waking a sleeping VM);
+  Settings → Appearance → Closing the window can
   either keep the window hidden or free its page's memory until opened again
 - **Kubernetes**: `kiri k8s start` — a single-node k3s cluster in one
   container, ready in ~20 s, as the `kiri` kubectl context
 - **Linux machines**: `kiri machine create dev --distro ubuntu` and
-  `kiri machine shell dev` — your user, sudo, and `/Users` at the same path
+  `kiri machine shell dev` — your user, sudo, and `/Users` at the same path;
+  `docker container prune` and `docker system prune` leave a stopped machine
+  alone (`kiri machine delete` removes it)
 - **The app**: `cargo xtask app` builds `Kiri.app` with the `docker` CLI,
   Compose and buildx inside; opening it runs `kiri setup` (docker context,
   LaunchAgent, build builder) and the window; `kiri update` installs new
@@ -246,3 +254,8 @@ To trust a private certificate authority at a Kiri Share edge only, set `KIRI_SH
   registry-1.docker.io ...`). The builder runs on the default bridge, so
   check from a container there:
   `docker run --rm alpine nslookup registry-1.docker.io`.
+
+- **`type=cifs` (SMB) volumes don't mount yet.** Kiri's guest kernel has no
+  CIFS client, so a local-driver volume with `driver_opts: {type: cifs}`
+  fails the same way NFS-backed volumes did before NFS support landed.
+  SMB support is a separate change.

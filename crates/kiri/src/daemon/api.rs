@@ -1039,8 +1039,8 @@ fn resources(engine: &Engine) -> Value {
     let disk: Option<(u64, u64, u64)> = None;
     let overridden = std::env::var_os("KIRI_CPUS").is_some()
         || std::env::var_os("KIRI_MEMORY_MIB").is_some()
-        || (cfg!(target_os = "macos") && std::env::var_os("KIRI_DISK_GB").is_some());
-    resources_payload(
+        || (cfg!(target_os = "macos") && (std::env::var_os("KIRI_DISK_GB").is_some() || std::env::var_os("KIRI_SWAP_MIB").is_some()));
+    let mut v = resources_payload(
         e::vm_cpus(),
         e::memory_ceiling() >> 20,
         engine.cpus(),
@@ -1050,7 +1050,19 @@ fn resources(engine: &Engine) -> Value {
         e::physical_memory_bytes() >> 20,
         overridden,
         disk,
-    )
+    );
+    // Swap is the VM's, on its data disk: a Linux host has its own.
+    if cfg!(target_os = "macos") {
+        swap_payload(&mut v, e::vm_swap_mib(), engine.swap_mib());
+    }
+    v
+}
+
+/// The swap the VM boots with next, what it has now, and the most it may have.
+fn swap_payload(v: &mut Value, swap_mib: u64, running_swap_mib: u64) {
+    v["swap_mib"] = json!(swap_mib);
+    v["running_swap_mib"] = json!(running_swap_mib);
+    v["max_swap_mib"] = json!(super::engine::MAX_SWAP_MIB);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1214,6 +1226,12 @@ fn save_resources(
         .unwrap_or_else(|| json!({}));
     out["cpus"] = json!(cpus);
     out["memory_mib"] = json!(mem);
+    // Left out, the saved swap stays (#326).
+    if let Some(val) = body.get("swap_mib").filter(|v| !v.is_null()) {
+        let max = super::engine::MAX_SWAP_MIB;
+        let swap = val.as_u64().filter(|s| *s <= max).ok_or_else(|| Error::BadRequest(format!("swap_mib must be 0 to {max}")))?;
+        out["swap_mib"] = json!(swap);
+    }
     if let Some(val) = body.get("disk_gb").filter(|v| !v.is_null()) {
         let current = current_disk_gb.unwrap_or(crate::guest::disk::DEFAULT_GB);
         let (min_disk, max_disk) = crate::guest::disk::ui_bounds(current, existing_disk_gb.unwrap_or(current));
@@ -2022,6 +2040,57 @@ fn volumes_from_mounts(guest: &[String], info: &[Value], ro: bool) -> Vec<(Strin
         .collect()
 }
 
+/// Prepares a host bind-mount source path before adding it to a container spec.
+/// On Linux/WSL, `/etc/localtime` and `/etc/timezone` are never created as
+/// directories: if missing (for `-v`) or an empty directory (left by an earlier
+/// version before #938), they are created/repaired as valid timezone files.
+fn prepare_bind_source(src: &str, here: &str, create_missing: bool) -> Result<(), Error> {
+    let tz = std::env::var("TZ").ok();
+    prepare_bind_source_at(std::path::Path::new("/"), src, here, create_missing, !cfg!(target_os = "macos"), tz.as_deref())
+}
+
+fn prepare_bind_source_at(
+    root: &std::path::Path,
+    src: &str,
+    here: &str,
+    create_missing: bool,
+    linux_tz_guard: bool,
+    tz_env: Option<&str>,
+) -> Result<(), Error> {
+    let norm = lexical_path(here);
+    let p = if root == std::path::Path::new("/") {
+        std::path::PathBuf::from(here)
+    } else {
+        root.join(norm.trim_start_matches('/'))
+    };
+    if linux_tz_guard && matches!(norm.as_str(), "/etc/localtime" | "/etc/timezone") {
+        let heal = || match norm.as_str() {
+            "/etc/localtime" => super::localtime::ensure_localtime_at(root, tz_env).map_err(Error::Io),
+            _ => super::localtime::ensure_timezone_at(root, tz_env).map_err(Error::Io),
+        };
+        let is_dir = std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_dir());
+        if is_dir {
+            return heal();
+        }
+        if !super::localtime::is_valid_timezone_file_at(root, &p) {
+            if !create_missing && !std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_file()) {
+                return Err(Error::BadRequest(format!(
+                    "invalid mount config for type \"bind\": bind source path does not exist: {src}"
+                )));
+            }
+            return heal();
+        }
+        return Ok(());
+    }
+    if !p.exists() {
+        if !create_missing {
+            return Err(Error::BadRequest(format!("invalid mount config for type \"bind\": bind source path does not exist: {src}")));
+        }
+        super::binds::make_source(&p).map_err(Error::Io)?;
+    }
+    Ok(())
+}
+
 /// `-v`, `--mount`, `--tmpfs`, `--volumes-from`, `-v /path` and the image's
 /// VOLUME lines.
 #[cfg(test)]
@@ -2097,13 +2166,7 @@ fn mounts_for(body: &Value, engine: &Engine, image: &kiri_image::Image, caller: 
                     out.info.push(json!({"Type": "bind", "Source": src, "Destination": dst, "Mode": "", "RW": !ro, "Propagation": "rprivate"}));
                     return Ok(());
                 };
-                let p = std::path::Path::new(&here);
-                if !p.exists() {
-                    if !create_missing {
-                        return Err(Error::BadRequest(format!("invalid mount config for type \"bind\": bind source path does not exist: {src}")));
-                    }
-                    super::binds::make_source(p).map_err(Error::Io)?;
-                }
+                prepare_bind_source(src, &here, create_missing)?;
                 // After a missing source was made, so its links are followed too.
                 out.guest.push(format!("{}\t{dst}\t{}", guest_bind_source(src), flag("")));
                 out.info.push(json!({"Type": "bind", "Source": src, "Destination": dst, "Mode": "", "RW": !ro, "Propagation": "rprivate"}));
@@ -3135,14 +3198,7 @@ fn links_from(list: &[String], engine: &Engine) -> Result<Vec<super::engine::Lin
 
 fn status_text(c: &Container) -> String {
     let ago = |t: Option<std::time::SystemTime>| {
-        let s = t.and_then(|t| t.elapsed().ok()).map_or(0, |d| d.as_secs());
-        match s {
-            0..=1 => "Less than a second".to_owned(),
-            2..=59 => format!("{s} seconds"),
-            60..=3599 => format!("{} minutes", s / 60),
-            3600..=86399 => format!("{} hours", s / 3600),
-            _ => format!("{} days", s / 86400),
-        }
+        super::time::human_duration(t.and_then(|t| t.elapsed().ok()).map_or(0, |d| d.as_secs()))
     };
     match c.status {
         Status::Created => "Created".into(),
@@ -3364,6 +3420,7 @@ fn list(req: &Request, engine: &Engine) -> Result<Value, Error> {
             "KiriExitCode": c.exit_code,
             "KiriOOMKilled": c.oom_killed,
             "KiriVmStopped": c.vm_stopped,
+            "KiriStoppedByUser": c.stopped_by_user,
             "Ports": ports_list(c),
             "Labels": if c.spec.labels.is_object() { c.spec.labels.clone() } else { json!({}) },
             "HostConfig": {"NetworkMode": c.spec.network_mode},
@@ -8062,5 +8119,81 @@ mod resources_disk_tests {
         let err = super::stream_copy_out(&mut host_bad, &mut sink, true).unwrap_err();
         bad_guest.join().unwrap();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn bind_mount_preparation_never_creates_localtime_or_timezone_directory() {
+        let root = std::env::temp_dir().join(format!("kiri-api-localtime-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+
+        // `--mount type=bind` (`create_missing = false`) refuses missing /etc/localtime without creating a directory.
+        let err = super::prepare_bind_source_at(&root, "/etc/localtime", "/etc/localtime", false, true, None).unwrap_err();
+        assert!(matches!(err, super::Error::BadRequest(ref m) if m.contains("bind source path does not exist")), "{err:?}");
+        assert!(std::fs::symlink_metadata(root.join("etc/localtime")).is_err());
+
+        // `-v /etc/localtime:/etc/localtime:ro` (`create_missing = true`) creates a valid TZif2 file, never a directory.
+        super::prepare_bind_source_at(&root, "/etc/localtime", "/etc//localtime", true, true, None).unwrap();
+        let lt = root.join("etc/localtime");
+        assert!(std::fs::symlink_metadata(&lt).unwrap().file_type().is_file());
+        let bytes = std::fs::read(&lt).unwrap();
+        assert!(bytes.starts_with(b"TZif2") && bytes.ends_with(b"\nUTC0\n"));
+
+        // Existing empty directory at /etc/localtime is repaired into a file for both `-v` and `--mount`.
+        std::fs::remove_file(&lt).unwrap();
+        std::fs::create_dir(&lt).unwrap();
+        super::prepare_bind_source_at(&root, "/etc/localtime", "/etc/./localtime", false, true, None).unwrap();
+        assert!(std::fs::symlink_metadata(&lt).unwrap().file_type().is_file());
+
+        // Non-empty directory at /etc/localtime is refused without deleting its contents.
+        std::fs::remove_file(&lt).unwrap();
+        std::fs::create_dir(&lt).unwrap();
+        std::fs::write(lt.join("keep"), b"keep").unwrap();
+        assert!(super::prepare_bind_source_at(&root, "/etc/localtime", "/etc/localtime", true, true, None).is_err());
+        assert_eq!(std::fs::read(lt.join("keep")).unwrap(), b"keep");
+        std::fs::remove_dir_all(&lt).unwrap();
+
+        // `-v /etc/timezone:/etc/timezone:ro` creates/repairs a regular file, never a directory.
+        let tz = root.join("etc/timezone");
+        let _ = std::fs::remove_file(&tz);
+        super::prepare_bind_source_at(&root, "/etc/timezone", "/etc/timezone", true, true, Some("Asia/Shanghai")).unwrap();
+        assert!(std::fs::symlink_metadata(&tz).unwrap().file_type().is_file());
+        assert_eq!(std::fs::read_to_string(&tz).unwrap(), "Asia/Shanghai\n");
+
+        // Regular missing bind paths still become directories under `-v`.
+        super::prepare_bind_source_at(&root, "/srv/app", "/srv/app", true, true, None).unwrap();
+        assert!(root.join("srv/app").is_dir());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Settings → Resources keeps the VM's swap (#326): 0 to 16 GiB, kept
+    /// when a save leaves it out.
+    #[test]
+    fn swap_is_saved_checked_and_kept() {
+        let dir = std::env::temp_dir().join(format!("kiri-res-swap-{}", std::process::id()));
+        let path = dir.join("vm.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        let save = |body: Value| save_resources(body.to_string().as_bytes(), &path, 12, 32768, Some(64), None, None);
+        let saved = || serde_json::from_slice::<Value>(&std::fs::read(&path).unwrap()).unwrap();
+
+        save(json!({"cpus": 4, "memory_mib": 8192, "swap_mib": 2048})).unwrap();
+        assert_eq!(saved()["swap_mib"], 2048);
+        save(json!({"cpus": 4, "memory_mib": 4096})).unwrap();
+        assert_eq!(saved()["swap_mib"], 2048, "left out, the swap stays");
+        save(json!({"cpus": 4, "memory_mib": 4096, "swap_mib": 0})).unwrap();
+        assert_eq!(saved()["swap_mib"], 0, "0 is no swap");
+        for bad in [json!(-1), json!(16 * 1024 + 1), json!("1024"), json!(1.5)] {
+            match save(json!({"cpus": 4, "memory_mib": 4096, "swap_mib": bad})) {
+                Err(Error::BadRequest(msg)) => assert!(msg.contains("swap_mib must be 0 to 16384"), "{msg}"),
+                other => panic!("expected BadRequest for {bad}, got {other:?}"),
+            }
+        }
+        assert_eq!(saved()["swap_mib"], 0, "a refused save changes nothing");
+
+        let mut v = json!({});
+        swap_payload(&mut v, 2048, 1024);
+        assert_eq!(v, json!({"swap_mib": 2048, "running_swap_mib": 1024, "max_swap_mib": 16384}));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

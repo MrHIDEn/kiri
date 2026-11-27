@@ -13,6 +13,90 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #983 CLI: add `kiri engine start | stop | restart | status [--json]` across macOS, Linux, and Windows (unreleased)
+- Fixes: #983 Add CLI commands to start, stop and inspect the Kiri engine
+- Caused: none known
+- Caused by: -
+- Check: `crates/kiri/src/engine_cli.rs`, `crates/kiri-win/src/refuse.rs`
+
+### #989 macOS & Kubernetes: stop watching `/Users` and `/Volumes` on `kiri-k8s`, coalesce `k3s` timers with `10 ms` `timerslack_ns`, and watch LoadBalancer services instead of polling `kubectl` every 3 s (unreleased)
+- Fixes: #989 macOS: idle VM burns a full host core while the Kubernetes cluster is running
+- Caused: none known
+- Caused by: -
+- Check: `crates/kiri/src/daemon/engine.rs`, `crates/kiri-init/src/linux/hostopts.rs`, `crates/kiri-init/src/linux/container.rs`
+
+### Start: evict stale `VmLink::layers` entries and re-send layers when `run` reports `"is not unpacked"` (unreleased)
+- Fixes: `start-restores-layer` (`docker start` failed with `layer sha256:… is not unpacked` when an unpacked layer directory disappeared on the guest's disk without a VM restart)
+- Caused: none known
+- Caused by: #776
+- Check: `start-restores-layer`, `crates/kiri/src/daemon/engine.rs`
+
+### #602 macOS: spawn daemon directly when LaunchAgent `kickstart` exits 0 without starting engine (unreleased)
+- Fixes: #602 Clicking Start on macOS does nothing when `launchctl kickstart` exits 0 without starting `kiri daemon`
+- Caused: none known
+- Caused by: -
+- Check: `crates/kiri/src/update.rs`
+
+### #936 follow-up Volumes: persist measured volume byte sizes across VM sleep and restarts (unreleased)
+- Fixes: #936 Volumes view shows `—` whenever the Linux VM is asleep or more than 30s after idle sleep
+- Caused: none known
+- Caused by: #936
+- Check: `crates/kiri/src/daemon/ops.rs`, `tests/ui/volumes-size.js`
+
+### #948 Engine & Guest: bound `VmLink` write/RPC waits and `kiri-init` TTY `recv_fd`, and refuse `exec_start` on paused containers (unreleased)
+- Fixes: #948 macOS/guest `VmLink` deadlock where hundreds of `kiri-api` threads block forever on a wedged guest or frozen TTY child
+- Caused: none known
+- Caused by: -
+- Check: `crates/kiri/src/daemon/vmlink.rs`, `crates/kiri-init/src/linux/container.rs`, `crates/kiri/src/daemon/engine.rs`
+
+### #981 Engine: docker container prune and system prune keep stopped machines (unreleased)
+- Fixes: #975 A stopped machine is deleted by docker container prune / docker system prune, with everything in it
+- Caused: none known
+- Caused by: -
+- Check: `machine-prune-keeps`, `crates/kiri/src/daemon/ops.rs`
+
+### #936 Volumes view: show each volume's disk size loaded asynchronously with daemon caching (unreleased)
+- Fixes: #936 Volumes view: show each volume's size, loaded asynchronously
+- Caused: Volume sizes were cached only in memory with a 30s TTL and skipped asleep VMs, causing the Volumes tab to show `—` whenever the VM was asleep (fixed in #936 follow-up)
+- Caused by: -
+- Check: `tests/ui/volumes-size.js`, `crates/kiri/src/daemon/ops.rs`
+
+### #982, #984 CLI & Windows: exit 0 without side effects on `--help` / `-h` and `--version` / `-V` / `-v`, enable Windows `kiri import` / `setup` / `build-with`, self-heal `~/.docker/config.json`, and allow `runkiri.com` / `canestack.com` About links (unreleased)
+- Fixes: #982 `--help` / `-h` executes commands instead of printing usage, #984 Windows 0.2.2: `kiri import` missing from Windows CLI, uninstalling Docker Desktop wipes `~/.docker/config.json`, and `kiri setup` / `kiri build-with` / `kiri --version` fail
+- Caused: none known
+- Caused by: -
+- Check: `crates/kiri/src/main.rs`, `crates/kiri/src/setup_win.rs`, `crates/kiri/src/dockerctx.rs`, `crates/kiri-win/src/engine.rs`
+
+### #932 Networking: return `NODATA` for external `AAAA` queries on IPv4-only networks and relay enterprise macOS VPN tunnels through the host (unreleased)
+- Fixes: #932 Containers and the Kubernetes node fail to reach Docker Hub with IPv6 `Network unreachable` and `TLS handshake timeout` under macOS VPN / packet-tunnel extensions
+- Caused: none known
+- Caused by: -
+- Check: `crates/kiri/src/daemon/ports.rs`, `crates/kiri-init/src/linux/dns.rs`
+
+### #938 Windows (WSL 2): bundle `zoneinfo`, self-heal `/etc/localtime`, and prevent bind mounts from creating timezone directories (unreleased)
+- Fixes: #938 Windows: `/etc/localtime` is a directory in Kiri WSL, breaking common bind mounts
+- Caused: none known
+- Caused by: -
+- Check: `crates/kiri/src/daemon/localtime.rs`, `crates/kiri-init/src/linux/localtime.rs`, `scripts/kiri-linux.sh`
+
+### #935 Machines: use local images before pulling and mount `--systemd` `/tmp` and `/run` with `exec` (unreleased)
+- Fixes: #935 `kiri machine create`: `--systemd` machines get a `noexec` `/tmp`, and `--image` always pulls instead of using a local image
+- Caused: none known
+- Caused by: -
+- Check: `crates/kiri/src/machine.rs`
+
+### #934 Guest kernel: enable ext2/ext3 and FAT/vfat for loop-mounted disk images (unreleased)
+- Fixes: #934 Guest kernel has no ext2 or FAT/vfat, so loop-mounted disk images can't be mounted (`pmbootstrap install`, SD-card/EFI images)
+- Caused: none known
+- Caused by: -
+- Check: `guest-kernel-ext2-vfat`
+
+### #929 macOS: hide the automatic `<` Finder entry for the Kiri NFS mount (unreleased)
+- Fixes: #929 Kiri appears as `<` in the Finder sidebar on macOS
+- Caused: none known
+- Caused by: -
+- Check: `finder-mount-nobrowse`
+
 ### #473 Mac: bind unprivileged low ports (`<1024`) on loopback and allow disabling `VZNATNetworkDeviceAttachment` (`kiri vm set --shared-nat off`) for Cloudflare WARP and strict TLS firewalls (unreleased)
 - Fixes: #473 Port forwarding for ports `<1024` fails without root on macOS even when binding `127.0.0.1`, #383 Cloudflare WARP breaks container networking on macOS (`InternetSharing` conflict), #350 TLS 1.3 handshake hangs when corporate firewall drops non-DF packets from macOS `InternetSharing` NAT
 - Caused: none known
